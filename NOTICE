@@ -1,0 +1,43 @@
+OSRSCN
+======
+
+The Simplified Chinese translation data shipped with this plugin is the transcript and
+translation work of lck3141592654 (https://github.com/lck3141592654).
+
+This product includes work derived from RuneLingual
+(https://github.com/YS-jack/RuneLingual-Plugin), used under the BSD 2-Clause License.
+
+Specifically, the <colNumN> colour-placeholder scheme used to match the community OSRS
+transcript data — com.osrscn.text.Tags#placeholdColors / #colorTags / #restoreColors — follows
+RuneLingual's com.RuneLingual.commonFunctions.Colors. The translation data format (English keys
+storing colours as <colNum0>, <colNum1>, ... and numbers as <Num0>, <Num1>, ...) originates with
+the RuneLingual project and the community transcript effort.
+
+---------------------------------------------------------------------------------------------------
+
+RuneLingual
+
+BSD 2-Clause License
+
+Copyright (c) 2024, Y. S. Jack
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
