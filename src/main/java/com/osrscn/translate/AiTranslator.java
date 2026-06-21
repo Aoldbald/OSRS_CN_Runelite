@@ -54,7 +54,8 @@ public class AiTranslator
 	@Inject
 	private OsrscnConfig config;
 
-	private final Gson gson = new Gson();
+	@Inject
+	private Gson gson;
 	private final ConcurrentHashMap<String, String> cache = new ConcurrentHashMap<>();
 	private final Set<String> inFlight = ConcurrentHashMap.newKeySet();
 	private final File dir = new File(RuneLite.RUNELITE_DIR, "osrscn");
