@@ -10,9 +10,12 @@ import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Font;
 import java.awt.GridLayout;
+import java.awt.Toolkit;
+import java.awt.datatransfer.StringSelection;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import javax.swing.BorderFactory;
+import javax.swing.BoxLayout;
 import javax.swing.JButton;
 import javax.swing.JComponent;
 import javax.swing.JLabel;
@@ -29,6 +32,7 @@ import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.PluginPanel;
 import net.runelite.client.ui.components.materialtabs.MaterialTab;
 import net.runelite.client.ui.components.materialtabs.MaterialTabGroup;
+import net.runelite.client.util.LinkBrowser;
 
 /**
  * OSRSCN side panel, organised as browser-style tabs to save space: 对话 (dialogue history),
@@ -39,6 +43,8 @@ import net.runelite.client.ui.components.materialtabs.MaterialTabGroup;
 public class OsrscnPanel extends PluginPanel
 {
 	private static final Color ACCENT = ColorScheme.BRAND_ORANGE;
+	private static final String QQ_GROUP = "978108806";
+	private static final String SURVEY_URL = "https://docs.qq.com/form/page/DWW5BcmpRZmRORFho";
 	private static final int SEARCH_LIMIT = 40;
 	private static final long TRANSLATE_TIMEOUT_MS = 15_000;
 	private static final String K_TAB = "panelTab";
@@ -120,7 +126,12 @@ public class OsrscnPanel extends PluginPanel
 		debugTab = addTab("调试", buildDebugTab());
 		debugTab.setVisible(false);
 
-		add(tabBar, BorderLayout.NORTH);
+		JPanel north = new JPanel();
+		north.setLayout(new BoxLayout(north, BoxLayout.Y_AXIS));
+		north.setBackground(ColorScheme.DARK_GRAY_COLOR);
+		north.add(buildContactBar());
+		north.add(tabBar);
+		add(north, BorderLayout.NORTH);
 		add(display, BorderLayout.CENTER);
 
 		searchDebounce = new Timer(180, e -> runSearch());
@@ -143,6 +154,33 @@ public class OsrscnPanel extends PluginPanel
 		tabGroup.addTab(tab);
 		tabList.add(tab);
 		return tab;
+	}
+
+	// Always-visible contact strip pinned above the tabs so feedback channels are easy to find.
+	private JComponent buildContactBar()
+	{
+		JPanel bar = new JPanel(new BorderLayout(0, 4));
+		bar.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+		bar.setBorder(BorderFactory.createEmptyBorder(6, 6, 6, 6));
+
+		JLabel qq = new JLabel("QQ群: " + QQ_GROUP);
+		qq.setForeground(ACCENT);
+		qq.setFont(uiFont(Font.BOLD, 14));
+		bar.add(qq, BorderLayout.NORTH);
+
+		JPanel btns = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+		btns.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+		JButton copy = new JButton("复制群号");
+		styleButton(copy);
+		copy.addActionListener(e ->
+				Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(QQ_GROUP), null));
+		JButton survey = new JButton("反馈问卷");
+		styleButton(survey);
+		survey.addActionListener(e -> LinkBrowser.browse(SURVEY_URL));
+		btns.add(copy);
+		btns.add(survey);
+		bar.add(btns, BorderLayout.CENTER);
+		return bar;
 	}
 
 	// ---- 对话 history ----

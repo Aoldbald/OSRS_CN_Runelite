@@ -15,23 +15,40 @@ public interface OsrscnConfig extends Config
 {
 	String GROUP = "osrscn";
 
-	@ConfigSection(name = "通用", description = "", position = 0)
+	@ConfigSection(name = "联系作者 / 反馈", description = "加 QQ 群或填写问卷，反馈问题与建议", position = 0)
+	String feedback = "feedback";
+
+	@ConfigSection(name = "通用", description = "", position = 1)
 	String general = "general";
 
-	@ConfigSection(name = "翻译", description = "", position = 1)
+	@ConfigSection(name = "翻译", description = "", position = 2)
 	String translate = "translate";
 
-	@ConfigSection(name = "外观", description = "", position = 2)
+	@ConfigSection(name = "外观", description = "", position = 3)
 	String display = "display";
 
 	@ConfigSection(
 			name = "AI 翻译",
 			description = "开启后，本地查表缺失的游戏英文文本会发送到你设置的翻译服务器（本地 Ollama 或在线 API）翻译。玩家名永不发送。默认用本地 Ollama。",
-			position = 3)
+			position = 4)
 	String ai = "ai";
 
-	@ConfigSection(name = "调试", description = "", position = 4, closedByDefault = true)
+	@ConfigSection(name = "调试", description = "", position = 5, closedByDefault = true)
 	String debug = "debug";
+
+	// ===== 联系作者 / 反馈 =====
+
+	@ConfigItem(
+			keyName = "qqGroup",
+			name = "QQ 群",
+			description = "汉化交流 / 问题反馈 QQ 群号。反馈问卷：https://docs.qq.com/form/page/DWW5BcmpRZmRORFho（侧边栏顶部有一键打开按钮）",
+			section = feedback,
+			position = 0
+	)
+	default String qqGroup()
+	{
+		return "978108806";
+	}
 
 	// ===== 通用 =====
 
