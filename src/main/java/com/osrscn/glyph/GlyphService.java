@@ -70,6 +70,12 @@ public class GlyphService
 	private static final int UI_SIZE = 11;    // interface / menus / chat / overhead bubbles
 	private static final int SMALL_SIZE = 11; // hover tooltips and cramped info boxes
 
+	// Coverage threshold for flattening an antialiased glyph to a 1-bit mask (see render()).
+	// macOS' Java2D antialiases even when the AA hint is OFF, leaving no fully-opaque pixels
+	// for RuneLite's IndexedSprite to keep, so small glyphs would render blank. 0x60 keeps
+	// thin CJK strokes legible at the tiny in-game sizes.
+	private static final int GLYPH_ALPHA_THRESHOLD = 0x60;
+
 	/** Point size for NPC/player dialogue text (the only user-configurable size). */
 	public int dialogueSize()
 	{
@@ -437,8 +443,9 @@ public class GlyphService
 
 		BufferedImage img = new BufferedImage(w, full, BufferedImage.TYPE_INT_ARGB);
 		Graphics2D g = img.createGraphics();
-		// IndexedSprite conversion keeps only fully-opaque pixels, so antialiasing (which makes
-		// semi-transparent edges) must be OFF or glyphs render as thin skeletal strokes.
+		// IndexedSprite conversion keeps only fully-opaque pixels. Render aliased (AA off) so
+		// Windows/Linux produce crisp fully-opaque glyphs; macOS ignores this hint and antialiases
+		// anyway, so we flatten the result to a 1-bit mask below.
 		g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_OFF);
 		g.setFont(f);
 		// pure black collides with the IndexedSprite transparent slot (index 0) and renders blank;
@@ -446,6 +453,20 @@ public class GlyphService
 		g.setColor(new Color(colorRgb == 0 ? 0x010101 : colorRgb));
 		g.drawString(s, 0, ascent);
 		g.dispose();
+
+		// macOS' Java2D antialiases even with the AA hint OFF; at small sizes the glyph then has no
+		// fully-opaque pixels and the IndexedSprite (which keeps only fully-opaque pixels) drops
+		// everything, rendering blank. Flatten coverage to a 1-bit mask so glyphs survive on macOS.
+		// No-op on Windows/Linux, where AA-off already yields fully-opaque/transparent pixels.
+		int solid = 0xFF000000 | ((colorRgb == 0 ? 0x010101 : colorRgb) & 0xFFFFFF);
+		for (int y = 0; y < full; y++)
+		{
+			for (int x = 0; x < w; x++)
+			{
+				int a = (img.getRGB(x, y) >>> 24) & 0xFF;
+				img.setRGB(x, y, a >= GLYPH_ALPHA_THRESHOLD ? solid : 0);
+			}
+		}
 
 		// crop to the shared ink window so glyphs sit tight on the baseline (no top/bottom gap)
 		glyphHeight(size); // ensure crop window computed

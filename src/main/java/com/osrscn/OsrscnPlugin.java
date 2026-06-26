@@ -136,9 +136,96 @@ public class OsrscnPlugin extends Plugin
 		return configManager.getConfig(OsrscnConfig.class);
 	}
 
+	private static boolean uiFontPatched = false;
+
+	private static boolean hasCjk(String s)
+	{
+		for (int i = 0; i < s.length(); i++)
+		{
+			if (s.charAt(i) >= 0x3400 && s.charAt(i) <= 0x9FFF)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// Force a CJK-capable font onto any label/button/text component that shows CJK text in a font
+	// that can't render it (e.g. RuneLite's @ConfigSection titles are set explicitly to the
+	// Latin-only RuneScape font). Latin-only and already-OK components are left untouched.
+	private static void fixCjkFonts(java.awt.Component c)
+	{
+		String text = null;
+		if (c instanceof javax.swing.JLabel)
+		{
+			text = ((javax.swing.JLabel) c).getText();
+		}
+		else if (c instanceof javax.swing.AbstractButton)
+		{
+			text = ((javax.swing.AbstractButton) c).getText();
+		}
+		else if (c instanceof javax.swing.text.JTextComponent)
+		{
+			text = ((javax.swing.text.JTextComponent) c).getText();
+		}
+		java.awt.Font f = c.getFont();
+		if (text != null && f != null && hasCjk(text) && f.canDisplayUpTo(text) != -1)
+		{
+			c.setFont(new java.awt.Font(java.awt.Font.SANS_SERIF, f.getStyle(), f.getSize()));
+		}
+		if (c instanceof java.awt.Container)
+		{
+			for (java.awt.Component child : ((java.awt.Container) c).getComponents())
+			{
+				fixCjkFonts(child);
+			}
+		}
+	}
+
+	// macOS' default Swing UI font has no CJK glyphs and no fallback, so RuneLite renders our
+	// Chinese config text as tofu boxes. On macOS only: retarget the default UI fonts to logical
+	// "SansSerif" (which has a CJK fallback on macOS) for the bulk of the panel, then keep sweeping
+	// open windows for any component still showing CJK in a non-CJK font (RuneLite sets some fonts
+	// explicitly, e.g. the orange @ConfigSection titles). No-op on Windows/Linux.
+	private static void ensureCjkUiFontOnMac()
+	{
+		if (uiFontPatched
+				|| !System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("mac"))
+		{
+			return;
+		}
+		uiFontPatched = true;
+		javax.swing.SwingUtilities.invokeLater(() ->
+		{
+			javax.swing.UIDefaults defaults = javax.swing.UIManager.getLookAndFeelDefaults();
+			for (Object key : defaults.keySet().toArray())
+			{
+				if (defaults.get(key) instanceof java.awt.Font)
+				{
+					java.awt.Font f = (java.awt.Font) defaults.get(key);
+					javax.swing.UIManager.put(key,
+							new javax.swing.plaf.FontUIResource(java.awt.Font.SANS_SERIF, f.getStyle(), f.getSize()));
+				}
+			}
+			// config panels are built lazily and set some fonts explicitly, so sweep periodically
+			new javax.swing.Timer(500, e ->
+			{
+				for (java.awt.Window w : java.awt.Window.getWindows())
+				{
+					fixCjkFonts(w);
+				}
+			}).start();
+			for (java.awt.Window w : java.awt.Window.getWindows())
+			{
+				javax.swing.SwingUtilities.updateComponentTreeUI(w);
+			}
+		});
+	}
+
 	@Override
 	protected void startUp()
 	{
+		ensureCjkUiFontOnMac();
 		store.setBaseUrl(config.dataBaseUrl());
 		store.loadAsync();
 		glyph.reloadFont();
