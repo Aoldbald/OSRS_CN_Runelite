@@ -51,6 +51,8 @@ public class Translator
 	private AiTranslator ai;
 	@Inject
 	private GlyphService glyph;
+	@Inject
+	private MissingCollector missing;
 
 	/**
 	 * @param english  plain English source text (tags already stripped by the caller)
@@ -73,14 +75,29 @@ public class Translator
 	 */
 	public String plain(String english)
 	{
+		return plainCore(english, null, null, null, false);
+	}
+
+	/**
+	 * Like {@link #plain} but, on a table miss, records the line to {@link MissingCollector} tagged with
+	 * the given transcript columns (category / NPC / speaker) so the collected file lines up with the data
+	 * tables. Used by the dialogue handler, which knows the NPC and speaker.
+	 */
+	public String plainCollect(String english, String category, String subCategory, String source)
+	{
+		return plainCore(english, category, subCategory, source, true);
+	}
+
+	private String plainCore(String english, String category, String subCategory, String source, boolean collect)
+	{
 		if (english == null || english.trim().isEmpty())
 		{
 			return null;
 		}
 		String name = playerName();
+		String query = name != null ? english.replace(name, PLAYER_NAME) : english;
 		if (name != null)
 		{
-			String query = english.replace(name, PLAYER_NAME);
 			String zh = store.lookupAny(query);
 			if (zh != null)
 			{
@@ -90,6 +107,10 @@ public class Translator
 		String zh = store.lookupAny(english);
 		if (zh == null)
 		{
+			if (collect)
+			{
+				missing.record(query, category, subCategory, source);
+			}
 			zh = aiTranslate(english, true);
 		}
 		return zh;
@@ -169,6 +190,7 @@ public class Translator
 		String zh = templateLookup(Tags.placeholdColors(option), MENU_ORDER);
 		if (zh == null)
 		{
+			missing.record(Tags.stripTags(option).trim(), "interface", "", "");
 			return null;
 		}
 		return glyph.toImgTags(Tags.restoreColors(zh, colors), colorRgb, 0, size);
@@ -236,16 +258,17 @@ public class Translator
 	 */
 	public Rendered renderUi(String text, int colorRgb, int maxChars, int size, boolean aiFallback, boolean persist)
 	{
-		return renderWithOrder(text, colorRgb, maxChars, size, aiFallback, persist, UI_ORDER);
+		return renderWithOrder(text, colorRgb, maxChars, size, aiFallback, persist, UI_ORDER, "interface");
 	}
 
 	public Rendered renderChat(String text, int colorRgb, int maxChars, int size, boolean aiFallback, boolean persist)
 	{
-		return renderWithOrder(text, colorRgb, maxChars, size, aiFallback, persist, CHAT_ORDER);
+		// collectSource null: chat carries player messages, which must never be written to missing.tsv
+		return renderWithOrder(text, colorRgb, maxChars, size, aiFallback, persist, CHAT_ORDER, null);
 	}
 
 	private Rendered renderWithOrder(String text, int colorRgb, int maxChars, int size, boolean aiFallback, boolean persist,
-			TranslationStore.Category[] order)
+			TranslationStore.Category[] order, String collectSource)
 	{
 		if (text == null || text.trim().isEmpty())
 		{
@@ -308,6 +331,10 @@ public class Translator
 					if (WORDY.matcher(Tags.stripCol(line)).find())
 					{
 						all = false; // a real line is still untranslated (table miss + AI not ready)
+						if (collectSource != null)
+						{
+							missing.record(Tags.stripTags(line).trim(), collectSource, "", "");
+						}
 					}
 				}
 			}
@@ -317,6 +344,10 @@ public class Translator
 			}
 			String img = glyph.toImgTags(sb.toString(), colorRgb, maxChars, size);
 			return img == null ? null : new Rendered(img, all);
+		}
+		if (collectSource != null && !text.contains("<br>"))
+		{
+			missing.record(Tags.stripTags(text).trim(), collectSource, "", "");
 		}
 		return null;
 	}
@@ -860,6 +891,29 @@ public class Translator
 		return zh == null ? null : zh.replace("[player]", name);
 	}
 
+	// Lowest-priority sweep when the scene's own order misses every table, so a translation filed under a
+	// category that order doesn't list still resolves instead of being lost forever. Dialogue tables stay
+	// last (experimental dead last) so any curated table the scene already tried keeps priority.
+	private static final TranslationStore.Category[] FALLBACK_ALL = {
+			TranslationStore.Category.NAME, TranslationStore.Category.INTERFACE,
+			TranslationStore.Category.GAME_TEXT, TranslationStore.Category.EXAMINE,
+			TranslationStore.Category.MANUAL, TranslationStore.Category.LVL_UP,
+			TranslationStore.Category.ACTIONS, TranslationStore.Category.INVENTORY_ACTIONS,
+			TranslationStore.Category.DIALOGUE, TranslationStore.Category.DIALOGUE_EXPERIMENTAL,
+	};
+
+	private static boolean inOrder(TranslationStore.Category[] order, TranslationStore.Category c)
+	{
+		for (TranslationStore.Category o : order)
+		{
+			if (o == c)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
 	private String lookupAnyOf(String key, TranslationStore.Category[] order)
 	{
 		String k = TranslationStore.normalize(key); // normalize once, not per category
@@ -876,6 +930,23 @@ public class Translator
 		for (TranslationStore.Category c : order)
 		{
 			String zh = store.lookupLower(c, lower);
+			if (zh != null)
+			{
+				return zh;
+			}
+		}
+		// Universal last resort: try every category the scene's order skipped (lowest priority).
+		for (TranslationStore.Category c : FALLBACK_ALL)
+		{
+			if (inOrder(order, c))
+			{
+				continue;
+			}
+			String zh = store.lookupNormalized(c, k);
+			if (zh == null)
+			{
+				zh = store.lookupLower(c, lower);
+			}
 			if (zh != null)
 			{
 				return zh;

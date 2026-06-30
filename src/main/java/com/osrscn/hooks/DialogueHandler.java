@@ -52,6 +52,7 @@ public class DialogueHandler
 	private final Map<String, String> lastSet = new HashMap<>();
 	private final Map<String, String> original = new HashMap<>(); // our translation -> original text, for restore
 	private final Map<String, Integer> lastColor = new HashMap<>(); // colour we baked the glyphs with
+	private String lastNpcName = ""; // remembered across ticks: the options screen has no name widget
 
 	public void translateDialogues()
 	{
@@ -152,8 +153,20 @@ public class DialogueHandler
 		{
 			return;
 		}
-		// translate once and reuse for both the history panel and the widget render
-		String zh = translator.plain(english);
+		// translate once and reuse for both the history panel and the widget render. Pass NPC + speaker so
+		// a collected miss (when enabled) records the same columns as the transcript tables. The options
+		// screen has no name widget, so remember the conversation's NPC across ticks and reuse it there.
+		String npc = npcSpeakerEn();
+		if (!npc.isEmpty())
+		{
+			lastNpcName = npc;
+		}
+		else
+		{
+			npc = lastNpcName;
+		}
+		String speaker = key.equals(NPC_TEXT_KEY) ? npc : "Player";
+		String zh = translator.plainCollect(english, "dialogue", npc, speaker);
 		// record new NPC/player dialogue lines into the history panel (this runs only when the line
 		// actually changed, so it captures each line once as the dialogue advances)
 		captureHistory(key, english, zh);
@@ -249,5 +262,6 @@ public class DialogueHandler
 		lastSet.clear();
 		original.clear();
 		lastColor.clear();
+		lastNpcName = "";
 	}
 }

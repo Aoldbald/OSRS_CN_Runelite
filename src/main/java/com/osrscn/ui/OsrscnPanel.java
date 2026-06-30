@@ -6,12 +6,14 @@ import com.osrscn.translate.TranslationStore;
 import com.osrscn.translate.Translator;
 import java.awt.BorderLayout;
 import java.awt.Color;
+import java.awt.Desktop;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Font;
 import java.awt.GridLayout;
 import java.awt.Toolkit;
 import java.awt.datatransfer.StringSelection;
+import java.io.File;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import javax.swing.BorderFactory;
@@ -30,6 +32,7 @@ import javax.swing.event.DocumentListener;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.PluginPanel;
+import net.runelite.client.RuneLite;
 import net.runelite.client.ui.components.materialtabs.MaterialTab;
 import net.runelite.client.ui.components.materialtabs.MaterialTabGroup;
 import net.runelite.client.util.LinkBrowser;
@@ -168,19 +171,43 @@ public class OsrscnPanel extends PluginPanel
 		qq.setFont(uiFont(Font.BOLD, 14));
 		bar.add(qq, BorderLayout.NORTH);
 
-		JPanel btns = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+		JPanel btns = new JPanel(new GridLayout(1, 3, 4, 0));
 		btns.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-		JButton copy = new JButton("复制群号");
+		JButton copy = new JButton("群号");
+		copy.setToolTipText("复制 QQ 群号");
 		styleButton(copy);
 		copy.addActionListener(e ->
 				Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(QQ_GROUP), null));
-		JButton survey = new JButton("反馈问卷");
+		JButton survey = new JButton("问卷");
+		survey.setToolTipText("打开反馈问卷");
 		styleButton(survey);
 		survey.addActionListener(e -> LinkBrowser.browse(SURVEY_URL));
+		JButton missingDir = new JButton("缺词");
+		missingDir.setToolTipText("打开缺词文件夹（missing.tsv 所在位置）");
+		styleButton(missingDir);
+		missingDir.addActionListener(e -> openMissingDir());
 		btns.add(copy);
 		btns.add(survey);
+		btns.add(missingDir);
 		bar.add(btns, BorderLayout.CENTER);
 		return bar;
+	}
+
+	/** Open the folder holding the collected {@code missing.tsv}; fall back to copying the path. */
+	private void openMissingDir()
+	{
+		File dir = new File(RuneLite.RUNELITE_DIR, "osrscn");
+		//noinspection ResultOfMethodCallIgnored
+		dir.mkdirs();
+		try
+		{
+			Desktop.getDesktop().open(dir);
+		}
+		catch (Exception ex)
+		{
+			Toolkit.getDefaultToolkit().getSystemClipboard()
+					.setContents(new StringSelection(dir.getPath()), null);
+		}
 	}
 
 	// ---- 对话 history ----

@@ -50,6 +50,19 @@ public interface OsrscnConfig extends Config
 		return "978108806";
 	}
 
+	@ConfigItem(
+			keyName = "collectMissing",
+			name = "帮忙补全汉化",
+			description = "想为汉化出份力就开它。游戏里查不到的文本会存到本地 missing.tsv"
+					+ "（不含聊天），攒一阵把文件通过反馈问卷发给我们即可。",
+			section = feedback,
+			position = 1
+	)
+	default boolean collectMissing()
+	{
+		return false;
+	}
+
 	// ===== 通用 =====
 
 	@ConfigItem(

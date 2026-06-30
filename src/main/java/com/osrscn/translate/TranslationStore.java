@@ -55,10 +55,13 @@ public class TranslationStore
 		}
 	}
 
-	// Order tried by lookupAny() when the caller has no specific context.
+	// Order tried by lookupAny() when the caller has no specific context. Every category is listed so a
+	// translation never gets lost just because it was filed under one this path didn't try; the dialogue
+	// tables stay last (experimental dead last) so curated tables win.
 	private static final Category[] ANY_ORDER = {
 			Category.DIALOGUE, Category.GAME_TEXT, Category.LVL_UP, Category.INTERFACE, Category.NAME,
-			Category.EXAMINE, Category.MANUAL, Category.DIALOGUE_EXPERIMENTAL,
+			Category.EXAMINE, Category.MANUAL, Category.ACTIONS, Category.INVENTORY_ACTIONS,
+			Category.DIALOGUE_EXPERIMENTAL,
 	};
 
 	// Categories that also get a case-insensitive index. The huge dialogue tables are
@@ -282,13 +285,22 @@ public class TranslationStore
 		return null;
 	}
 
-	/** Collapse whitespace and trim, so game text and TSV keys compare equal. {@code <br>} becomes a
-	 *  space; {@code <str>}/{@code </str>} (strikethrough on completed diary/quest lines) is dropped so
-	 *  struck-through text still matches the plain transcript key. */
+	/** Canonicalize so game text and TSV keys compare equal. {@code <br>} becomes a space; {@code <str>}
+	 *  is dropped so struck-through diary/quest lines match the plain key. Typographic variants are folded
+	 *  to their ASCII form (curly quotes -&gt; straight, en/em dashes -&gt; '-', ellipsis -&gt; '...').
+	 *  The apostrophe is kept as a real character (so "you've" never collapses onto "youve"). Unusual
+	 *  Unicode spaces (NBSP, full-width, thin, zero-width) that Java's {@code \s} does NOT match are
+	 *  turned into a normal space before whitespace is collapsed. */
 	public static String normalize(String s)
 	{
 		return s.replaceAll("(?i)<br\\s*/?>", " ")
 				.replaceAll("(?i)</?str>", "")
+				.replace((char) 0x2018, '\'').replace((char) 0x2019, '\'').replace((char) 0x201B, '\'')
+				.replace((char) 0x00B4, '\'').replace('`', '\'')
+				.replace((char) 0x201C, '"').replace((char) 0x201D, '"').replace((char) 0x201E, '"')
+				.replace((char) 0x2013, '-').replace((char) 0x2014, '-').replace((char) 0x2012, '-').replace((char) 0x2015, '-')
+				.replace(String.valueOf((char) 0x2026), "...")
+				.replaceAll("[\\u00A0\\u2000-\\u200B\\u202F\\u205F\\u3000\\uFEFF]", " ")
 				.replaceAll("\\s+", " ").trim();
 	}
 

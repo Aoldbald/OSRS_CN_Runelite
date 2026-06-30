@@ -158,7 +158,16 @@ public class AiTranslator
 					int t = line.indexOf('\t');
 					if (t > 0 && t < line.length() - 1)
 					{
-						cache.putIfAbsent(line.substring(0, t), line.substring(t + 1));
+						String k = line.substring(0, t);
+						String v = line.substring(t + 1);
+						cache.putIfAbsent(k, v);
+						// Entries written before a normalize() change keep their old key; re-normalize on
+						// load so the current query key still hits and the AI isn't re-run for them.
+						String nk = TranslationStore.normalize(k);
+						if (!nk.equals(k))
+						{
+							cache.putIfAbsent(nk, v);
+						}
 					}
 				}
 				log.info("OSRSCN AI cache loaded: {} entries ({})", cache.size(), cacheFile.getName());
