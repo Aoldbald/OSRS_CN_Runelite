@@ -8,6 +8,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
 import javax.inject.Inject;
@@ -32,6 +34,8 @@ public class MissingCollector
 
 	@Inject
 	private OsrscnConfig config;
+	@Inject
+	private ScheduledExecutorService executor;
 
 	private final File file = new File(RuneLite.RUNELITE_DIR, "osrscn/missing.tsv");
 	private final java.util.Set<String> seen = ConcurrentHashMap.newKeySet();
@@ -115,29 +119,10 @@ public class MissingCollector
 
 	private void ensureFlusher()
 	{
-		if (!flusherStarted.compareAndSet(false, true))
+		if (flusherStarted.compareAndSet(false, true))
 		{
-			return;
-		}
-		Thread t = new Thread(this::flushLoop, "osrscn-missing-flush");
-		t.setDaemon(true);
-		t.start();
-	}
-
-	private void flushLoop()
-	{
-		while (true)
-		{
-			try
-			{
-				Thread.sleep(5000);
-			}
-			catch (InterruptedException e)
-			{
-				Thread.currentThread().interrupt();
-				return;
-			}
-			flush();
+			// RuneLite's shared executor; plugin-hub disallows plugin-created threads / sleep / interrupt.
+			executor.scheduleWithFixedDelay(this::flush, 5, 5, TimeUnit.SECONDS);
 		}
 	}
 
