@@ -9,6 +9,7 @@ import java.nio.file.Files;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
@@ -42,6 +43,7 @@ public class MissingCollector
 	private final ConcurrentLinkedQueue<String> pending = new ConcurrentLinkedQueue<>();
 	private final AtomicBoolean loaded = new AtomicBoolean();
 	private final AtomicBoolean flusherStarted = new AtomicBoolean();
+	private volatile ScheduledFuture<?> flusherFuture;
 
 	/**
 	 * Record a table miss as a row matching the transcript TSV columns
@@ -122,8 +124,21 @@ public class MissingCollector
 		if (flusherStarted.compareAndSet(false, true))
 		{
 			// RuneLite's shared executor; plugin-hub disallows plugin-created threads / sleep / interrupt.
-			executor.scheduleWithFixedDelay(this::flush, 5, 5, TimeUnit.SECONDS);
+			flusherFuture = executor.scheduleWithFixedDelay(this::flush, 5, 5, TimeUnit.SECONDS);
 		}
+	}
+
+	/** Final flush and cancel the periodic flusher (plugin shutdown); a re-enable restarts it lazily. */
+	public void stop()
+	{
+		ScheduledFuture<?> f = flusherFuture;
+		if (f != null)
+		{
+			f.cancel(false);
+			flusherFuture = null;
+		}
+		flush();
+		flusherStarted.set(false);
 	}
 
 	private synchronized void flush()

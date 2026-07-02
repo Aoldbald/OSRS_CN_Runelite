@@ -6,6 +6,9 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.regex.Pattern;
 import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.List;
@@ -226,9 +229,27 @@ public class TranslationStore
 			{
 				throw new java.io.IOException("HTTP " + response.code());
 			}
-			try (InputStream in = response.body().byteStream())
+			// Download to a temp file and swap it in atomically, so an interrupted download can
+			// never leave a truncated table that the exists() check would treat as complete.
+			Path tmp = dest.toPath().resolveSibling(dest.getName() + ".tmp");
+			try
 			{
-				Files.copy(in, dest.toPath());
+				try (InputStream in = response.body().byteStream())
+				{
+					Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING);
+				}
+				try
+				{
+					Files.move(tmp, dest.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+				}
+				catch (java.nio.file.AtomicMoveNotSupportedException e)
+				{
+					Files.move(tmp, dest.toPath(), StandardCopyOption.REPLACE_EXISTING);
+				}
+			}
+			finally
+			{
+				Files.deleteIfExists(tmp);
 			}
 		}
 	}
@@ -285,6 +306,13 @@ public class TranslationStore
 		return null;
 	}
 
+	// Precompiled: normalize() sits on the per-frame widget scan path, so its regexes must not be
+	// recompiled on every call.
+	private static final Pattern BR_TAG = Pattern.compile("(?i)<br\\s*/?>");
+	private static final Pattern STR_TAG = Pattern.compile("(?i)</?str>");
+	private static final Pattern ODD_SPACES = Pattern.compile("[\\u00A0\\u2000-\\u200B\\u202F\\u205F\\u3000\\uFEFF]");
+	private static final Pattern WHITESPACE = Pattern.compile("\\s+");
+
 	/** Canonicalize so game text and TSV keys compare equal. {@code <br>} becomes a space; {@code <str>}
 	 *  is dropped so struck-through diary/quest lines match the plain key. Typographic variants are folded
 	 *  to their ASCII form (curly quotes -&gt; straight, en/em dashes -&gt; '-', ellipsis -&gt; '...').
@@ -293,15 +321,15 @@ public class TranslationStore
 	 *  turned into a normal space before whitespace is collapsed. */
 	public static String normalize(String s)
 	{
-		return s.replaceAll("(?i)<br\\s*/?>", " ")
-				.replaceAll("(?i)</?str>", "")
-				.replace((char) 0x2018, '\'').replace((char) 0x2019, '\'').replace((char) 0x201B, '\'')
+		s = BR_TAG.matcher(s).replaceAll(" ");
+		s = STR_TAG.matcher(s).replaceAll("");
+		s = s.replace((char) 0x2018, '\'').replace((char) 0x2019, '\'').replace((char) 0x201B, '\'')
 				.replace((char) 0x00B4, '\'').replace('`', '\'')
 				.replace((char) 0x201C, '"').replace((char) 0x201D, '"').replace((char) 0x201E, '"')
 				.replace((char) 0x2013, '-').replace((char) 0x2014, '-').replace((char) 0x2012, '-').replace((char) 0x2015, '-')
-				.replace(String.valueOf((char) 0x2026), "...")
-				.replaceAll("[\\u00A0\\u2000-\\u200B\\u202F\\u205F\\u3000\\uFEFF]", " ")
-				.replaceAll("\\s+", " ").trim();
+				.replace(String.valueOf((char) 0x2026), "...");
+		s = ODD_SPACES.matcher(s).replaceAll(" ");
+		return WHITESPACE.matcher(s).replaceAll(" ").trim();
 	}
 
 	/** One English/Chinese name pair, for the panel's search results. */

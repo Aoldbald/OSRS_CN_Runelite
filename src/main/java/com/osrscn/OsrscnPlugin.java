@@ -8,6 +8,7 @@ import com.osrscn.hooks.InterfaceTranslator;
 import com.osrscn.hooks.MenuTranslator;
 import com.osrscn.hooks.OverheadHandler;
 import com.osrscn.translate.AiTranslator;
+import com.osrscn.translate.MissingCollector;
 import com.osrscn.translate.TranslationStore;
 import com.osrscn.translate.Translator;
 import com.osrscn.ui.HoverTooltipOverlay;
@@ -61,6 +62,8 @@ public class OsrscnPlugin extends Plugin
 	private Translator translator;
 	@Inject
 	private AiTranslator aiTranslator;
+	@Inject
+	private MissingCollector missingCollector;
 	@Inject
 	private DialogueHandler dialogueHandler;
 	@Inject
@@ -137,6 +140,7 @@ public class OsrscnPlugin extends Plugin
 	}
 
 	private static boolean uiFontPatched = false;
+	private static javax.swing.Timer uiFontTimer;
 
 	private static boolean hasCjk(String s)
 	{
@@ -208,17 +212,33 @@ public class OsrscnPlugin extends Plugin
 				}
 			}
 			// config panels are built lazily and set some fonts explicitly, so sweep periodically
-			new javax.swing.Timer(500, e ->
+			uiFontTimer = new javax.swing.Timer(500, e ->
 			{
 				for (java.awt.Window w : java.awt.Window.getWindows())
 				{
 					fixCjkFonts(w);
 				}
-			}).start();
+			});
+			uiFontTimer.start();
 			for (java.awt.Window w : java.awt.Window.getWindows())
 			{
 				javax.swing.SwingUtilities.updateComponentTreeUI(w);
 			}
+		});
+	}
+
+	// Queued on the EDT after any pending patch runnable, so it also catches a timer created just
+	// before shutdown. Resets the guard so a re-enable can re-patch.
+	private static void stopMacUiFontSweep()
+	{
+		javax.swing.SwingUtilities.invokeLater(() ->
+		{
+			if (uiFontTimer != null)
+			{
+				uiFontTimer.stop();
+				uiFontTimer = null;
+			}
+			uiFontPatched = false;
 		});
 	}
 
@@ -252,6 +272,21 @@ public class OsrscnPlugin extends Plugin
 			clientToolbar.removeNavigation(navButton);
 			navButton = null;
 		}
+		// Put the original English back and drop per-session state, so nothing stays translated
+		// while the plugin is off and a re-enable starts clean.
+		clientThread.invoke(() ->
+		{
+			dialogueHandler.restore();
+			interfaceTranslator.restore();
+			overheadHandler.clear();
+			chatHandler.goEnglish();
+			dialogueHandler.reset();
+			interfaceTranslator.reset();
+			chatHandler.clear();
+		});
+		missingCollector.stop();
+		stopMacUiFontSweep();
+		announced = false;
 		log.info("OSRSCN stopped");
 	}
 
