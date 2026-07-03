@@ -136,6 +136,7 @@ public class ChatHandler
 			case GAMEMESSAGE:
 			case ENGINE:
 			case SPAM:
+			case WELCOME:
 			case NPC_EXAMINE:
 			case ITEM_EXAMINE:
 			case OBJECT_EXAMINE:

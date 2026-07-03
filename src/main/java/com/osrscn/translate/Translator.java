@@ -263,8 +263,9 @@ public class Translator
 
 	public Rendered renderChat(String text, int colorRgb, int maxChars, int size, boolean aiFallback, boolean persist)
 	{
-		// collectSource null: chat carries player messages, which must never be written to missing.tsv
-		return renderWithOrder(text, colorRgb, maxChars, size, aiFallback, persist, CHAT_ORDER, null);
+		// Game messages pass persist=true and are safe to collect; player chat passes persist=false
+		// and must never be written to missing.tsv.
+		return renderWithOrder(text, colorRgb, maxChars, size, aiFallback, persist, CHAT_ORDER, persist ? "gameText" : null);
 	}
 
 	private Rendered renderWithOrder(String text, int colorRgb, int maxChars, int size, boolean aiFallback, boolean persist,
@@ -278,7 +279,7 @@ public class Translator
 		// real <col=..> tags afterwards, so the colour-aware glyph renderer can colour each segment.
 		// First try the whole widget as one entry (multi-line info boxes like prayer/spell are combined).
 		List<String> wholeColors = Tags.colorTags(text);
-		String whole = templateLookup(Tags.placeholdColors(text), order);
+		String whole = lookupPeriodTolerant(Tags.placeholdColors(text), order);
 		if (whole != null)
 		{
 			String img = glyph.toImgTags(Tags.restoreColors(whole, wholeColors), colorRgb, maxChars, size);
@@ -301,7 +302,7 @@ public class Translator
 				}
 				String line = lines[i];
 				List<String> lineColors = Tags.colorTags(line);
-				String lzh = templateLookup(Tags.placeholdColors(line), order);
+				String lzh = lookupPeriodTolerant(Tags.placeholdColors(line), order);
 				if (lzh == null)
 				{
 					// Styled link/quest lines (<u=..>Quest</u>) and struck items are stored plain in the
@@ -309,7 +310,7 @@ public class Translator
 					String plain = Tags.stripStyle(line);
 					if (!plain.equals(line) && !plain.trim().isEmpty())
 					{
-						String pz = templateLookup(plain, order);
+						String pz = lookupPeriodTolerant(plain, order);
 						if (pz != null)
 						{
 							lzh = "<col=" + Tags.hex(Tags.firstColor(line, colorRgb)) + ">" + pz + "</col>";
@@ -348,6 +349,27 @@ public class Translator
 		if (collectSource != null && !text.contains("<br>"))
 		{
 			missing.record(Tags.stripTags(text).trim(), collectSource, "", "");
+		}
+		return null;
+	}
+
+	// Tables and live messages disagree on trailing full stops ("You catch some raw shrimps" in the
+	// table vs "...shrimps." in game), so on a miss retry once with the period stripped or added.
+	private String lookupPeriodTolerant(String key, TranslationStore.Category[] order)
+	{
+		String zh = templateLookup(key, order);
+		if (zh != null)
+		{
+			return zh;
+		}
+		String t = key.trim();
+		if (t.endsWith(".") && !t.endsWith(".."))
+		{
+			return templateLookup(t.substring(0, t.length() - 1), order);
+		}
+		if (!t.isEmpty() && Character.isLetterOrDigit(t.charAt(t.length() - 1)))
+		{
+			return templateLookup(t + ".", order);
 		}
 		return null;
 	}
