@@ -353,8 +353,8 @@ public class Translator
 		return null;
 	}
 
-	// Tables and live messages disagree on trailing full stops ("You catch some raw shrimps" in the
-	// table vs "...shrimps." in game), so on a miss retry once with the period stripped or added.
+	// Tables and live messages disagree on trailing punctuation ("You catch some raw shrimps" in the
+	// table vs "...shrimps." in game), so on a miss retry once with it stripped, or with '.' added.
 	private String lookupPeriodTolerant(String key, TranslationStore.Category[] order)
 	{
 		String zh = templateLookup(key, order);
@@ -363,11 +363,16 @@ public class Translator
 			return zh;
 		}
 		String t = key.trim();
-		if (t.endsWith(".") && !t.endsWith(".."))
+		if (t.isEmpty())
+		{
+			return null;
+		}
+		char last = t.charAt(t.length() - 1);
+		if ((last == '.' || last == '!' || last == '?') && !t.endsWith(".."))
 		{
 			return templateLookup(t.substring(0, t.length() - 1), order);
 		}
-		if (!t.isEmpty() && Character.isLetterOrDigit(t.charAt(t.length() - 1)))
+		if (Character.isLetterOrDigit(last))
 		{
 			return templateLookup(t + ".", order);
 		}
