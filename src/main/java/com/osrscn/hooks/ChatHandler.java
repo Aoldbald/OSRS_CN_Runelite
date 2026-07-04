@@ -139,6 +139,7 @@ public class ChatHandler
 			case WELCOME:
 			case BROADCAST:
 			case DIDYOUKNOW:
+			case LEVELUPMESSAGE:
 			case NPC_EXAMINE:
 			case ITEM_EXAMINE:
 			case OBJECT_EXAMINE:
