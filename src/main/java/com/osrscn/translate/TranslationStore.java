@@ -160,9 +160,28 @@ public class TranslationStore
 		{
 			//noinspection ResultOfMethodCallIgnored
 			cacheDir.mkdirs();
+			// Refresh stale tables against the published hash list; without this, existing
+			// installs would keep their first-download copies forever. Any failure keeps the
+			// cached copy - the check must never block startup.
+			Map<String, String> remote = fetchRemoteHashes();
 			for (Category c : Category.values())
 			{
 				File f = new File(cacheDir, c.file);
+				if (f.exists() && remote != null)
+				{
+					String want = remote.get(c.file);
+					if (want != null && !want.equalsIgnoreCase(sha256(f)))
+					{
+						try
+						{
+							download(baseUrl + c.file, f);
+						}
+						catch (Exception e)
+						{
+							log.debug("OSRSCN: refresh failed for {}, keeping cached copy: {}", c.file, e.getMessage());
+						}
+					}
+				}
 				if (!f.exists() && baseUrl != null)
 				{
 					try
@@ -216,6 +235,65 @@ public class TranslationStore
 					lower.putIfAbsent(key.toLowerCase(), zh);
 				}
 			}
+		}
+	}
+
+	/** Published table hashes ({@code name|sha256} per line), or null when unavailable/offline. */
+	private Map<String, String> fetchRemoteHashes()
+	{
+		if (baseUrl == null)
+		{
+			return null;
+		}
+		try
+		{
+			Request request = new Request.Builder().url(baseUrl + "hashList_zh.txt").build();
+			try (Response response = httpClient.newCall(request).execute())
+			{
+				if (!response.isSuccessful() || response.body() == null)
+				{
+					return null;
+				}
+				Map<String, String> out = new java.util.HashMap<>();
+				for (String line : response.body().string().split("\n"))
+				{
+					int p = line.indexOf('|');
+					if (p > 0)
+					{
+						out.put(line.substring(0, p).trim(), line.substring(p + 1).trim());
+					}
+				}
+				return out;
+			}
+		}
+		catch (Exception e)
+		{
+			log.debug("OSRSCN: hash list not available: {}", e.getMessage());
+			return null;
+		}
+	}
+
+	private static String sha256(File f)
+	{
+		try (InputStream in = Files.newInputStream(f.toPath()))
+		{
+			java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+			byte[] buf = new byte[8192];
+			int n;
+			while ((n = in.read(buf)) > 0)
+			{
+				md.update(buf, 0, n);
+			}
+			StringBuilder sb = new StringBuilder();
+			for (byte b : md.digest())
+			{
+				sb.append(Character.forDigit((b >> 4) & 0xF, 16)).append(Character.forDigit(b & 0xF, 16));
+			}
+			return sb.toString();
+		}
+		catch (Exception e)
+		{
+			return "";
 		}
 	}
 
