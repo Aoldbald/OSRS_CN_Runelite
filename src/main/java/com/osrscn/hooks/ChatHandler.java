@@ -57,6 +57,8 @@ public class ChatHandler
 	private GlyphService glyph;
 	@Inject
 	private OsrscnConfig config;
+	@Inject
+	private com.osrscn.ToggleService toggle;
 
 	// nodes we still re-assert each tick (AI may land late, or a plugin may overwrite our text)
 	private final Map<MessageNode, Pending> pending = new ConcurrentHashMap<>();
@@ -155,7 +157,7 @@ public class ChatHandler
 
 	private void handlePublic(MessageNode node)
 	{
-		if (node == null)
+		if (node == null || !toggle.isChineseEnabled())
 		{
 			return;
 		}
@@ -230,6 +232,13 @@ public class ChatHandler
 		if (value == null || value.isEmpty() || value.contains("<img="))
 		{
 			return; // empty, our own message, or already translated
+		}
+		if (!toggle.isChineseEnabled())
+		{
+			// English mode: track only, so goChinese() can translate messages that arrived
+			// while the toggle was off.
+			track(node, value, Tags.firstColor(value, GAME_DEFAULT_RGB), true);
+			return;
 		}
 		translateNode(node, value, Tags.firstColor(value, GAME_DEFAULT_RGB), true);
 	}

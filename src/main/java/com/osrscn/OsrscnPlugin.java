@@ -386,10 +386,9 @@ public class OsrscnPlugin extends Plugin
 	@Subscribe
 	public void onChatMessage(net.runelite.api.events.ChatMessage event)
 	{
-		if (toggle.isChineseEnabled())
-		{
-			chatHandler.handle(event);
-		}
+		// Always forward: in English mode the handler only tracks game messages, so a later
+		// switch to Chinese can translate lines that arrived while the toggle was off.
+		chatHandler.handle(event);
 	}
 
 	@Subscribe
