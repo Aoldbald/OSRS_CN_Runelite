@@ -653,17 +653,33 @@ public class GlyphService
 	}
 
 	/**
-	 * The OSRS bitmap font can't draw the interpunct used in foreign names (it shows as '?'), and the
-	 * glossary standard is '.', so normalize all name separators to '.'.
+	 * The OSRS bitmap font can't draw the interpunct used in foreign names (shows as '?'), nor most
+	 * other non-ASCII punctuation below the CJK range - ellipsis, em-dash, curly quotes pass through
+	 * as garbage glyphs (chars &lt; 0x2E80 are kept native, see the render loop). Fold them to ASCII
+	 * the font does have; CJK punctuation at U+3000+ is glyph-rendered and unaffected.
 	 */
 	private static String normalizeSeparators(String s)
 	{
-		if (s.indexOf('·') < 0 && s.indexOf('・') < 0
-				&& s.indexOf('‧') < 0 && s.indexOf('•') < 0)
+		boolean dirty = false;
+		for (int i = 0; i < s.length(); i++)
+		{
+			char c = s.charAt(i);
+			if (c >= 0x80 && c < 0x2E80)
+			{
+				dirty = true;
+				break;
+			}
+		}
+		if (!dirty)
 		{
 			return s;
 		}
-		return s.replace('·', '.').replace('・', '.').replace('‧', '.').replace('•', '.');
+		return s.replace('·', '.').replace('・', '.').replace('‧', '.').replace('•', '.')
+				.replace("…", "...")
+				.replace('—', '-').replace('–', '-')
+				.replace('“', '"').replace('”', '"')
+				.replace('‘', '\'').replace('’', '\'')
+				.replace('\u00A0', ' ');
 	}
 
 	private static FontMetrics metrics(Font f)
