@@ -138,6 +138,7 @@ public class ChatHandler
 			case SPAM:
 			case WELCOME:
 			case BROADCAST:
+			case DIDYOUKNOW:
 			case NPC_EXAMINE:
 			case ITEM_EXAMINE:
 			case OBJECT_EXAMINE:
