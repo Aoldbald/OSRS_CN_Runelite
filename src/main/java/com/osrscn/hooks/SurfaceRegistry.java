@@ -43,6 +43,7 @@ final class SurfaceRegistry
 	{
 		boolean excluded;         // never translated by the generic walk (player names, chatbox, new guide)
 		boolean perFrameExcluded; // skipped by the per-frame pass (hit-test-sensitive / big list); tick only
+		boolean slowScan;         // big list with many misses: only the game-tick slow lane walks it
 		boolean small;            // render at the smaller info-box / tooltip glyph size
 		boolean noAi;             // never AI-translate misses (HP bar: don't guess monster names)
 		boolean reconstruct;      // owned by reconstructJournals (whole-task reflow), not the generic walk
@@ -97,6 +98,18 @@ final class SurfaceRegistry
 		})
 		{
 			r.row(g).excluded = true;
+		}
+
+		// ===== SLOW SCAN: big lists full of lookup misses -> game-tick lane only =====
+		// World switcher: hundreds of world rows that never enter the translated cache; the 50x/s
+		// walk over them tanked FPS to 30-60 whenever the tab stayed open (e.g. after a hop). The
+		// game-tick lane still translates the useful bits (activity names, filter/options).
+		for (int g : new int[]{
+				grp(InterfaceID.Worldswitcher.UNIVERSE),
+				InterfaceID.WORLDSWITCHER_FILTER, InterfaceID.WORLDSWITCHER_OPTIONS // top-level ids are group ids
+		})
+		{
+			r.row(g).slowScan = true;
 		}
 
 		// ===== SMALL: hover info-box / tooltip glyph size =====

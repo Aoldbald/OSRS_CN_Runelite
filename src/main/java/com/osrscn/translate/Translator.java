@@ -200,7 +200,7 @@ public class Translator
 	private static final TranslationStore.Category[] UI_ORDER = {
 			TranslationStore.Category.INTERFACE, TranslationStore.Category.GAME_TEXT,
 			TranslationStore.Category.LVL_UP, TranslationStore.Category.NAME,
-			TranslationStore.Category.EXAMINE, TranslationStore.Category.MANUAL,
+			TranslationStore.Category.EXAMINE, TranslationStore.Category.AI_BAKED,
 	};
 
 	// Chat/game messages often come from dialogue captures even when shown in the chatbox.
@@ -208,7 +208,7 @@ public class Translator
 			TranslationStore.Category.DIALOGUE, TranslationStore.Category.GAME_TEXT,
 			TranslationStore.Category.LVL_UP, TranslationStore.Category.INTERFACE,
 			TranslationStore.Category.NAME, TranslationStore.Category.EXAMINE,
-			TranslationStore.Category.MANUAL, TranslationStore.Category.DIALOGUE_EXPERIMENTAL,
+			TranslationStore.Category.AI_BAKED, TranslationStore.Category.DIALOGUE_EXPERIMENTAL,
 	};
 
 	/**
@@ -313,7 +313,11 @@ public class Translator
 						String pz = lookupPeriodTolerant(plain, order);
 						if (pz != null)
 						{
-							lzh = "<col=" + Tags.hex(Tags.firstColor(line, colorRgb)) + ">" + pz + "</col>";
+							// A single colour tag colours the whole line (quest links etc.); several tags
+							// mean highlighted words in base-coloured text - painting everything with the
+							// first highlight looks wrong, keep the base colour instead.
+							int wrap = lineColors.size() > 1 ? colorRgb : Tags.firstColor(line, colorRgb);
+							lzh = "<col=" + Tags.hex(wrap) + ">" + pz + "</col>";
 						}
 					}
 				}
@@ -924,7 +928,7 @@ public class Translator
 	private static final TranslationStore.Category[] FALLBACK_ALL = {
 			TranslationStore.Category.NAME, TranslationStore.Category.INTERFACE,
 			TranslationStore.Category.GAME_TEXT, TranslationStore.Category.EXAMINE,
-			TranslationStore.Category.MANUAL, TranslationStore.Category.LVL_UP,
+			TranslationStore.Category.AI_BAKED, TranslationStore.Category.LVL_UP,
 			TranslationStore.Category.ACTIONS, TranslationStore.Category.INVENTORY_ACTIONS,
 			TranslationStore.Category.DIALOGUE, TranslationStore.Category.DIALOGUE_EXPERIMENTAL,
 	};

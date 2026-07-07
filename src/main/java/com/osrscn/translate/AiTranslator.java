@@ -56,12 +56,23 @@ public class AiTranslator
 
 	@Inject
 	private Gson gson;
+
+	@Inject
+	private java.util.concurrent.ScheduledExecutorService executor;
 	private final ConcurrentHashMap<String, String> cache = new ConcurrentHashMap<>();
 	private final Set<String> inFlight = ConcurrentHashMap.newKeySet();
 	private final File dir = new File(RuneLite.RUNELITE_DIR, "osrscn");
 	private String loadedModel; // model whose cache is currently in memory (per-model on disk)
 	private File cacheFile;
 	private volatile long lastDispatch;
+
+	// Back off when the backend keeps failing (Ollama down, API unreachable) instead of
+	// re-firing a request on every lookup miss.
+	private static final int BACKOFF_AFTER_FAILURES = 3;
+	private static final long BACKOFF_BASE_MS = 5_000;
+	private static final long BACKOFF_MAX_MS = 300_000;
+	private final java.util.concurrent.atomic.AtomicInteger failStreak = new java.util.concurrent.atomic.AtomicInteger();
+	private volatile long backoffUntil;
 
 	// monitor stats
 	private final java.util.concurrent.atomic.AtomicInteger sessionCount = new java.util.concurrent.atomic.AtomicInteger();
@@ -97,6 +108,10 @@ public class AiTranslator
 		if (!config.useLocalAi())
 		{
 			return null; // AI off: cache-only, never dispatch a fresh translation request
+		}
+		if (System.currentTimeMillis() < backoffUntil)
+		{
+			return null; // backend keeps failing: wait out the backoff window
 		}
 		// rate limit so Ollama doesn't saturate the GPU and stall the game (both configurable)
 		if (inFlight.size() >= Math.max(1, config.aiConcurrency())
@@ -134,6 +149,12 @@ public class AiTranslator
 		return new java.util.ArrayList<>(recent);
 	}
 
+	/** Read the disk cache off the game thread so the first lookup miss doesn't stall the client. */
+	public void preloadAsync()
+	{
+		executor.execute(this::ensureLoaded);
+	}
+
 	/** Each model keeps its own disk cache, so switching models doesn't return the old one's output. */
 	private synchronized void ensureLoaded()
 	{
@@ -145,6 +166,8 @@ public class AiTranslator
 		loadedModel = model;
 		cache.clear();
 		inFlight.clear();
+		failStreak.set(0);
+		backoffUntil = 0;
 		//noinspection ResultOfMethodCallIgnored
 		dir.mkdirs();
 		cacheFile = new File(dir, "ai_" + model.replaceAll("[^a-zA-Z0-9._-]", "_") + ".tsv");
@@ -229,6 +252,7 @@ public class AiTranslator
 			{
 				inFlight.remove(english);
 				lastDispatch = System.currentTimeMillis(); // gap measured from completion -> idle GPU window
+				recordFailure();
 				log.warn("OSRSCN AI request failed ({}): {}", url, e.toString());
 			}
 
@@ -239,9 +263,11 @@ public class AiTranslator
 				{
 					if (!r.isSuccessful())
 					{
+						recordFailure();
 						log.warn("OSRSCN AI HTTP {} for model '{}'", r.code(), activeModel());
 						return;
 					}
+					recordSuccess();
 					if (r.body() != null)
 					{
 						String content = parseContent(r.body().string());
@@ -274,6 +300,23 @@ public class AiTranslator
 				}
 			}
 		});
+	}
+
+	private void recordFailure()
+	{
+		int n = failStreak.incrementAndGet();
+		if (n >= BACKOFF_AFTER_FAILURES)
+		{
+			long delay = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS << Math.min(6, n - BACKOFF_AFTER_FAILURES));
+			backoffUntil = System.currentTimeMillis() + delay;
+			log.warn("OSRSCN AI: {} consecutive failures, backing off {}s", n, delay / 1000);
+		}
+	}
+
+	private void recordSuccess()
+	{
+		failStreak.set(0);
+		backoffUntil = 0;
 	}
 
 	/** The model name for the active backend; also names the per-model on-disk cache file. */

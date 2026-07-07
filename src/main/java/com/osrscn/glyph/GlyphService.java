@@ -427,11 +427,67 @@ public class GlyphService
 		return id;
 	}
 
+	/** Colour-independent 1-bit pixel mask of a rasterized glyph, cached per (size, codepoint). */
+	private static final class Mask
+	{
+		static final Mask EMPTY = new Mask(0, 0, new long[0]);
+		final int w;
+		final int h;
+		final long[] bits; // row-major solid-pixel bitset
+
+		Mask(int w, int h, long[] bits)
+		{
+			this.w = w;
+			this.h = h;
+			this.bits = bits;
+		}
+
+		boolean solid(int x, int y)
+		{
+			int i = y * w + x;
+			return (bits[i >> 6] & (1L << (i & 63))) != 0;
+		}
+	}
+
+	private final Map<Long, Mask> masks = new HashMap<>(); // (size,codepoint) -> mask
+
 	private BufferedImage render(int codepoint, int colorRgb, int size)
 	{
+		Mask m = maskFor(codepoint, size);
+		if (m == null)
+		{
+			return null;
+		}
+		// pure black collides with the IndexedSprite transparent slot (index 0) and renders blank;
+		// nudge it to near-black, which is visually identical.
+		int solid = 0xFF000000 | ((colorRgb == 0 ? 0x010101 : colorRgb) & 0xFFFFFF);
+		BufferedImage img = new BufferedImage(m.w, m.h, BufferedImage.TYPE_INT_ARGB);
+		for (int y = 0; y < m.h; y++)
+		{
+			for (int x = 0; x < m.w; x++)
+			{
+				if (m.solid(x, y))
+				{
+					img.setRGB(x, y, solid);
+				}
+			}
+		}
+		return img;
+	}
+
+	/** Rasterize a glyph once per (size, codepoint); per-colour sprites just repaint the mask. */
+	private Mask maskFor(int codepoint, int size)
+	{
+		long key = ((long) size << 21) | codepoint;
+		Mask cached = masks.get(key);
+		if (cached != null)
+		{
+			return cached == Mask.EMPTY ? null : cached;
+		}
 		Font f = fontFor(size);
 		if (f == null || !f.canDisplay(codepoint))
 		{
+			masks.put(key, Mask.EMPTY);
 			return null;
 		}
 		String s = new String(Character.toChars(codepoint));
@@ -445,34 +501,34 @@ public class GlyphService
 		Graphics2D g = img.createGraphics();
 		// IndexedSprite conversion keeps only fully-opaque pixels. Render aliased (AA off) so
 		// Windows/Linux produce crisp fully-opaque glyphs; macOS ignores this hint and antialiases
-		// anyway, so we flatten the result to a 1-bit mask below.
+		// anyway, so coverage is flattened to the 1-bit mask below (which is also what we cache).
 		g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_OFF);
 		g.setFont(f);
-		// pure black collides with the IndexedSprite transparent slot (index 0) and renders blank;
-		// nudge it to near-black, which is visually identical.
-		g.setColor(new Color(colorRgb == 0 ? 0x010101 : colorRgb));
+		g.setColor(Color.WHITE);
 		g.drawString(s, 0, ascent);
 		g.dispose();
-
-		// macOS' Java2D antialiases even with the AA hint OFF; at small sizes the glyph then has no
-		// fully-opaque pixels and the IndexedSprite (which keeps only fully-opaque pixels) drops
-		// everything, rendering blank. Flatten coverage to a 1-bit mask so glyphs survive on macOS.
-		// No-op on Windows/Linux, where AA-off already yields fully-opaque/transparent pixels.
-		int solid = 0xFF000000 | ((colorRgb == 0 ? 0x010101 : colorRgb) & 0xFFFFFF);
-		for (int y = 0; y < full; y++)
-		{
-			for (int x = 0; x < w; x++)
-			{
-				int a = (img.getRGB(x, y) >>> 24) & 0xFF;
-				img.setRGB(x, y, a >= GLYPH_ALPHA_THRESHOLD ? solid : 0);
-			}
-		}
 
 		// crop to the shared ink window so glyphs sit tight on the baseline (no top/bottom gap)
 		glyphHeight(size); // ensure crop window computed
 		int top = Math.min(cropTop.get(size), full - 1);
 		int ch = Math.min(glyphH.get(size), full - top);
-		return img.getSubimage(0, top, w, ch);
+
+		long[] bits = new long[(w * ch + 63) >> 6];
+		for (int y = 0; y < ch; y++)
+		{
+			for (int x = 0; x < w; x++)
+			{
+				int a = (img.getRGB(x, top + y) >>> 24) & 0xFF;
+				if (a >= GLYPH_ALPHA_THRESHOLD)
+				{
+					int i = y * w + x;
+					bits[i >> 6] |= 1L << (i & 63);
+				}
+			}
+		}
+		Mask m = new Mask(w, ch, bits);
+		masks.put(key, m);
+		return m;
 	}
 
 	/**
@@ -486,6 +542,7 @@ public class GlyphService
 		// clear caches so glyphs re-render with the new font / size
 		fonts.clear();
 		regId.clear();
+		masks.clear();
 		glyphW.clear();
 		glyphH.clear();
 		cropTop.clear();

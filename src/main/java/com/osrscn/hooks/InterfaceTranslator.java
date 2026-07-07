@@ -75,6 +75,7 @@ public class InterfaceTranslator
 
 	// keyed by id+index: dynamic children (skill/quest lists) share one id, so id alone collides
 	private final Map<Long, String> lastSet = new HashMap<>();
+	private final Map<Long, Integer> lastColor = new HashMap<>(); // colour baked into the glyphs, for hover re-render
 	private final Map<Long, String> original = new HashMap<>(); // -> original text, for instant restore
 	// per journal root: the raw slot text the last tick saw, to debounce the client's multi-stage population
 	private final Map<Integer, String> journalSig = new HashMap<>();
@@ -363,6 +364,12 @@ public class InterfaceTranslator
 		int c = text.indexOf("<col=");
 		if (c >= 0)
 		{
+			// Mixed-colour line (base text with highlighted words): the tag colour only covers the
+			// highlights, so painting the whole translation with it looks wrong - keep the base colour.
+			if (c > 0 && text.lastIndexOf("</col>") < text.length() - "</col>".length())
+			{
+				return widgetColor;
+			}
 			int end = text.indexOf('>', c);
 			if (end > c + 5)
 			{
@@ -678,6 +685,29 @@ public class InterfaceTranslator
 		walk(w, false);
 	}
 
+	// True while the game-tick slow lane is walking its groups; client-thread only, so a plain field.
+	private boolean slowLane;
+
+	/**
+	 * Translate the {@link SurfaceRegistry.Surface#slowScan} groups. Called once per game tick (600ms)
+	 * instead of the 50x/s client-tick scan: these are big miss-heavy lists whose recursion and lookup
+	 * cost at client-tick rate tanks the frame rate. A full-tree walk (not translateGroupId) because
+	 * side panels live nested inside the top-level root, not as their own widget root; non-slowScan
+	 * widgets are skipped in translateWidget, so the fast lanes' work is not duplicated.
+	 */
+	public void translateSlowGroups()
+	{
+		slowLane = true;
+		try
+		{
+			scan(false);
+		}
+		finally
+		{
+			slowLane = false;
+		}
+	}
+
 	public void translateGroupId(int groupId)
 	{
 		Widget[] roots = client.getWidgetRoots();
@@ -733,6 +763,13 @@ public class InterfaceTranslator
 		{
 			return;
 		}
+		// Prune slow-scan subtrees from the fast lanes entirely: merely skipping them in
+		// translateWidget still recurses hundreds of rows and clones their child arrays 50x/s,
+		// which is what actually tanked FPS with the world switcher open.
+		if (!slowLane && registry.forGroup(w.getId() >>> 16).slowScan)
+		{
+			return;
+		}
 		translateWidget(w, perFrame);
 		walkArray(w.getStaticChildren(), perFrame);
 		walkArray(w.getDynamicChildren(), perFrame);
@@ -763,8 +800,10 @@ public class InterfaceTranslator
 		// reconstruct groups are owned by reconstructJournals.
 		int grp = w.getId() >>> 16;
 		SurfaceRegistry.Surface s = registry.forGroup(grp);
-		if (s.excluded || (perFrame && s.perFrameExcluded))
+		if (s.excluded || (perFrame && s.perFrameExcluded) || (s.slowScan != slowLane))
 		{
+			// slowScan != slowLane: fast lanes skip slow groups; the slow lane only translates them
+			// (it re-walks the whole tree to reach nested side panels, so skip everything else).
 			return;
 		}
 		if (s.reconstruct && config.reconstructJournals())
@@ -781,9 +820,12 @@ public class InterfaceTranslator
 		}
 		if (text.contains("<img="))
 		{
-			// already shows our translation. Revisit only if it was partial (AI pending) so we can
-			// upgrade it once the missing lines are cached; otherwise it would stay half-English forever.
-			if (!incomplete.contains(key))
+			// already shows our translation. Revisit if it was partial (AI pending), or if the widget's
+			// colour changed since we baked the glyphs - char-images don't follow a native recolour, so
+			// hover highlights (e.g. the music list) need a re-render in the new colour.
+			Integer baked = lastColor.get(key);
+			boolean recolour = baked != null && baked != w.getTextColor();
+			if (!incomplete.contains(key) && !recolour)
 			{
 				return;
 			}
@@ -825,6 +867,7 @@ public class InterfaceTranslator
 			w.setLineHeight(glyph.glyphHeight(size));
 		}
 		lastSet.put(key, r.text);
+		lastColor.put(key, w.getTextColor());
 		// keep retrying partial boxes (AI lines pending) until every translatable line is done
 		if (r.complete)
 		{
@@ -849,6 +892,7 @@ public class InterfaceTranslator
 		}
 		restoreChatTabs();
 		lastSet.clear();
+		lastColor.clear();
 		original.clear();
 		incomplete.clear();
 	}
@@ -890,6 +934,7 @@ public class InterfaceTranslator
 	public void reset()
 	{
 		lastSet.clear();
+		lastColor.clear();
 		original.clear();
 		incomplete.clear();
 		tabOriginal.clear();

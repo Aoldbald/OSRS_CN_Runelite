@@ -42,7 +42,11 @@ public class ChatHandler
 {
 	private static final String BLUE_HEX = "0000ff"; // classic OSRS public-chat blue
 	private static final int BLUE_RGB = 0x0000ff;
-	private static final int GAME_DEFAULT_RGB = 0x000000; // fallback; most game messages carry a <col>
+	// Untagged messages are coloured by the engine per message type; baked glyphs must match.
+	private static final int BROADCAST_OPAQUE_RGB = 0x036602; // sampled from vanilla tip lines
+	private static final int BROADCAST_TRANSPARENT_RGB = 0x036602;
+	private static final int GAME_OPAQUE_RGB = 0x000000;
+	private static final int GAME_TRANSPARENT_RGB = 0xffffff;
 	private static final int CHAT_WIDTH_PX = 480; // approx chat line width, for wrapping
 	private static final int TIMESTAMP_PAD_PX = 60;
 	private static final long PENDING_TIMEOUT_MS = 15_000;
@@ -147,7 +151,7 @@ public class ChatHandler
 			case OBJECT_EXAMINE:
 				if (config.translateGameMessages())
 				{
-					handleGame(node);
+					handleGame(node, event.getType());
 				}
 				break;
 			default:
@@ -222,7 +226,7 @@ public class ChatHandler
 		return true;
 	}
 
-	private void handleGame(MessageNode node)
+	private void handleGame(MessageNode node, ChatMessageType type)
 	{
 		if (node == null)
 		{
@@ -233,14 +237,38 @@ public class ChatHandler
 		{
 			return; // empty, our own message, or already translated
 		}
+		int fallback = engineDefaultColor(type);
 		if (!toggle.isChineseEnabled())
 		{
 			// English mode: track only, so goChinese() can translate messages that arrived
 			// while the toggle was off.
-			track(node, value, Tags.firstColor(value, GAME_DEFAULT_RGB), true);
+			track(node, value, Tags.firstColor(value, fallback), true);
 			return;
 		}
-		translateNode(node, value, Tags.firstColor(value, GAME_DEFAULT_RGB), true);
+		translateNode(node, value, Tags.firstColor(value, fallback), true);
+	}
+
+	/**
+	 * Colour the engine would paint an untagged message of this type. Baked glyph images can't
+	 * inherit the engine's per-type colouring, so we have to reproduce it: broadcast/tip lines are
+	 * vanilla green (player's chat-colour setting wins when set), everything else black on the
+	 * opaque chat box and white on the transparent one.
+	 */
+	private int engineDefaultColor(ChatMessageType type)
+	{
+		boolean transparent = client.getVarbitValue(net.runelite.api.gameval.VarbitID.CHATBOX_TRANSPARENCY) != 0;
+		if (type == ChatMessageType.BROADCAST || type == ChatMessageType.DIDYOUKNOW)
+		{
+			int setting = client.getVarpValue(transparent
+					? net.runelite.api.gameval.VarPlayerID.OPTION_CHAT_COLOUR_BROADCAST_TRANSPARENT
+					: net.runelite.api.gameval.VarPlayerID.OPTION_CHAT_COLOUR_BROADCAST_OPAQUE);
+			if (setting > 0)
+			{
+				return (setting - 1) & 0xffffff;
+			}
+			return transparent ? BROADCAST_TRANSPARENT_RGB : BROADCAST_OPAQUE_RGB;
+		}
+		return transparent ? GAME_TRANSPARENT_RGB : GAME_OPAQUE_RGB;
 	}
 
 	private void translateNode(MessageNode node, String english, int color, boolean persist)

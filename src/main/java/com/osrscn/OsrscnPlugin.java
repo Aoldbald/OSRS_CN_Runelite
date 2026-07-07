@@ -248,6 +248,7 @@ public class OsrscnPlugin extends Plugin
 		ensureCjkUiFontOnMac();
 		store.setBaseUrl(config.dataBaseUrl());
 		store.loadAsync();
+		aiTranslator.preloadAsync();
 		glyph.reloadFont();
 		keyManager.registerKeyListener(toggleHotkey);
 		keyManager.registerKeyListener(clearCacheHotkey);
@@ -319,6 +320,17 @@ public class OsrscnPlugin extends Plugin
 			{
 				menuTranslator.retranslateOpenMenu();
 			}
+		}
+	}
+
+	@Subscribe
+	public void onGameTick(net.runelite.api.events.GameTick t)
+	{
+		// Slow lane for big miss-heavy lists (world switcher): translated once per game tick instead of
+		// the 50x/s client-tick scan, whose repeated lookup misses over hundreds of rows tanked FPS.
+		if (toggle.isChineseEnabled())
+		{
+			interfaceTranslator.translateSlowGroups();
 		}
 	}
 
