@@ -81,9 +81,9 @@ public class MissingCollector
 		{
 			return;
 		}
-		if (isFragment(t) || DYNAMIC.matcher(t).find())
+		if (isFragment(t) || DYNAMIC.matcher(t).find() || hasCjk(t))
 		{
-			return; // half a wrapped sentence, or a live value label: not translatable data
+			return; // half a wrapped sentence, a live value label, or player-authored CJK content
 		}
 		ensureLoaded();
 		if (seen.add(TranslationStore.normalize(t)))
@@ -108,6 +108,19 @@ public class MissingCollector
 		char last = bare.charAt(bare.length() - 1);
 		boolean terminal = last == '.' || last == '!' || last == '?' || last == ':' || last == ')' || last == '"';
 		return !terminal && bare.split("\\s+").length >= 4 && FRAG_END.matcher(bare).find();
+	}
+
+	/** Game English is never CJK, so any CJK codepoint means player-authored content (setup / tab names). */
+	private static boolean hasCjk(String s)
+	{
+		for (int i = 0; i < s.length(); i++)
+		{
+			if (s.charAt(i) >= 0x2E80)
+			{
+				return true;
+			}
+		}
+		return false;
 	}
 
 	private static String clean(String s)

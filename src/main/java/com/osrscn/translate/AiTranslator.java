@@ -39,6 +39,16 @@ public class AiTranslator
 {
 	private static final MediaType JSON = MediaType.parse("application/json");
 	private static final Pattern THINK = Pattern.compile("(?s)<think>.*?</think>");
+	// Value labels (bank/GE totals "(3.6B)", "(500)") change with every gp move, so they never form a
+	// stable cross-session cache hit - keep them out of the on-disk reflow cache. Doses like "(4)" pass.
+	private static final Pattern CACHE_DYNAMIC = Pattern.compile("\\([\\d.,]+[KkMmBb]\\)|\\(\\d[\\d.,]{2,}\\)");
+	// Number-templated messages (kill counts "1,290", prices, durations "4:58", charges) differ by a value
+	// every time, so a cached instance never matches the next - persisting them only bloats the file. The
+	// live in-memory cache still serves them within a session; we just don't write them to disk.
+	private static final Pattern CACHE_NUMTEMPLATE = Pattern.compile(
+			"\\d,\\d|\\d:\\d\\d|kill count is:|completion count is:|Actively traded price|charges remaining"
+			+ "|Personal best|Buy limit:|Guide price|You received:|received a drop:|You healed"
+			+ "|Delve level:|Total duration|Fight duration|Value:\\s*\\d|Level:\\s*\\d|Wave:?\\s*\\d|Rank\\s+\\d");
 
 	private static final String SYSTEM_PROMPT =
 			"You are translating Old School RuneScape (OSRS) game text to Simplified Chinese.\n"
@@ -205,6 +215,31 @@ public class AiTranslator
 		}
 	}
 
+	/**
+	 * Gate for the on-disk reflow cache only - never the in-memory {@code cache}, which always serves live
+	 * on-screen text (cache.put is unconditional). Rejects the two categories that can never be a stable
+	 * cross-session hit and only bloat the cache / pollute reflow submissions: player-authored CJK content
+	 * (game English is never CJK), dynamic value labels, and number-templated messages that never recur.
+	 * Deliberately does NOT apply MissingCollector's fragment / MAX_LEN / WORDY rules - those legitimately
+	 * get translated live (e.g. wrapped info-box lines), and dropping them from disk would make AI-off
+	 * users lose the translation next session.
+	 */
+	private static boolean isPersistable(String english)
+	{
+		if (english == null)
+		{
+			return false;
+		}
+		for (int i = 0; i < english.length(); i++)
+		{
+			if (english.charAt(i) >= 0x2E80)
+			{
+				return false; // CJK = player-created content (inventory-setup / bank-tab names)
+			}
+		}
+		return !CACHE_DYNAMIC.matcher(english).find() && !CACHE_NUMTEMPLATE.matcher(english).find();
+	}
+
 	private synchronized void persistToDisk(String english, String zh)
 	{
 		if (cacheFile == null || english.indexOf('\t') >= 0 || english.indexOf('\n') >= 0
@@ -278,7 +313,7 @@ public class AiTranslator
 						{
 							String zh = clean(content);
 							cache.put(english, zh);
-							if (persist)
+							if (persist && isPersistable(english))
 							{
 								persistToDisk(english, zh);
 							}
