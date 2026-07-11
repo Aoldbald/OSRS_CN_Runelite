@@ -31,7 +31,20 @@ import net.runelite.client.RuneLite;
 public class MissingCollector
 {
 	private static final Pattern WORDY = Pattern.compile("[A-Za-z]{3,}");
-	private static final int MAX_LEN = 300;
+	// Reconstructed quest-journal / achievement-diary sentences can run long; 300 dropped some, so allow
+	// more. Still bounded to keep pathological strings out of the collected file.
+	private static final int MAX_LEN = 500;
+	// A wrapped interface line (a quest-journal line when whole-task reflow is off, a long tip's middle
+	// row, ...) is only ever half a sentence, and translating half-sentences yields broken data. Reject
+	// the tell-tale mid-sentence chunks: a lowercase-leading continuation, or a run of words that ends on
+	// a linking word with no terminal punctuation. Whole labels ("More info", "Over the Mountains") and
+	// full sentences (which end in punctuation) pass; only genuine fragments are dropped.
+	private static final Pattern FRAG_END = Pattern.compile("(?i)\\b(the|a|an|to|of|for|in|on|at|with|from|by"
+			+ "|and|or|as|your|my|his|her|its|their|our|that|which|you|we|they|is|are|was|were|be|been)$");
+	// Live/dynamic labels that recur with a changing value (bank tab totals "Tab 2 (96.9K)", amount
+	// buttons "Deposit-15000"): not translatable content, and they spam the file as the value ticks.
+	private static final Pattern DYNAMIC = Pattern.compile(
+			"\\([\\d.,]+[KkMmBb]\\)|^(?:Deposit|Withdraw)-\\d+$");
 
 	@Inject
 	private OsrscnConfig config;
@@ -68,12 +81,33 @@ public class MissingCollector
 		{
 			return;
 		}
+		if (isFragment(t) || DYNAMIC.matcher(t).find())
+		{
+			return; // half a wrapped sentence, or a live value label: not translatable data
+		}
 		ensureLoaded();
 		if (seen.add(TranslationStore.normalize(t)))
 		{
 			pending.add(t + "\t\t" + clean(category) + "\t" + clean(subCategory) + "\t" + clean(source));
 			ensureFlusher();
 		}
+	}
+
+	/** A wrapped-line fragment (mid-sentence), which must not be collected as a translatable unit. */
+	private static boolean isFragment(String t)
+	{
+		String bare = t.replaceAll("<[^>]+>", "").trim();
+		if (bare.isEmpty())
+		{
+			return false;
+		}
+		if (Character.isLowerCase(bare.charAt(0)))
+		{
+			return true; // starts mid-sentence
+		}
+		char last = bare.charAt(bare.length() - 1);
+		boolean terminal = last == '.' || last == '!' || last == '?' || last == ':' || last == ')' || last == '"';
+		return !terminal && bare.split("\\s+").length >= 4 && FRAG_END.matcher(bare).find();
 	}
 
 	private static String clean(String s)

@@ -201,7 +201,7 @@ public interface OsrscnConfig extends Config
 	@ConfigItem(
 			keyName = "aiFillInterface",
 			name = "界面缺词 AI 翻译",
-			description = "界面里查表没有的文字也用 AI 翻译（新版技能指南会跳过，建议用旧版指南）",
+			description = "界面里查表没有的文字也用 AI 翻译（含新版技能指南正文的缺句）",
 			section = ai,
 			position = 2
 	)
@@ -212,15 +212,28 @@ public interface OsrscnConfig extends Config
 
 	@ConfigItem(
 			keyName = "reconstructJournals",
-			name = "成就/任务日志整句翻译(实验)",
-			description = "把成就日志/任务日志里被折行拆碎的任务拼回整句再翻译。实验功能，"
+			name = "成就/任务日志整句翻译",
+			description = "把成就日志/任务日志里被折行拆碎的任务拼回整句再翻译，并保留完成/要求的颜色区分。"
 					+ "需配合「界面缺词 AI 翻译」效果最好；不满意可关闭。",
 			section = ai,
 			position = 3
 	)
 	default boolean reconstructJournals()
 	{
-		return false;
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "skillGuideOverlay",
+			name = "新版技能指南翻译",
+			description = "翻译新版技能指南（OSRS 设置 Enable new-style skill guide interface 的界面）：正文整段重排为中文，"
+					+ "图标、链接、维基横幅保持可用。游戏更新若导致排版异常，可临时关闭恢复英文。",
+			section = ai,
+			position = 4
+	)
+	default boolean skillGuideOverlay()
+	{
+		return true;
 	}
 
 	@ConfigItem(
@@ -228,7 +241,7 @@ public interface OsrscnConfig extends Config
 			name = "翻译并发数",
 			description = "同时进行的 AI 翻译请求数。越大填充越快，但更吃 GPU、可能掉帧（Ollama 需开并行）",
 			section = ai,
-			position = 4
+			position = 5
 	)
 	@Range(min = 1, max = 6)
 	default int aiConcurrency()
@@ -241,7 +254,7 @@ public interface OsrscnConfig extends Config
 			name = "翻译间隔(ms)",
 			description = "每次 AI 翻译之间的最小间隔。越小填充越快、越吃 GPU；越大越省 FPS",
 			section = ai,
-			position = 5
+			position = 6
 	)
 	@Range(min = 0, max = 1000)
 	@Units("ms")
@@ -255,7 +268,7 @@ public interface OsrscnConfig extends Config
 			name = "Ollama 地址",
 			description = "本地 Ollama 服务地址（后端选「本地 Ollama」时使用）",
 			section = ai,
-			position = 6
+			position = 7
 	)
 	default String ollamaUrl()
 	{
@@ -267,7 +280,7 @@ public interface OsrscnConfig extends Config
 			name = "Ollama 模型",
 			description = "用于翻译的模型名（后端选「本地 Ollama」时使用）",
 			section = ai,
-			position = 7
+			position = 8
 	)
 	default String ollamaModel()
 	{
@@ -280,7 +293,7 @@ public interface OsrscnConfig extends Config
 			description = "后端选「在线 API」时使用。选一个常用服务商会自动填好下面的「API 地址」"
 					+ "（之后仍可手改）。选「自定义」则自己填地址。",
 			section = ai,
-			position = 8
+			position = 9
 	)
 	default AiProvider aiProvider()
 	{
@@ -293,7 +306,7 @@ public interface OsrscnConfig extends Config
 			description = "OpenAI 兼容接口的基础地址，如 https://api.deepseek.com。"
 					+ "插件会自动补 /chat/completions。一般选好「API 服务商」即可自动填。",
 			section = ai,
-			position = 9
+			position = 10
 	)
 	default String apiUrl()
 	{
@@ -305,7 +318,7 @@ public interface OsrscnConfig extends Config
 			name = "API 密钥",
 			description = "服务商给的 API Key（后端选「在线 API」时使用）。保存在本地 RuneLite 配置里，不要分享给别人。",
 			section = ai,
-			position = 10,
+			position = 11,
 			secret = true
 	)
 	default String apiKey()
@@ -318,7 +331,7 @@ public interface OsrscnConfig extends Config
 			name = "API 模型",
 			description = "模型名（后端选「在线 API」时使用），如 deepseek-chat、gpt-4o-mini、Qwen/Qwen2.5-7B-Instruct 等。",
 			section = ai,
-			position = 11
+			position = 12
 	)
 	default String apiModel()
 	{
@@ -331,7 +344,7 @@ public interface OsrscnConfig extends Config
 			description = "勾一下立即测试当前「AI 后端」是否连通（在线 API 还会验密钥），不消耗 token。"
 					+ "勾后会自动弹回，结果用弹窗提示。",
 			section = ai,
-			position = 12
+			position = 13
 	)
 	default boolean testConnection()
 	{

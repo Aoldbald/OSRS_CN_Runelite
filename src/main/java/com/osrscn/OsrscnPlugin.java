@@ -444,13 +444,23 @@ public class OsrscnPlugin extends Plugin
 		if ("fontPath".equals(key) || "mainFontSize".equals(key))
 		{
 			glyph.reloadFont();
-			dialogueHandler.reset();
-			interfaceTranslator.reset();
+			// reset() now reverts 860 widgets, so it must run on the client thread (this event fires on the EDT)
+			clientThread.invoke(() ->
+			{
+				dialogueHandler.reset();
+				interfaceTranslator.reset();
+			});
 			// reloadFont cleared the glyph cache: re-warm so the new font/size doesn't flash on first use.
 			if (store.isLoaded())
 			{
 				glyph.beginPrewarm(store.chineseCodepoints());
 			}
+		}
+		// Turning the new-style skill guide translation off must actively hand the page back to the client,
+		// or the last laid-out Chinese stays frozen on screen with no pass left to clean it up.
+		if ("skillGuideOverlay".equals(key) && !config.skillGuideOverlay())
+		{
+			clientThread.invoke(interfaceTranslator::revertSkillGuide);
 		}
 	}
 

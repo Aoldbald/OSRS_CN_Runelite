@@ -526,6 +526,8 @@ public class OsrscnPanel extends PluginPanel
 	public void stop()
 	{
 		refreshTimer.stop();
+		translatePoll.stop();  // a manual-translate poll in flight would otherwise keep ticking ~15s
+		searchDebounce.stop();
 	}
 
 	/** Re-read config-driven visibility (called when settings change). */

@@ -48,6 +48,8 @@ public class TranslationStore
 		EXAMINE("transcript_zh_examine.tsv"),
 		GAME_TEXT("transcript_zh_gameText.tsv"),
 		LVL_UP("transcript_zh_lvl_up_msg.tsv"),
+		// skill-guide prose/titles (group 860), regenerated wholesale from the cache-dump pipeline
+		SKILL_GUIDE("transcript_zh_skillguide.tsv"),
 		AI_BAKED("transcript_zh_ai_baked.tsv");
 
 		final String file;
@@ -63,15 +65,16 @@ public class TranslationStore
 	// tables stay last (experimental dead last) so curated tables win.
 	private static final Category[] ANY_ORDER = {
 			Category.DIALOGUE, Category.GAME_TEXT, Category.LVL_UP, Category.INTERFACE, Category.NAME,
-			Category.EXAMINE, Category.AI_BAKED, Category.ACTIONS, Category.INVENTORY_ACTIONS,
-			Category.DIALOGUE_EXPERIMENTAL,
+			Category.EXAMINE, Category.SKILL_GUIDE, Category.AI_BAKED, Category.ACTIONS,
+			Category.INVENTORY_ACTIONS, Category.DIALOGUE_EXPERIMENTAL,
 	};
 
 	// Categories that also get a case-insensitive index. The huge dialogue tables are
 	// excluded to save memory - dialogue is matched verbatim.
 	private static final java.util.EnumSet<Category> LOOSE = java.util.EnumSet.of(
 			Category.NAME, Category.INTERFACE, Category.GAME_TEXT, Category.EXAMINE,
-			Category.AI_BAKED, Category.LVL_UP, Category.ACTIONS, Category.INVENTORY_ACTIONS);
+			Category.SKILL_GUIDE, Category.AI_BAKED, Category.LVL_UP, Category.ACTIONS,
+			Category.INVENTORY_ACTIONS);
 
 	private final File cacheDir = new File(RuneLite.RUNELITE_DIR, "osrscn/zh");
 	private final Map<Category, Map<String, String>> maps = new EnumMap<>(Category.class);

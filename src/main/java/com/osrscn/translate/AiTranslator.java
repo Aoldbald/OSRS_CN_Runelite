@@ -13,6 +13,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import lombok.extern.slf4j.Slf4j;
@@ -37,14 +38,16 @@ import okhttp3.Response;
 public class AiTranslator
 {
 	private static final MediaType JSON = MediaType.parse("application/json");
+	private static final Pattern THINK = Pattern.compile("(?s)<think>.*?</think>");
 
 	private static final String SYSTEM_PROMPT =
 			"You are translating Old School RuneScape (OSRS) game text to Simplified Chinese.\n"
 			+ "Rules:\n"
 			+ "1. Concise, natural game-style Chinese. This is in-game text, not literature.\n"
 			+ "2. Keep proper nouns without established translations in English.\n"
-			+ "3. Preserve ALL tags exactly as-is: <br>, [player name], [player 1], "
-			+ "<osrscn-name-0>, [milady/sirrah] etc. Never translate placeholders and never add "
+			+ "3. Preserve ALL tags exactly as-is: <br>, <colNum0>, </col>, [player name], [player 1], "
+			+ "<osrscn-name-0>, [milady/sirrah] etc. Keep every <colNumN> placeholder in place around the "
+			+ "same words it wraps in the source. Never translate placeholders and never add "
 			+ "tags that are not in the source.\n"
 			+ "4. Output ONLY the translation, nothing else.";
 
@@ -474,7 +477,7 @@ public class AiTranslator
 
 	private static String clean(String s)
 	{
-		return s.replaceAll("(?s)<think>.*?</think>", "").trim();
+		return THINK.matcher(s).replaceAll("").trim();
 	}
 
 	private JsonObject message(String role, String content)

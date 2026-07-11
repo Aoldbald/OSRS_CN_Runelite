@@ -20,6 +20,7 @@ public final class Tags
 	private static final Pattern COL_PLACEHOLDER = Pattern.compile("<colNum\\d+>");
 	// Every colour/underline/strikethrough tag + colour placeholder, for stripping a line to plain text.
 	private static final Pattern STYLE = Pattern.compile("(?i)</?(?:col|u|str)[^>]*>|<colNum\\d+>");
+	private static final Pattern WHITESPACE = Pattern.compile("\\s+");
 
 	private Tags()
 	{
@@ -49,8 +50,8 @@ public final class Tags
 		{
 			return "";
 		}
-		return ALL_TAGS.matcher(s.replace("<br>", " ").replace('\u00A0', ' '))
-				.replaceAll("").replaceAll("\\s+", " ").trim();
+		String noTags = ALL_TAGS.matcher(s.replace("<br>", " ").replace('\u00A0', ' ')).replaceAll("");
+		return WHITESPACE.matcher(noTags).replaceAll(" ").trim();
 	}
 
 	/** Lower-case 6-digit hex of an RGB value, for building {@code <col=RRGGBB>} tags. */
@@ -110,6 +111,22 @@ public final class Tags
 			s = s.replace("<colNum" + i + ">", tags.get(i));
 		}
 		return s;
+	}
+
+	/** How many {@code <colNumN>} placeholders a string carries, to check a translation kept them all. */
+	public static int placeholderCount(String s)
+	{
+		if (s == null)
+		{
+			return 0;
+		}
+		int n = 0;
+		Matcher m = COL_PLACEHOLDER.matcher(s);
+		while (m.find())
+		{
+			n++;
+		}
+		return n;
 	}
 
 	/** Drop colour placeholders and any literal {@code </col>}, for single-colour glyph rendering. */

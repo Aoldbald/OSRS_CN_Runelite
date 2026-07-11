@@ -26,6 +26,7 @@ public class Translator
 	private static final String PLAYER_NAME = "[player name]";
 	private static final Pattern NUMBER = Pattern.compile("\\d+(?:[.,]\\d+)*");
 	private static final Pattern WORDY = Pattern.compile("[A-Za-z]{3,}"); // has a real word worth AI-translating
+	private static final Pattern HAS_LETTER = Pattern.compile("[A-Za-z]");
 	private static final Pattern TOP_THREE_WERE = Pattern.compile("(?i)(top three .+? were )(.+?)([.!?])");
 	private static final Pattern TOP_CRAB_WAS = Pattern.compile("(?i)the top crab crusher was (.+?)([.!?])");
 	private static final Pattern MEMBERS_LINE = Pattern.compile("(?i)^Members:\\s*(.+)$");
@@ -117,6 +118,36 @@ public class Translator
 	}
 
 	/**
+	 * Colour-aware dialogue translation. A line with an inline {@code <col=..>} segment (e.g. the red
+	 * "Hardcore Group Ironmen" in a tutor line) keeps its colours by translating the {@code <colNumN>}
+	 * templated form: coloured transcript entries are stored that way, and the AI is told to preserve
+	 * tags, so the placeholders survive and {@link Tags#restoreColors} paints each segment. Safety: an
+	 * uncoloured line takes the exact plain path unchanged; if the model drops or reorders the
+	 * placeholders (count mismatch) we strip them and render single-colour, so a coloured line never
+	 * comes out worse than today. Returns {@code null} while the AI is still in flight (caller retries).
+	 */
+	public String plainColored(String text, String category, String subCategory, String source)
+	{
+		if (text == null || text.trim().isEmpty())
+		{
+			return null;
+		}
+		List<String> colors = Tags.colorTags(text);
+		if (colors.isEmpty())
+		{
+			return plainCollect(Tags.stripTags(text), category, subCategory, source);
+		}
+		String zh = plainCore(Tags.placeholdColors(text), category, subCategory, source, true);
+		if (zh == null)
+		{
+			return null;
+		}
+		return Tags.placeholderCount(zh) == colors.size()
+				? Tags.restoreColors(zh, colors)
+				: Tags.stripColorPlaceholders(zh);
+	}
+
+	/**
 	 * Plain-text translation with no client access (no player-name substitution), safe to call from
 	 * the Swing thread - used by the side panel's manual translate box.
 	 */
@@ -198,9 +229,10 @@ public class Translator
 
 	// Tables tried, in order, for generic interface text (LVL_UP covers level-up chat messages).
 	private static final TranslationStore.Category[] UI_ORDER = {
-			TranslationStore.Category.INTERFACE, TranslationStore.Category.GAME_TEXT,
-			TranslationStore.Category.LVL_UP, TranslationStore.Category.NAME,
-			TranslationStore.Category.EXAMINE, TranslationStore.Category.AI_BAKED,
+			TranslationStore.Category.INTERFACE, TranslationStore.Category.SKILL_GUIDE,
+			TranslationStore.Category.GAME_TEXT, TranslationStore.Category.LVL_UP,
+			TranslationStore.Category.NAME, TranslationStore.Category.EXAMINE,
+			TranslationStore.Category.AI_BAKED,
 	};
 
 	// Chat/game messages often come from dialogue captures even when shown in the chatbox.
@@ -499,7 +531,7 @@ public class Translator
 		int len = name.length();
 		return len >= 1 && len <= 12
 				&& name.matches("[A-Za-z0-9 _-]+")
-				&& Pattern.compile("[A-Za-z]").matcher(name).find();
+				&& HAS_LETTER.matcher(name).find();
 	}
 
 	private static final class ProtectedText
@@ -756,6 +788,10 @@ public class Translator
 		{
 			return zh;
 		}
+		// Capture the verbatim reconstructed journal sentence (quest journal / achievement diary) so it
+		// can be batch-translated and baked into the tables later. This is the only drift-free source for
+		// journal recaps: they are server-sent, absent from both the cache dump and (accurately) the wiki.
+		missing.record(plain, "journal", "", "");
 		return aiFallback ? aiLine(plain, true) : null;
 	}
 

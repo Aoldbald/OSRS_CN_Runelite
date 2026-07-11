@@ -166,10 +166,11 @@ public class DialogueHandler
 			npc = lastNpcName;
 		}
 		String speaker = key.equals(NPC_TEXT_KEY) ? npc : "Player";
-		String zh = translator.plainCollect(english, "dialogue", npc, speaker);
+		String zh = translator.plainColored(text, "dialogue", npc, speaker);
 		// record new NPC/player dialogue lines into the history panel (this runs only when the line
-		// actually changed, so it captures each line once as the dialogue advances)
-		captureHistory(key, english, zh);
+		// actually changed, so it captures each line once as the dialogue advances). The panel shows
+		// plain Chinese; the widget render below keeps the inline <col> segments.
+		captureHistory(key, english, zh == null ? null : Tags.stripCol(zh));
 		if (zh == null)
 		{
 			return; // not translated yet; a later tick retries

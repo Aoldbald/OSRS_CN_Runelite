@@ -202,6 +202,11 @@ public class MenuTranslator
 		}
 		if (renderedName == null)
 		{
+			// skill-guide link targets ("Courses tab", "Cook's Assistant quest") live in SKILL_GUIDE
+			renderedName = translator.lookupRender(Category.SKILL_GUIDE, name, color, 0, size);
+		}
+		if (renderedName == null)
+		{
 			return null; // not in table (or not ready): leave English so it stays readable
 		}
 		return renderedName + levelSuffix;

@@ -101,8 +101,10 @@ public class GlyphService
 
 	// Colours pre-warmed for every translated character so its first appearance never flashes English
 	// while the sprite uploads: white (menu/UI), OSRS blue (public chat), yellow (overhead/highlight),
-	// near-black (game messages / dialogue / default widget text). Rare widget colours stay lazy.
-	private static final int[] PREWARM_COLORS = {0xFFFFFF, 0x0000FF, 0xFFFF00, 0x000000};
+	// near-black (game messages / dialogue / default widget text), and the skill-guide prose orange
+	// (whose first-use upload used to hold every freshly opened guide page in English for ~0.5s).
+	// Rare widget colours stay lazy.
+	private static final int[] PREWARM_COLORS = {0xFFFFFF, 0x0000FF, 0xFFFF00, 0x000000, 0xFF981F};
 
 	private final Map<Long, Integer> regId = new HashMap<>(); // (size,colour,codepoint) -> registration id / FAILED
 	private int[] prewarmCps;   // codepoints still to warm (null when idle/done)
@@ -329,6 +331,85 @@ public class GlyphService
 			}
 		}
 		return ready ? out.toString() : null;
+	}
+
+	/**
+	 * Wrap tag-free text into lines by pixel budget: the first line gets {@code firstPx}, later lines
+	 * {@code restPx}. A CJK glyph counts {@link #glyphWidth(int)} px, anything else (ASCII, digit,
+	 * space) half that. Unbreakable tokens - a maximal non-CJK run ("15%", "1,000,000") or a CJK char
+	 * with its trailing {@link #NO_LEADING} punctuation - are measured up front and moved whole to the
+	 * next line when they don't fit, so a line never overflows its budget and never starts with closing
+	 * punctuation. A token wider than a whole line is placed alone (overshoot accepted, no split).
+	 */
+	public java.util.List<String> wrapPlain(String plain, int firstPx, int restPx, int size)
+	{
+		java.util.List<String> lines = new java.util.ArrayList<>();
+		if (plain == null || plain.isEmpty())
+		{
+			return lines;
+		}
+		plain = normalizeSeparators(plain);
+		int gw = glyphWidth(size);
+		int half = (gw + 1) / 2;
+		int budget = Math.max(firstPx, gw);
+		int restBudget = Math.max(restPx, gw);
+		StringBuilder line = new StringBuilder();
+		int lineW = 0;
+		int i = 0;
+		int len = plain.length();
+		while (i < len)
+		{
+			// form the next unbreakable token and measure it
+			int start = i;
+			int tokenW = 0;
+			int cp = plain.codePointAt(i);
+			if (cp < 0x2E80)
+			{
+				if (Character.isWhitespace(plain.charAt(i)))
+				{
+					i++;
+					tokenW = half; // a single space: breakable, dropped at a line start
+				}
+				else
+				{
+					while (i < len && plain.codePointAt(i) < 0x2E80 && !Character.isWhitespace(plain.charAt(i)))
+					{
+						tokenW += half;
+						i += Character.charCount(plain.codePointAt(i));
+					}
+				}
+			}
+			else
+			{
+				tokenW = gw;
+				i += Character.charCount(cp);
+			}
+			// attach trailing no-leading punctuation so a line never starts with it
+			while (i < len && NO_LEADING.indexOf(plain.charAt(i)) >= 0)
+			{
+				tokenW += plain.codePointAt(i) < 0x2E80 ? half : gw;
+				i++;
+			}
+			String token = plain.substring(start, i);
+			if (lineW > 0 && lineW + tokenW > budget)
+			{
+				lines.add(line.toString());
+				line.setLength(0);
+				lineW = 0;
+				budget = restBudget;
+				if (token.trim().isEmpty())
+				{
+					continue; // drop the whitespace the line broke on
+				}
+			}
+			line.append(token);
+			lineW += tokenW;
+		}
+		if (line.length() > 0)
+		{
+			lines.add(line.toString());
+		}
+		return lines;
 	}
 
 	/**

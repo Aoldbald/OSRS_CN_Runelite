@@ -81,6 +81,16 @@ public class InterfaceTranslator
 	private final Map<Integer, String> journalSig = new HashMap<>();
 	// widgets we translated only partially (some AI lines pending): re-translate until complete
 	private final Set<Long> incomplete = new HashSet<>();
+	// prose slots (860) whose position we changed while compacting: original x/y to revert on restore/decommit
+	private final Map<Long, Integer> movedX = new HashMap<>();
+	private final Map<Long, Integer> movedY = new HashMap<>();
+	// native width before we widened a slot: without reverting it, the next layout's column measurement
+	// reads our own widened slots and the column inflates a little more on every re-layout / tab switch
+	private final Map<Long, Integer> movedW = new HashMap<>();
+	// where WE put each moved widget: live != placed means the client repositioned it (repopulation evidence),
+	// and live == placed corroborates the geometry is still ours and safe to revert
+	private final Map<Long, Integer> placedX = new HashMap<>();
+	private final Map<Long, Integer> placedY = new HashMap<>();
 	// chat tab labels are handled explicitly by component id (the generic walk's index-based key proved
 	// unreliable for them across re-translation, leaving them stuck in Chinese on an English toggle).
 	private final Map<Integer, String> tabOriginal = new HashMap<>();
@@ -99,6 +109,7 @@ public class InterfaceTranslator
 		scan(false);
 		translateChatTabs();
 		reconstructJournals();
+		reconstructWordSplit(); // PROTOTYPE Phase 3: new-style (word-per-widget) skill guide, group 860
 	}
 
 	// ===== Experimental whole-task journal translation (config.reconstructJournals) =====
@@ -123,6 +134,1468 @@ public class InterfaceTranslator
 		}
 		reconstructRoot(InterfaceID.Journalscroll.UNIVERSE);
 		reconstructRoot(InterfaceID.Questjournal.UNIVERSE);
+	}
+
+	private static final int SKILL_GUIDE_NEW_GROUP = 860;
+	private static final int PROSE_CHILD = 0x0e; // the guide's description column (word-per-widget prose)
+	private static final int PROSE_COMPONENT_ID = (SKILL_GUIDE_NEW_GROUP << 16) | PROSE_CHILD;
+	private static final int PROSE_SCROLLBAR_ID = (SKILL_GUIDE_NEW_GROUP << 16) | 0x10; // its scrollbar
+	private String lastProseSig = ""; // debounce: only reflow the prose once its raw text settles
+	private String committedSig = null; // the effective-English frame we last fully laid out (skip if unchanged)
+	private Integer proseNativeScrollHeight = null; // container scrollHeight before we shrank it
+	private int appliedScrollHeight = -1; // what we last set; -2 = gave up (a clientscript keeps fighting us)
+	private int scrollFights = 0;
+	private String failedSig = null; // frame that last failed layout (translation pending): retry throttle
+	private int pendingCooldown = 0;
+	private boolean pendingHasAi = false; // last incomplete pass waited on AI (throttle) vs glyph upload (don't)
+	private int sigTick = 0; // committed-state signature is only rebuilt every 8th tick (cost control)
+
+	/**
+	 * Reflow the new-style skill guide (group 860), whose prose is split one word per widget, into readable
+	 * Chinese. Title, tabs and item/quest lists are whole labels translated in place ({@link #translateLabel});
+	 * the prose column (child {@code 0x0e}) is reflowed by {@link #reflowProse}, which pins each translated
+	 * line to the client's own line grid so fixed-position sprite icons stay put and inline links stay
+	 * clickable. Gated on {@code skillGuideOverlay}.
+	 */
+	private void reconstructWordSplit()
+	{
+		if (!config.skillGuideOverlay())
+		{
+			return;
+		}
+		Widget root = client.getWidget(SKILL_GUIDE_NEW_GROUP, 0);
+		if (root == null || root.isHidden())
+		{
+			return;
+		}
+		Widget container = client.getWidget(SKILL_GUIDE_NEW_GROUP, PROSE_CHILD);
+		if (container == null)
+		{
+			return; // interface mid-close
+		}
+		List<Widget> slots = new ArrayList<>();
+		collectTextSlots(root, slots);
+		// The description column (widget child 0x0e) is real prose split one word per widget: reflow it
+		// (icons, inline links and headers inside it are handled by reflowProse). Everything else - title,
+		// tabs, and the item / quest name lists - is a complete label per widget, so translate those in
+		// place (setText keeps the widget and its click target, so tabs stay clickable).
+		List<Widget> prose = new ArrayList<>();
+		for (Widget w : slots)
+		{
+			if ((w.getId() & 0xFFFF) == PROSE_CHILD)
+			{
+				// Only the container's DIRECT children take part in the flow. The wiki banner is a type-0
+				// sub-layer child whose own children (caps/bars/badge/text) carry coordinates relative to
+				// the LAYER (0..20) - flowed raw they shredded paragraph one. The banner moves as one unit.
+				if (w.getParent() == container && flowMember(w))
+				{
+					prose.add(w);
+				}
+			}
+			else
+			{
+				translateLabel(w);
+			}
+		}
+		// The prose column also holds TEXTLESS children - sprite icons and horizontal divider lines
+		// (getText()==null, so collectTextSlots skips them). They are part of the reading flow and must be
+		// repositioned with the text, so collect them here.
+		Widget[] kids = container.getDynamicChildren();
+		if (kids != null)
+		{
+			for (Widget w : kids)
+			{
+				if (w == null)
+				{
+					continue;
+				}
+				if (w.getText() == null && w.getSpriteId() > 0 && flowMember(w))
+				{
+					prose.add(w);
+				}
+				// A sub-layer (the wiki banner) stays out of the flow, but its own label ("View X on the
+				// Wiki") is translated in place - text only, geometry untouched, so the banner keeps its
+				// centring and click behaviour.
+				if (w.getType() == 0 && !w.isSelfHidden())
+				{
+					for (Widget[] group : new Widget[][]{
+							w.getDynamicChildren(), w.getStaticChildren(), w.getNestedChildren()})
+					{
+						if (group == null)
+						{
+							continue;
+						}
+						for (Widget c : group)
+						{
+							if (c != null && c.getText() != null && !c.getText().isEmpty())
+							{
+								translateLabel(c);
+							}
+						}
+					}
+				}
+			}
+		}
+		reflowProse(container, prose);
+	}
+
+	// The wiki banner's frame furniture: end caps (917/919, 9x16), long bars (918/920, 173x9) and the WIKI
+	// badge (2420, 40x14). They are absolutely positioned at y=0..20 (the client places the drawn banner
+	// itself) yet render nowhere near there, so flowing them shredded paragraph one with invisible spacers.
+	// The banner's functional part - the "View X on the Wiki" icon+link row - is separate and flows fine.
+	private static final Set<Integer> BANNER_SPRITES = new HashSet<>(java.util.Arrays.asList(917, 918, 919, 920, 2420));
+
+	/**
+	 * True when a prose-column child takes part in the reading flow. Excluded: hidden slots, pool widgets
+	 * still parked at (0,0), and - crucially - anything not ABSOLUTELY positioned. The wiki banner's frame
+	 * (side caps, 173px bars, the WIKI badge and its text) is anchored to the container's bottom, so its
+	 * raw coordinates read 0..20 and once sorted the whole banner shredded itself into paragraph one. The
+	 * client keeps anchored widgets placed correctly on its own, including after we shrink the scroll area.
+	 */
+	private boolean flowMember(Widget w)
+	{
+		return !w.isSelfHidden() && !parkedAtOrigin(w)
+				&& w.getXPositionMode() == 0 && w.getYPositionMode() == 0
+				// banner furniture carries empty TEXT, so it arrives through the text walk - the sprite-id
+				// quarantine must sit here on the shared path, not in the textless-sprite loop
+				&& !BANNER_SPRITES.contains(w.getSpriteId());
+	}
+
+	/**
+	 * True for a pool widget still parked at (0,0): the client creates children there and positions them a
+	 * step later. Laying one out would prepend it to the flow (real prose starts at x/y >= 2). The ledger is
+	 * consulted so a widget WE moved - whose live position is ours, not the pool's - is never mistaken for
+	 * parked.
+	 */
+	private boolean parkedAtOrigin(Widget w)
+	{
+		return nativeX(w) == 0 && nativeY(w) == 0;
+	}
+
+	/** In-place whole-label translation of one widget (title / tab / item / quest name), keeping it clickable. */
+	private void translateLabel(Widget w)
+	{
+		String t = w.getText();
+		if (t == null || t.isEmpty() || t.contains("<img="))
+		{
+			return;
+		}
+		long key = widgetKey(w);
+		if (t.equals(lastSet.get(key)))
+		{
+			return;
+		}
+		int size = glyph.uiSize();
+		int maxChars = glyph.wrapChars(w.getWidth() - WRAP_PAD, size);
+		if (maxChars < MIN_WRAP)
+		{
+			maxChars = 0; // short labels (tabs) shouldn't force-wrap
+		}
+		// Full interface render: splits <br> (item name + "Requires:" line), looks each line up, and keeps
+		// the <col> requirement colour - item / quest names sit in the tables like any other UI text.
+		Translator.Rendered r = translator.renderUi(t, w.getTextColor(), maxChars, size, config.aiFillInterface());
+		if (r == null)
+		{
+			return;
+		}
+		original.put(key, t);
+		w.setText(r.text);
+		w.setTextShadowed(false);
+		if (r.text.contains("<br>"))
+		{
+			w.setLineHeight(glyph.glyphHeight(size));
+		}
+		lastSet.put(key, r.text);
+	}
+
+	private enum ProseKind
+	{
+		WORD,   // translatable prose word
+		ICON,   // game sprite / divider line - flows as inline or block decoration
+		LINK,   // clickable cross-reference (<u=ffff00>...</u>) - translate in place, keep the widget
+		HITBOX, // transparent rectangle carrying a link's click listener: moved to wherever its link goes
+		HEADER, // white section title (e.g. "Getting Started")
+		OURS    // a slot we already translated or blanked this session (idempotent skip)
+	}
+
+	/**
+	 * Classify one prose slot. Widget TYPE comes first: the real 860 dump shows sprites/dividers/hitboxes
+	 * all carry an EMPTY text (not null), so a text-based check would misfile them as spacers - the exact
+	 * bug that left icons stranded under the compacted text. Types: 3=rectangle (the invisible click hitbox
+	 * of a link, opacity 255 + listener), 5=graphic (icon sprite), 9=line (divider).
+	 */
+	private ProseKind classify(Widget w)
+	{
+		int type = w.getType();
+		if (type == 5 || type == 9)
+		{
+			return ProseKind.ICON;
+		}
+		if (type == 3)
+		{
+			// Only a LINE-SIZED rectangle is a link hitbox. The container also holds a huge transparent
+			// rectangle (full-panel click zone, y=0): row-matching against it once backed the entire first
+			// text row as "links" and shattered the paragraph into yellow fragments. Never touch it.
+			return w.getHeight() <= 24 && w.getWidth() <= 250 ? ProseKind.HITBOX : ProseKind.OURS;
+		}
+		long key = widgetKey(w);
+		String cur = w.getText();
+		if (cur == null)
+		{
+			return ProseKind.ICON;
+		}
+		if (cur.equals(lastSet.get(key)))
+		{
+			return ProseKind.OURS; // exactly our char-image head or our blank
+		}
+		if (cur.isEmpty())
+		{
+			return ProseKind.OURS; // client spacer / already blank
+		}
+		if (cur.contains("<img="))
+		{
+			return ProseKind.ICON;
+		}
+		// A link is underlined or (yellow AND actually clickable). A merely-yellow word with no listener is
+		// prose emphasis: keep it in the word run so the sentence translates whole instead of fragmenting.
+		if (cur.contains("<u=") || ((w.getTextColor() & 0xFFFFFF) == 0xffff00 && w.hasListener()))
+		{
+			return ProseKind.LINK;
+		}
+		if ((w.getTextColor() & 0xFFFFFF) == 0xffffff)
+		{
+			return ProseKind.HEADER;
+		}
+		return ProseKind.WORD;
+	}
+
+	/**
+	 * Reflow the word-per-widget description column (child {@code 0x0e}) into compact readable Chinese by
+	 * treating the whole column as one inline flow (like an HTML paragraph engine) laid back onto the native
+	 * widgets. Reading order (sort by y then x) is walked with a running cursor (cx,cy): a run of words is
+	 * translated whole and its Chinese is poured across lines one-line-per-widget (never folding many lines
+	 * into one widget, which garbled before); a sprite icon is repositioned inline to the cursor so it flows
+	 * with the text it annotates (never left at its English x, which floated before); an inline link is
+	 * rendered yellow into its own widget (click listener kept) at the cursor; a white header breaks the
+	 * line. Because Chinese is denser the flow always ends higher than the English did, so it compacts with
+	 * no blank gaps and nothing overlaps. Everything moved records its native x/y for restore.
+	 *
+	 * <p>Each pass first restores our slots to English (so it re-lays from a clean frame in one tick, no
+	 * flicker) then re-flows; it only runs once the effective English is stable two ticks and stops once a
+	 * complete pass is committed. If the client rewrites a slot we own (tab switch) we drop our state and
+	 * wait for the rebuild to settle.
+	 */
+	private void reflowProse(Widget container, List<Widget> prose)
+	{
+		if (prose.size() < 2)
+		{
+			return;
+		}
+		// Sort by *native* position (moved widgets report their stored original), so once we compact the flow
+		// the reading order - and therefore the signature computed from it - stays stable. Sorting by the live
+		// (moved) position would change the order every tick and thrash debounce/commit forever. Y goes
+		// through row CLUSTERING (adjacent native ys within 8px = one visual row): icons sit a few px off
+		// their row's text baseline, and a fixed 16px bucket once split an icon (y=138) from its own link
+		// (y=140) across a bucket edge, tearing pairs apart. Clusters are gap-based, so no boundary exists.
+		java.util.TreeSet<Integer> ys = new java.util.TreeSet<>();
+		for (Widget w : prose)
+		{
+			ys.add(nativeY(w));
+		}
+		Map<Integer, Integer> rowOf = new HashMap<>();
+		int rowIdx = -1;
+		int prevY = Integer.MIN_VALUE;
+		for (int y : ys)
+		{
+			if (y - prevY > 8)
+			{
+				rowIdx++;
+			}
+			rowOf.put(y, rowIdx);
+			prevY = y;
+		}
+		prose.sort((a, b) -> {
+			int ra = rowOf.get(nativeY(a));
+			int rb = rowOf.get(nativeY(b));
+			return ra != rb ? Integer.compare(ra, rb) : Integer.compare(nativeX(a), nativeX(b));
+		});
+
+		String decision;
+		// Repopulation check runs EVERY tick, before anything can short-circuit, and walks the container's
+		// FULL child array - including hidden widgets. A tab switch hides pooled widgets it doesn't need
+		// instead of resetting them; state ops that only saw the visible list once purged the position
+		// ledger of hidden-but-still-moved hitboxes/icons, and when they came back their old laid position
+		// masqueraded as "native" (links shattering paragraph one, icons on wrong rows, the vanishing wiki).
+		String repop = repopReason(container);
+		if (repop != null)
+		{
+			decommitRepop(container);
+			committedSig = null;
+			failedSig = null;
+			lastProseSig = effectiveEnglishSig(container, prose);
+			decision = "REPOP[" + repop + "]";
+		}
+		else if (committedSig != null)
+		{
+			// Committed steady state. Keep the scroll region we shrank pinned (a clientscript may re-grow it)
+			// and clamp scrollY into range every tick; only rebuild the (expensive) signature every 8th tick.
+			maintainProseScroll(container);
+			if ((++sigTick & 7) != 0)
+			{
+				decision = "SKIP";
+			}
+			else
+			{
+				String sig = effectiveEnglishSig(container, prose);
+				if (sig.equals(committedSig))
+				{
+					decision = "SKIP";
+				}
+				else if (!sig.equals(lastProseSig))
+				{
+					lastProseSig = sig; // a non-owned slot changed: wait for it to hold still
+					decision = "DEBOUNCE";
+				}
+				else
+				{
+					committedSig = null; // stable divergent frame: drop the commit so the next tick re-lays
+					decision = "DEBOUNCE";
+				}
+			}
+		}
+		else
+		{
+			String sig = effectiveEnglishSig(container, prose);
+			if (!sig.equals(lastProseSig))
+			{
+				lastProseSig = sig;
+				decision = "DEBOUNCE"; // still settling: wait for two identical ticks
+			}
+			else if (sig.equals(failedSig) && pendingCooldown-- > 0)
+			{
+				decision = "LAID_WAIT"; // translation still pending: don't re-attempt 50x/s
+			}
+			else
+			{
+				// Re-lay from a clean English frame (revert our slots first, all within this one tick). The
+				// native-coordinate snapshot is taken BEFORE the revert: relative coordinates only refresh
+				// when the client re-lays the frame, so reading them back mid-tick after our own writes is
+				// unreliable - the ledger/snapshot is the single source of truth for native geometry.
+				Map<Long, int[]> nat = new HashMap<>();
+				for (Widget w : prose)
+				{
+					nat.put(widgetKey(w), new int[]{nativeX(w), nativeY(w)});
+				}
+				restoreOwnedToEnglish(container);
+				boolean complete = layoutInline(container, prose, nat, glyph.uiSize());
+				if (complete)
+				{
+					committedSig = sig;
+					failedSig = null;
+				}
+				else if (pendingHasAi)
+				{
+					committedSig = null;
+					failedSig = sig;
+					pendingCooldown = 30; // ~600ms before re-asking the AI about this same frame
+				}
+				else
+				{
+					committedSig = null;
+					failedSig = null; // glyphs upload within a frame or two: retry every tick, no cooldown
+				}
+				decision = complete ? "LAID_OK" : "LAID_PENDING";
+			}
+		}
+	}
+
+	/**
+	 * Signature of the column's effective English (our stored original where we own a slot, else live text),
+	 * plus the container width (a resize must re-layout) and each sprite's native geometry (an icon moving
+	 * or resizing natively means the client rebuilt the page).
+	 */
+	private String effectiveEnglishSig(Widget container, List<Widget> prose)
+	{
+		StringBuilder sb = new StringBuilder();
+		sb.append(container.getWidth()).append('\n');
+		for (Widget w : prose)
+		{
+			long key = widgetKey(w);
+			String cur = w.getText();
+			if (cur == null)
+			{
+				sb.append("SPR:").append(w.getSpriteId());
+			}
+			else
+			{
+				boolean ours = cur.equals(lastSet.get(key));
+				sb.append(ours ? original.getOrDefault(key, "") : cur);
+			}
+			// Native geometry is part of the frame identity: the client fills pooled widgets in stages (text
+			// first, position a frame later), and laying out such a half-placed frame filed the wiki link
+			// into the middle of paragraph one. Position changes now fail the debounce until settled.
+			sb.append('@').append(nativeX(w)).append(',').append(nativeY(w)).append('\n');
+		}
+		return sb.toString();
+	}
+
+	/**
+	 * Non-null with a short diagnostic when the client repopulated a slot we own. Text mismatch on an owned
+	 * slot is the primary signal; geometry is compared through {@code getOriginalX/Y} - the very fields we
+	 * wrote - because relative coordinates only update when the client re-lays the frame, so comparing them
+	 * right after our own pass false-positives and decommits our freshly laid page into a blank. Walks the
+	 * container's FULL child array so hidden pooled widgets are covered too.
+	 */
+	private String repopReason(Widget container)
+	{
+		Widget[] kids = container.getDynamicChildren();
+		if (kids == null)
+		{
+			return null;
+		}
+		for (Widget w : kids)
+		{
+			if (w == null)
+			{
+				continue;
+			}
+			long key = widgetKey(w);
+			String cur = w.getText();
+			if (lastSet.containsKey(key) && cur != null && !cur.equals(lastSet.get(key)))
+			{
+				return "TXT idx=" + w.getIndex();
+			}
+			// Geometry: the client rebuilding the page rewrites original x/y to its English layout.
+			Integer px = placedX.get(key);
+			if (px != null && (w.getOriginalX() != px || w.getOriginalY() != placedY.get(key)))
+			{
+				return "GEO idx=" + w.getIndex() + " orig=" + w.getOriginalX() + "," + w.getOriginalY()
+						+ " placed=" + px + "," + placedY.get(key);
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Tab-switch decommit: blank our char-images (never refill stored English - the client is repopulating
+	 * these pooled slots and stale refills both flash ghost text and can leak garbage sentences into the AI
+	 * cache), revert geometry only where the original fields still corroborate as ours, then purge ALL prose
+	 * state for this container (a shrinking tab reuses indexes, so per-member removal leaves ghost entries).
+	 * MUST walk the full child array: hidden pooled widgets we moved would otherwise keep our laid position
+	 * while the purge below forgets their true native one - the position then poisons every later layout.
+	 */
+	private void decommitRepop(Widget container)
+	{
+		Widget[] kids = container.getDynamicChildren();
+		if (kids != null)
+		{
+			for (Widget w : kids)
+			{
+				if (w == null)
+				{
+					continue;
+				}
+				long key = widgetKey(w);
+				String cur = w.getText();
+				if (lastSet.containsKey(key) && cur != null && cur.equals(lastSet.get(key)) && cur.contains("<img="))
+				{
+					w.setText("");
+					w.setTextShadowed(true); // the client's repopulation reuses the slot with native shadow
+				}
+				Integer px = placedX.get(key);
+				boolean corroborated = px == null
+						|| (w.getOriginalX() == px && w.getOriginalY() == placedY.get(key));
+				if (corroborated)
+				{
+					revertGeom(key, w);
+				}
+				// not corroborated = the client already re-laid this widget itself: leave its geometry alone
+			}
+		}
+		purgeProseState();
+		restoreProseScroll();
+	}
+
+	/** Forget every prose-state entry for the 860 content column, including ghost indexes this tab never used. */
+	private void purgeProseState()
+	{
+		java.util.function.Predicate<Long> isProse = k -> (k >>> 21) == (PROSE_COMPONENT_ID & 0xFFFFFFFFL);
+		lastSet.keySet().removeIf(isProse);
+		original.keySet().removeIf(isProse);
+		lastColor.keySet().removeIf(isProse);
+		incomplete.removeIf(isProse);
+		movedX.keySet().removeIf(isProse);
+		movedY.keySet().removeIf(isProse);
+		movedW.keySet().removeIf(isProse);
+		placedX.keySet().removeIf(isProse);
+		placedY.keySet().removeIf(isProse);
+	}
+
+	/**
+	 * Revert every slot we own to its stored English and native position, and forget it (clean re-layout
+	 * base). Walks the container's full child array so hidden pooled widgets we moved revert too.
+	 */
+	private void restoreOwnedToEnglish(Widget container)
+	{
+		Widget[] kids = container.getDynamicChildren();
+		if (kids == null)
+		{
+			return;
+		}
+		for (Widget w : kids)
+		{
+			if (w == null)
+			{
+				continue;
+			}
+			long key = widgetKey(w);
+			boolean owned = lastSet.containsKey(key) || movedX.containsKey(key);
+			if (!owned)
+			{
+				continue;
+			}
+			String eng = original.get(key);
+			if (eng != null)
+			{
+				w.setText(eng); // both char-image heads and blanked words carry their original English word
+				w.setTextShadowed(true); // we disabled the shadow for glyphs; native prose is shadowed
+			}
+			revertGeom(key, w);
+			original.remove(key);
+			lastColor.remove(key);
+			lastSet.remove(key);
+			incomplete.remove(key);
+		}
+	}
+
+	/** One resolved atom of the inline flow: a word run, an icon, an inline link, or a white header. */
+	private static final class FlowItem
+	{
+		static final int WORD = 0;
+		static final int ICON = 1;
+		static final int LINK = 2;
+		static final int HEADER = 3;
+		int kind;
+		List<Widget> widgets; // run words (or merged header slots); a single-element list for icon/link
+		String zh;            // translated Chinese (null for icons)
+		int color;
+		int iconWidth;
+		int iconHeight;
+		int iconNativeX;      // native x from the snapshot (a block keeps it so centering survives)
+		boolean block;        // full-width decoration (divider line): own row, keep native x
+		boolean lineStart;    // icon that natively begins a line (skill-list rows): keep it starting one
+		boolean gapBefore;    // an English paragraph break precedes this item
+	}
+
+	/**
+	 * The inline flow: walk the (now all-English) column in reading order and lay it out onto the native
+	 * widgets under a compacting cursor. Runs all-or-nothing - phase 1 translates every run/link/header
+	 * without touching a widget; if <em>any</em> is still pending (AI off/loading, or glyphs uploading) it
+	 * returns false immediately so the whole column stays English (no half-translated, jittering frame).
+	 * Only when everything is ready does phase 2 pour the Chinese in, reposition icons/dividers inline, and
+	 * blank the leftover word slots. Finishes by shrinking the scroll region to the compacted height.
+	 */
+	private boolean layoutInline(Widget container, List<Widget> prose, Map<Long, int[]> nat, int size)
+	{
+		int gw = glyph.glyphWidth(size);
+		int lineH = glyph.glyphHeight(size) + 2; // +2 leading: the raw glyph ink height sets lines touching
+		boolean ai = config.aiFillInterface();
+
+		// All geometry below reads the pre-revert native snapshot (nat), never live relative coordinates:
+		// mid-tick relative values are stale after our own writes and would corrupt grouping and the ledger.
+		int col = 0;
+		int leftMargin = Integer.MAX_VALUE;
+		int startY = Integer.MAX_VALUE;
+		for (Widget w : prose)
+		{
+			ProseKind k = classify(w);
+			if (k == ProseKind.OURS || k == ProseKind.HITBOX)
+			{
+				continue; // hitboxes shadow their link's row: they must not skew the margins
+			}
+			int[] p = nat.get(widgetKey(w));
+			if (k == ProseKind.WORD || k == ProseKind.LINK)
+			{
+				leftMargin = Math.min(leftMargin, p[0]);
+			}
+			startY = Math.min(startY, p[1]);
+			col = Math.max(col, p[0] + w.getWidth());
+		}
+		if (col < MIN_WRAP * gw || leftMargin == Integer.MAX_VALUE)
+		{
+			return true; // nothing to lay out
+		}
+		if (startY == Integer.MAX_VALUE)
+		{
+			startY = 4;
+		}
+
+		// NOTE: links are identified by their text alone (<u=..> / yellow+listener). An earlier "hitbox
+		// backing" classifier looked tidy but hitboxes spawn at (0,0) before the client positions them, and
+		// row-matching those turned the first text row into fake links. Hitboxes are only ever PAIRED to an
+		// already-identified link for repositioning, never used to classify.
+
+		// Phase 1: build + translate every item, no widget mutation. If anything is still pending we keep
+		// WALKING (so every missing sentence fires its async AI request in this same pass and they all
+		// translate concurrently) and only then report incomplete. Bailing at the first pending key made
+		// page warm-up serial: one new key discovered per retry cooldown, tens of seconds for a fresh page.
+		boolean ready = true;
+		pendingHasAi = false;
+		List<FlowItem> items = new ArrayList<>();
+		List<Widget> hitboxes = new ArrayList<>();
+		int prevNativeY = -1;
+		int i = 0;
+		while (i < prose.size())
+		{
+			Widget a = prose.get(i);
+			ProseKind k = classify(a);
+			if (k == ProseKind.OURS)
+			{
+				i++;
+				continue;
+			}
+			if (k == ProseKind.HITBOX)
+			{
+				// a link's invisible click rectangle: repositioned onto its link after the links are placed.
+				// It must not update prevNativeY (it shares the link's row) or take part in the flow itself.
+				hitboxes.add(a);
+				i++;
+				continue;
+			}
+			int ay = nat.get(widgetKey(a))[1];
+			boolean gap = prevNativeY >= 0 && ay - prevNativeY > 20;
+
+			if (k == ProseKind.ICON)
+			{
+				FlowItem it = new FlowItem();
+				it.kind = FlowItem.ICON;
+				it.widgets = java.util.Collections.singletonList(a);
+				it.iconWidth = Math.max(a.getWidth(), 1);
+				it.iconHeight = Math.max(a.getHeight(), 1);
+				// near-column-wide, tall, or an actual LINE widget = page decoration (divider), not inline
+				it.block = a.getType() == 9
+						|| it.iconWidth >= (col - leftMargin) * 6 / 10 || it.iconHeight > 2 * lineH;
+				it.iconNativeX = nat.get(widgetKey(a))[0];
+				// an icon that natively started its line (the skill-interaction rows) keeps starting one, so
+				// those entries read one-per-line like the English page instead of running together
+				it.lineStart = it.iconNativeX <= leftMargin + 4;
+				it.gapBefore = gap;
+				items.add(it);
+				prevNativeY = ay;
+				i++;
+				continue;
+			}
+			if (k == ProseKind.HEADER)
+			{
+				// A header may itself be split word-per-widget: merge consecutive same-row header slots into
+				// one item so it translates whole instead of once per fragment.
+				List<Widget> parts = new ArrayList<>();
+				StringBuilder rawH = new StringBuilder();
+				int j = i;
+				while (j < prose.size())
+				{
+					Widget hw = prose.get(j);
+					if (classify(hw) != ProseKind.HEADER || nat.get(widgetKey(hw))[1] != ay)
+					{
+						break;
+					}
+					parts.add(hw);
+					if (rawH.length() > 0)
+					{
+						rawH.append(' ');
+					}
+					rawH.append(hw.getText());
+					j++;
+				}
+				String zh = plainZh(rawH.toString(), ai);
+				if (zh == null || glyph.toImgTags(zh, 0xffffff, 0, size) == null)
+				{
+					ready = false; // keep walking: warm every remaining translation this pass
+					pendingHasAi |= zh == null;
+					prevNativeY = ay;
+					i = j;
+					continue;
+				}
+				FlowItem it = new FlowItem();
+				it.kind = FlowItem.HEADER;
+				it.widgets = parts;
+				it.zh = zh;
+				it.color = parts.get(0).getTextColor() & 0xFFFFFF;
+				it.gapBefore = gap;
+				items.add(it);
+				prevNativeY = ay;
+				i = j;
+				continue;
+			}
+			if (k == ProseKind.LINK)
+			{
+				// links carry their colour in the <u=RRGGBB> tag (yellow normally, GREEN for a completed
+				// quest) - render the Chinese in the same colour instead of hardcoding yellow
+				int lc = linkColor(a.getText(), a.getTextColor() & 0xFFFFFF);
+				String zh = plainZh(a.getText(), ai);
+				if (zh == null || glyph.toImgTags(zh, lc, 0, size) == null)
+				{
+					ready = false;
+					pendingHasAi |= zh == null;
+					prevNativeY = ay;
+					i++;
+					continue;
+				}
+				FlowItem it = new FlowItem();
+				it.kind = FlowItem.LINK;
+				it.widgets = java.util.Collections.singletonList(a);
+				it.zh = zh;
+				it.color = lc;
+				it.gapBefore = gap;
+				items.add(it);
+				prevNativeY = ay;
+				i++;
+				continue;
+			}
+
+			// WORD run: gather consecutive words (no big native y-gap).
+			List<Widget> words = new ArrayList<>();
+			StringBuilder raw = new StringBuilder();
+			int lastY = ay;
+			int maxNativeY = ay;
+			int j = i;
+			while (j < prose.size())
+			{
+				Widget ww = prose.get(j);
+				if (classify(ww) != ProseKind.WORD)
+				{
+					break;
+				}
+				int wy = nat.get(widgetKey(ww))[1];
+				if (j > i && wy - lastY > 20)
+				{
+					break; // paragraph gap
+				}
+				words.add(ww);
+				if (raw.length() > 0)
+				{
+					raw.append(' ');
+				}
+				raw.append(ww.getText());
+				lastY = wy;
+				maxNativeY = Math.max(maxNativeY, wy);
+				j++;
+			}
+			int bodyColor = dominantColor(words, a.getTextColor());
+			String english = JournalReconstructor.strip(raw.toString()).trim();
+			String zh = english.isEmpty() ? null : plainZh(english, ai);
+			if (zh == null)
+			{
+				// Tiny glue fragments between two adjacent links ("or a", "on the") miss the tables and the
+				// AI refuses them - they'd block the whole page forever. Map the common ones, pass any other
+				// short scrap through as literal English; only real sentences may hold the page pending.
+				zh = glueZh(english);
+			}
+			if (zh == null || glyph.toImgTags(zh, bodyColor, 0, size) == null)
+			{
+				ready = false; // keep walking so the remaining runs fire their AI requests too
+				pendingHasAi |= zh == null;
+				prevNativeY = maxNativeY;
+				i = j;
+				continue;
+			}
+			FlowItem it = new FlowItem();
+			it.kind = FlowItem.WORD;
+			it.widgets = words;
+			it.zh = zh;
+			it.color = bodyColor;
+			it.gapBefore = gap;
+			items.add(it);
+			prevNativeY = maxNativeY;
+			i = j;
+		}
+		if (!ready)
+		{
+			return false; // some translations still pending (all fired concurrently above): retry next tick
+		}
+
+		// Phase 2: everything is ready - pour it onto the widgets under the compacting cursor. rowH is the
+		// current line's height (an inline icon taller than the text grows the row instead of overlapping the
+		// next line); every line break advances cy by rowH then resets it.
+		int padPx = gw; // right-edge safety margin inside the column
+		int cx = leftMargin;
+		int cy = startY;
+		int rowH = lineH;
+		for (FlowItem it : items)
+		{
+			if (it.gapBefore)
+			{
+				if (cx > leftMargin)
+				{
+					cx = leftMargin;
+					cy += rowH;
+					rowH = lineH;
+				}
+				cy += lineH / 2; // preserve the paragraph break as a half-line gap
+			}
+			if (it.kind == FlowItem.ICON)
+			{
+				Widget icon = it.widgets.get(0);
+				seedNative(icon, nat);
+				if (it.block)
+				{
+					// divider / full-width art: own row, keep its native x (centering stays intact)
+					if (cx > leftMargin)
+					{
+						cx = leftMargin;
+						cy += rowH;
+						rowH = lineH;
+					}
+					moveWidget(icon, it.iconNativeX, cy);
+					icon.revalidate();
+					cy += it.iconHeight + 4;
+					continue;
+				}
+				if (cx > leftMargin && (it.lineStart || cx + it.iconWidth > col))
+				{
+					cx = leftMargin;
+					cy += rowH;
+					rowH = lineH;
+				}
+				moveWidget(icon, cx, cy);
+				icon.revalidate();
+				rowH = Math.max(rowH, it.iconHeight);
+				cx += it.iconWidth + 2;
+				continue;
+			}
+			if (it.kind == FlowItem.HEADER)
+			{
+				if (cx > leftMargin)
+				{
+					cx = leftMargin;
+					cy += rowH;
+					rowH = lineH;
+				}
+				seedNative(it.widgets.get(0), nat);
+				int lines = placeSingle(it.widgets.get(0), it.zh, it.color, false,
+						leftMargin, cy, col - leftMargin - padPx, size, gw, lineH);
+				for (int p = 1; p < it.widgets.size(); p++)
+				{
+					blankWord(it.widgets.get(p)); // merged header fragments
+				}
+				cy += lines * lineH;
+				continue;
+			}
+			if (it.kind == FlowItem.LINK)
+			{
+				int w = advancePx(it.zh, gw);
+				if (cx > leftMargin && cx + w > col - padPx)
+				{
+					cx = leftMargin;
+					cy += rowH;
+					rowH = lineH;
+				}
+				seedNative(it.widgets.get(0), nat);
+				int lines = placeSingle(it.widgets.get(0), it.zh, it.color, true,
+						cx, cy, col - cx - padPx, size, gw, lineH);
+				// The click listener lives on a separate invisible rectangle at the link's ENGLISH spot
+				// (860 dump: type=3, opacity 255, hasListener) - drag it onto the Chinese or the link is dead.
+				placeLinkHitbox(it.widgets.get(0), hitboxes, nat, cx, cy,
+						Math.min(w, col - cx - padPx));
+				if (lines > 1)
+				{
+					cy += (lines - 1) * lineH;
+					cx = leftMargin; // a wrapped link ends its row; prose resumes on the next line
+					cy += rowH;
+					rowH = lineH;
+				}
+				else
+				{
+					cx += w + 2;
+				}
+				continue;
+			}
+
+			// WORD run: wrap by pixel budget (first line = what's left of the current row, rest = full column)
+			// and pour one line per word widget at the cursor.
+			List<Widget> words = it.widgets;
+			if (cx == leftMargin)
+			{
+				// a run that begins at a line start must not open with closing punctuation (", 你需要..."
+				// happens when the preceding fragment became a header/link) - drop the orphaned leaders
+				it.zh = trimLeadingPunct(it.zh);
+			}
+			int firstPx = col - cx - padPx;
+			int restPx = col - leftMargin - padPx;
+			if (firstPx < 2 * gw && cx > leftMargin)
+			{
+				cx = leftMargin;
+				cy += rowH;
+				rowH = lineH;
+				firstPx = restPx;
+			}
+			List<String> lines = glyph.wrapPlain(it.zh, firstPx, restPx, size);
+			if (lines.size() > words.size() && cx > leftMargin)
+			{
+				// more lines than slots from a mid-row start: restart the run at the left margin (each line
+				// then gets the full column, minimising lines) before falling back to slot absorption
+				cx = leftMargin;
+				cy += rowH;
+				rowH = lineH;
+				lines = glyph.wrapPlain(it.zh, restPx, restPx, size);
+			}
+			int lastStartX = cx;
+			for (int k = 0; k < lines.size() && k < words.size(); k++)
+			{
+				boolean last = k == words.size() - 1 && lines.size() > words.size();
+				int x = k == 0 ? cx : leftMargin;
+				if (k > 0)
+				{
+					cy += rowH;
+					rowH = lineH;
+				}
+				lastStartX = x;
+				seedNative(words.get(k), nat);
+				if (last)
+				{
+					// final slot absorbs every remaining line (it sits at the left margin by construction)
+					StringBuilder rem = new StringBuilder();
+					int extra = 0;
+					for (int p = k; p < lines.size(); p++)
+					{
+						String piece = glyph.toImgTags(lines.get(p), it.color, 0, size);
+						if (piece == null)
+						{
+							continue;
+						}
+						if (rem.length() > 0)
+						{
+							rem.append("<br>");
+							extra++;
+						}
+						rem.append(piece);
+					}
+					writeRunPiece(words.get(k), rem.toString(), col - x - padPx, x, cy, lineH, true);
+					cy += extra * lineH;
+					lastStartX = leftMargin;
+				}
+				else
+				{
+					String piece = glyph.toImgTags(lines.get(k), it.color, 0, size);
+					if (piece != null)
+					{
+						writeRunPiece(words.get(k), piece, advancePx(lines.get(k), gw) + 2, x, cy, lineH, false);
+					}
+				}
+			}
+			for (int p = lines.size(); p < words.size(); p++)
+			{
+				blankWord(words.get(p));
+			}
+			cx = lastStartX + advancePx(lines.isEmpty() ? "" : lines.get(lines.size() - 1), gw) + 2;
+		}
+		// Park sub-layer children (the wiki banner) right under the compacted content: the banner natively
+		// sits at the ENGLISH page bottom (e.g. y=716), far past the shrunk scroll height, i.e. invisible.
+		// Moving the layer moves its children with it, so the banner arrives whole and functional.
+		Widget[] all = container.getDynamicChildren();
+		if (all != null)
+		{
+			List<Widget> layers = new ArrayList<>();
+			for (Widget w : all)
+			{
+				if (w != null && w.getType() == 0 && !w.isSelfHidden() && w.getHeight() > 0
+						&& w.getXPositionMode() == 0 && w.getYPositionMode() == 0 && !parkedAtOrigin(w))
+				{
+					layers.add(w);
+				}
+			}
+			layers.sort(java.util.Comparator.comparingInt(this::nativeY));
+			for (Widget layer : layers)
+			{
+				if (cx > leftMargin)
+				{
+					cx = leftMargin;
+					cy += rowH;
+					rowH = lineH;
+				}
+				cy += lineH / 2;
+				moveWidget(layer, nativeX(layer), cy);
+				layer.revalidate();
+				cy += Math.max(layer.getHeight(), 1) + 4;
+			}
+		}
+		applyProseScroll(container, cy + rowH);
+		return true;
+	}
+
+	/**
+	 * Move a link's invisible click hitbox onto the link's new position and width. The hitbox is a type-3
+	 * transparent rectangle sharing the link's native row; it is matched by native geometry and consumed so
+	 * a row with several links pairs each hitbox once. Without this the visible Chinese link is dead while
+	 * an unmarked zone at the old English spot still clicks.
+	 */
+	private void placeLinkHitbox(Widget link, List<Widget> hitboxes, Map<Long, int[]> nat, int x, int y, int wPx)
+	{
+		int[] lp = nat.get(widgetKey(link));
+		if (lp == null)
+		{
+			return;
+		}
+		for (java.util.Iterator<Widget> iter = hitboxes.iterator(); iter.hasNext(); )
+		{
+			Widget hb = iter.next();
+			int[] hp = nat.get(widgetKey(hb));
+			if (hp == null || Math.abs(hp[1] - lp[1]) > 8)
+			{
+				continue; // not this link's row
+			}
+			if (hp[0] > lp[0] + 200 || hp[0] + hb.getWidth() + 8 < lp[0])
+			{
+				continue; // no horizontal overlap with the link's native span
+			}
+			seedNative(hb, nat);
+			long key = widgetKey(hb);
+			movedW.putIfAbsent(key, hb.getOriginalWidth());
+			moveWidget(hb, x, y);
+			hb.setOriginalWidth(Math.max(wPx, 1));
+			hb.setWidth(Math.max(wPx, 1));
+			hb.revalidate();
+			iter.remove();
+			return;
+		}
+	}
+
+	/**
+	 * Seed the native-position ledger from the pre-revert snapshot before moving a widget. moveWidget's own
+	 * putIfAbsent would read live relative coordinates, which are stale mid-tick right after our reverts and
+	 * would poison the ledger with compacted positions as "native".
+	 */
+	private void seedNative(Widget w, Map<Long, int[]> nat)
+	{
+		long key = widgetKey(w);
+		int[] p = nat.get(key);
+		if (p != null)
+		{
+			movedX.putIfAbsent(key, p[0]);
+			movedY.putIfAbsent(key, p[1]);
+		}
+	}
+
+	private static final String NO_LEADING_PUNCT = "、。，．；：！？）｝】》」』〉〕…—·％”’,.;:!?)";
+
+	/** Colour of a link from its {@code <u=RRGGBB>} tag (green = completed quest), else the widget colour. */
+	private static int linkColor(String text, int fallback)
+	{
+		int u = text == null ? -1 : text.indexOf("<u=");
+		if (u >= 0)
+		{
+			int end = text.indexOf('>', u);
+			if (end > u + 3)
+			{
+				try
+				{
+					return Integer.parseInt(text.substring(u + 3, end).trim(), 16) & 0xFFFFFF;
+				}
+				catch (NumberFormatException ignored)
+				{
+					// plain <u> or malformed: fall through to the widget colour
+				}
+			}
+		}
+		return fallback;
+	}
+
+	/**
+	 * Chinese for the glue scraps left between two adjacent inline links ("...with the [Fishing skill]
+	 * or a [Range]..."). Tables miss them and the AI refuses such stubs, which would pin the whole page
+	 * in English forever. Unknown scraps up to a few words pass through literally; longer text returns
+	 * null and keeps the normal pending path.
+	 */
+	private static String glueZh(String english)
+	{
+		switch (english.toLowerCase(java.util.Locale.ROOT))
+		{
+			case "or":
+			case "or a":
+			case "or an":
+			case "or on a":
+			case "or the":
+				return "或";
+			case "and":
+			case "and a":
+			case "and an":
+			case "and the":
+				return "和";
+			case "the":
+			case "a":
+			case "an":
+			case "of":
+			case "of the":
+				return "";
+			case "on":
+			case "on a":
+			case "on an":
+			case "on the":
+			case "in":
+			case "in a":
+			case "in the":
+			case "at":
+			case "at a":
+			case "at the":
+				return "在";
+			case "with":
+			case "with a":
+			case "with the":
+			case "using":
+			case "using the":
+				return "用";
+			case "from":
+			case "from a":
+			case "from the":
+				return "从";
+			case "to":
+			case "to a":
+			case "to the":
+				return "到";
+			case "such as the":
+			case "such as a":
+			case "such as":
+				return "例如";
+			default:
+				return english.length() <= 14 ? english : null; // short scrap: show literally, never block
+		}
+	}
+
+	/** Drop closing punctuation (and following spaces) stranded at the start of a line-leading run. */
+	private static String trimLeadingPunct(String zh)
+	{
+		int i = 0;
+		while (i < zh.length()
+				&& (NO_LEADING_PUNCT.indexOf(zh.charAt(i)) >= 0 || Character.isWhitespace(zh.charAt(i))))
+		{
+			i++;
+		}
+		return i == 0 ? zh : zh.substring(i);
+	}
+
+	/** Advance width in px of a rendered plain segment: CJK counts a full glyph, anything else half. */
+	private static int advancePx(String plain, int gw)
+	{
+		int half = (gw + 1) / 2;
+		int px = 0;
+		for (int i = 0; i < plain.length(); )
+		{
+			int cp = plain.codePointAt(i);
+			px += cp >= 0x2E80 ? gw : half;
+			i += Character.charCount(cp);
+		}
+		return px;
+	}
+
+	/** Translate a stripped English fragment to plain Chinese (tags removed), or null if pending. */
+	private String plainZh(String english, boolean ai)
+	{
+		String raw = JournalReconstructor.strip(english == null ? "" : english).trim();
+		if (raw.isEmpty())
+		{
+			return null;
+		}
+		// The exact key first: every table row and AI-cache entry accumulated so far lives under it.
+		String zh = translator.translateJournalSentence(raw, ai);
+		if (zh == null)
+		{
+			// A run that starts right after an inline link keeps the link's trailing punctuation (", first
+			// obtain a mould..."), and the AI refuses that opening outright - retry under the sanitised key
+			// so those pages (Prayer, Crafting) can translate instead of pending forever.
+			String plain = raw.replaceFirst("^[,.;:!?]+\\s*", "");
+			if (!plain.isEmpty() && !plain.equals(raw))
+			{
+				zh = translator.translateJournalSentence(plain, ai);
+			}
+		}
+		return zh == null ? null : zh.replaceAll("<[^>]*>", ""); // char images can't carry residual tags
+	}
+
+	/**
+	 * Write one rendered piece (a single line, or the absorbing tail with {@code <br>}s) into a word slot at
+	 * (x,y) with an explicit pixel width. Width is recorded in {@code movedW} before mutation so the next
+	 * layout can restore the native width - without that the column measurement reads our own widened slots
+	 * and inflates a little more on every re-layout.
+	 */
+	private void writeRunPiece(Widget slot, String img, int widthPx, int x, int y, int lineH, boolean multi)
+	{
+		if (img == null || img.isEmpty())
+		{
+			return;
+		}
+		long key = widgetKey(slot);
+		original.putIfAbsent(key, slot.getText() == null ? "" : slot.getText());
+		movedW.putIfAbsent(key, slot.getOriginalWidth());
+		slot.setText(img);
+		slot.setTextShadowed(false);
+		slot.setOriginalWidth(Math.max(widthPx, 1));
+		slot.setWidth(Math.max(widthPx, 1));
+		if (multi || img.contains("<br>"))
+		{
+			slot.setLineHeight(lineH);
+		}
+		moveWidget(slot, x, y);
+		slot.revalidate();
+		lastSet.put(key, img);
+	}
+
+	/**
+	 * Place a single-widget label (header / link) at (x,y), wrapping to {@code availPx} when it is too wide
+	 * (the extra lines stay inside this same widget, so a link's click listener covers all of them). Links
+	 * keep their {@code <u=ffff00>} underline wrapper. Returns the number of lines written (0 = pending).
+	 */
+	private int placeSingle(Widget w, String zh, int color, boolean underline, int x, int y,
+			int availPx, int size, int gw, int lineH)
+	{
+		List<String> lines = glyph.wrapPlain(zh, availPx, availPx, size);
+		if (lines.isEmpty())
+		{
+			return 0;
+		}
+		StringBuilder sb = new StringBuilder();
+		int maxPx = 0;
+		for (int k = 0; k < lines.size(); k++)
+		{
+			String img = glyph.toImgTags(lines.get(k), color, 0, size);
+			if (img == null)
+			{
+				return 0; // glyphs still uploading (phase 1 pre-checked, so this is a rare race)
+			}
+			if (k > 0)
+			{
+				sb.append("<br>");
+			}
+			sb.append(img);
+			maxPx = Math.max(maxPx, advancePx(lines.get(k), gw));
+		}
+		String out = underline
+				? "<u=" + String.format("%06x", color & 0xFFFFFF) + ">" + sb + "</u>"
+				: sb.toString();
+		long key = widgetKey(w);
+		original.putIfAbsent(key, w.getText() == null ? "" : w.getText());
+		movedW.putIfAbsent(key, w.getOriginalWidth());
+		w.setText(out);
+		w.setTextShadowed(false);
+		w.setOriginalWidth(Math.max(maxPx, gw)); // widget width == ink width: no dead click-zone past the text
+		w.setWidth(Math.max(maxPx, gw));
+		if (lines.size() > 1)
+		{
+			w.setLineHeight(lineH);
+		}
+		moveWidget(w, x, y);
+		w.revalidate();
+		lastColor.put(key, color);
+		lastSet.put(key, out);
+		return lines.size();
+	}
+
+	/** Blank a word slot the flow didn't need (its Chinese went into an earlier line-head). */
+	private void blankWord(Widget w)
+	{
+		long key = widgetKey(w);
+		if (!original.containsKey(key))
+		{
+			original.put(key, w.getText() == null ? "" : w.getText());
+		}
+		w.setText("");
+		lastSet.put(key, "");
+	}
+
+	/** Move a prose widget to (x,y) in the compacted flow, remembering its native position to revert later. */
+	private void moveWidget(Widget w, int x, int y)
+	{
+		long key = widgetKey(w);
+		movedX.putIfAbsent(key, w.getRelativeX());
+		movedY.putIfAbsent(key, w.getRelativeY());
+		placedX.put(key, x); // always the latest target: live != placed later means the client moved it
+		placedY.put(key, y);
+		w.setOriginalX(x);
+		w.setOriginalY(y);
+	}
+
+	/** Native (pre-move) x/y of a prose widget: the stored original if we moved it, else its live position. */
+	private int nativeX(Widget w)
+	{
+		Integer x = movedX.get(widgetKey(w));
+		return x != null ? x : w.getRelativeX();
+	}
+
+	private int nativeY(Widget w)
+	{
+		Integer y = movedY.get(widgetKey(w));
+		return y != null ? y : w.getRelativeY();
+	}
+
+	/** Put a moved prose widget back at its native position and width (English toggle / decommit). */
+	private void revertGeom(long key, Widget w)
+	{
+		Integer ox = movedX.remove(key);
+		Integer oy = movedY.remove(key);
+		Integer ow = movedW.remove(key);
+		placedX.remove(key);
+		placedY.remove(key);
+		if (ox != null)
+		{
+			w.setOriginalX(ox);
+		}
+		if (oy != null)
+		{
+			w.setOriginalY(oy);
+		}
+		if (ow != null)
+		{
+			w.setOriginalWidth(ow); // mirror both fields: the next layout reads getWidth() for the column
+			w.setWidth(ow);
+		}
+		if (ox != null || oy != null || ow != null)
+		{
+			w.revalidate();
+		}
+	}
+
+	// ===== 860 prose scroll-region management (the compacted Chinese is much shorter than the English) =====
+
+	/** After a committed layout: shrink the scroll region to the Chinese content height. */
+	private void applyProseScroll(Widget container, int contentBottom)
+	{
+		if (container.getScrollHeight() <= 0 || appliedScrollHeight == -2)
+		{
+			return; // not a scroll container, or a clientscript kept fighting us and we gave up
+		}
+		if (proseNativeScrollHeight == null)
+		{
+			proseNativeScrollHeight = container.getScrollHeight();
+		}
+		int newH = Math.max(container.getHeight(), contentBottom + 8);
+		container.setScrollHeight(newH);
+		int maxY = Math.max(0, newH - container.getHeight());
+		if (container.getScrollY() > maxY)
+		{
+			container.setScrollY(maxY);
+		}
+		container.revalidateScroll();
+		syncScrollbar(container);
+		appliedScrollHeight = newH;
+	}
+
+	/**
+	 * Tell the native scrollbar its range changed. Without this the bar keeps the OLD range: after we
+	 * shrink for Chinese and the player toggles back to English, the bar refuses to scroll past the
+	 * shrunken height and the page bottom is unreachable until a tab switch rebuilds it.
+	 */
+	private void syncScrollbar(Widget container)
+	{
+		client.runScript(net.runelite.api.ScriptID.UPDATE_SCROLLBAR,
+				PROSE_SCROLLBAR_ID, PROSE_COMPONENT_ID, container.getScrollY());
+	}
+
+	/** Committed steady state: re-pin our scroll height if a clientscript re-grew it; clamp scrollY. */
+	private void maintainProseScroll(Widget container)
+	{
+		if (appliedScrollHeight <= 0)
+		{
+			return;
+		}
+		if (container.getScrollHeight() != appliedScrollHeight)
+		{
+			if (++scrollFights > 5)
+			{
+				appliedScrollHeight = -2; // stop fighting: dead space at the bottom beats a tug-of-war
+				return;
+			}
+			container.setScrollHeight(appliedScrollHeight);
+			container.revalidateScroll();
+			syncScrollbar(container);
+		}
+		int maxY = Math.max(0, appliedScrollHeight - container.getHeight());
+		if (container.getScrollY() > maxY)
+		{
+			container.setScrollY(maxY);
+		}
+	}
+
+	/** Give the scroll region back to the client (decommit / EN toggle / reset). */
+	private void restoreProseScroll()
+	{
+		if (proseNativeScrollHeight != null)
+		{
+			Widget container = client.getWidget(SKILL_GUIDE_NEW_GROUP, PROSE_CHILD);
+			if (container != null)
+			{
+				container.setScrollHeight(proseNativeScrollHeight);
+				int maxY = Math.max(0, proseNativeScrollHeight - container.getHeight());
+				if (container.getScrollY() > maxY)
+				{
+					container.setScrollY(maxY);
+				}
+				container.revalidateScroll();
+				syncScrollbar(container);
+			}
+		}
+		proseNativeScrollHeight = null;
+		appliedScrollHeight = -1;
+		scrollFights = 0;
+	}
+
+	/**
+	 * Fully hand the 860 prose column back to the client: our text out, native geometry back, scroll region
+	 * restored, all state purged. Used by {@link #reset()} (font change) and when the guide toggle is turned
+	 * off. Safe when the interface is closed (only purges state then).
+	 */
+	public void revertSkillGuide()
+	{
+		Widget container = client.getWidget(SKILL_GUIDE_NEW_GROUP, PROSE_CHILD);
+		if (container != null)
+		{
+			Widget[] kids = container.getDynamicChildren();
+			if (kids != null)
+			{
+				for (Widget w : kids)
+				{
+					if (w == null)
+					{
+						continue;
+					}
+					long key = widgetKey(w);
+					if (!lastSet.containsKey(key) && !movedX.containsKey(key))
+					{
+						continue; // never ours
+					}
+					String eng = original.get(key);
+					String cur = w.getText();
+					if (eng != null && cur != null && (cur.equals(lastSet.get(key)) || cur.contains("<img=")))
+					{
+						w.setText(eng);
+						w.setTextShadowed(true);
+					}
+					revertGeom(key, w);
+				}
+			}
+		}
+		restoreProseScroll();
+		purgeProseState();
+		committedSig = null;
+		failedSig = null;
+		lastProseSig = "";
+	}
+
+	/** Most common colour among a segment's words, so a stray coloured word doesn't tint the paragraph. */
+	private static int dominantColor(List<Widget> words, int fallback)
+	{
+		HashMap<Integer, Integer> hist = new HashMap<>();
+		int best = 0;
+		int bestColor = fallback & 0xFFFFFF;
+		for (Widget w : words)
+		{
+			int c = w.getTextColor() & 0xFFFFFF;
+			int cnt = hist.merge(c, 1, Integer::sum);
+			if (cnt > best)
+			{
+				best = cnt;
+				bestColor = c;
+			}
+		}
+		return bestColor;
 	}
 
 	private void reconstructRoot(int componentId)
@@ -525,6 +1998,12 @@ public class InterfaceTranslator
 		return out.toString();
 	}
 
+	// ===== TEMP DEBUG P1-1 (remove after we know the achievement/quest journal widget structure) =====
+	// Achievement-diary task scroll (Journalscroll, group 741) and quest journal (Questjournal, group
+	// 119): dump every text widget's id/index/colour/bounds/text so we can see whether one task is a
+	// single widget or wrapped across several QJ lines. Gated on the developer-only "开发者：日志转储"
+	// ===== END TEMP DEBUG P1-1 =====
+
 	/**
 	 * Translate the chat channel tabs (Game/Public/.../Trade + On/Off) by component id.
 	 *
@@ -891,10 +2370,21 @@ public class InterfaceTranslator
 			}
 		}
 		restoreChatTabs();
+		restoreProseScroll();
 		lastSet.clear();
 		lastColor.clear();
 		original.clear();
 		incomplete.clear();
+		movedX.clear();
+		movedY.clear();
+		movedW.clear();
+		placedX.clear();
+		placedY.clear();
+		// the 860 signatures must die with the state: a surviving committedSig would match the very first
+		// re-derived frame after an EN->CN toggle and SKIP forever, sticking the guide in English
+		committedSig = null;
+		failedSig = null;
+		lastProseSig = "";
 	}
 
 	private void restoreWalk(Widget w)
@@ -912,7 +2402,12 @@ public class InterfaceTranslator
 		if (orig != null && cur != null && (cur.equals(lastSet.get(key)) || cur.contains("<img=")))
 		{
 			w.setText(orig);
+			if ((key >>> 21) == (PROSE_COMPONENT_ID & 0xFFFFFFFFL))
+			{
+				w.setTextShadowed(true); // 860 prose is natively shadowed; we disabled it for glyphs
+			}
 		}
+		revertGeom(key, w); // 860 prose widgets we compacted: put back at their native x/y
 		restoreArray(w.getStaticChildren());
 		restoreArray(w.getDynamicChildren());
 		restoreArray(w.getNestedChildren());
@@ -930,14 +2425,22 @@ public class InterfaceTranslator
 		}
 	}
 
-	/** Forget what we translated so everything re-translates (e.g. after a font-size change). */
+	/** Forget what we translated so everything re-translates (e.g. after a font-size change). Client thread. */
 	public void reset()
 	{
+		// put the 860 prose back to English FIRST: clearing the maps below would orphan its stored English
+		// (the column would keep old-size char-images with no way back until the client rebuilds it)
+		revertSkillGuide();
 		lastSet.clear();
 		lastColor.clear();
 		original.clear();
 		incomplete.clear();
 		tabOriginal.clear();
 		journalSig.clear();
+		movedX.clear();
+		movedY.clear();
+		movedW.clear();
+		placedX.clear();
+		placedY.clear();
 	}
 }
