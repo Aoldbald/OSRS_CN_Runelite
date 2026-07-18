@@ -8,6 +8,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import lombok.extern.slf4j.Slf4j;
@@ -142,6 +144,14 @@ public class InterfaceTranslator
 	private static final int PROSE_SCROLLBAR_ID = (SKILL_GUIDE_NEW_GROUP << 16) | 0x10; // its scrollbar
 	private String lastProseSig = ""; // debounce: only reflow the prose once its raw text settles
 	private String committedSig = null; // the effective-English frame we last fully laid out (skip if unchanged)
+	// Collection settle gate (2026-07-16 council action 6): missing rows and AI disk-cache writes only
+	// happen once the prose signature has held still this many consecutive ticks (~300ms). Frames still
+	// translate and render immediately - mid-relayout scrambles just never persist anywhere.
+	private static final int COLLECT_SETTLE_TICKS = 15;
+	private int settleTicks;
+	private boolean collectOk;
+	private final List<String> pendingCollect = new ArrayList<>(); // keys laid before settle; collected once stable
+	private int gatedRuns; // debug: runs translated while the gate was closed (undercollection stays visible)
 	private Integer proseNativeScrollHeight = null; // container scrollHeight before we shrank it
 	private int appliedScrollHeight = -1; // what we last set; -2 = gave up (a clientscript keeps fighting us)
 	private int scrollFights = 0;
@@ -433,6 +443,8 @@ public class InterfaceTranslator
 			committedSig = null;
 			failedSig = null;
 			lastProseSig = effectiveEnglishSig(container, prose);
+			settleTicks = 0;
+			pendingCollect.clear();
 			decision = "REPOP[" + repop + "]";
 		}
 		else if (committedSig != null)
@@ -442,6 +454,8 @@ public class InterfaceTranslator
 			maintainProseScroll(container);
 			if ((++sigTick & 7) != 0)
 			{
+				settleTicks++;
+				collectSettled();
 				decision = "SKIP";
 			}
 			else
@@ -449,16 +463,20 @@ public class InterfaceTranslator
 				String sig = effectiveEnglishSig(container, prose);
 				if (sig.equals(committedSig))
 				{
+					settleTicks++;
+					collectSettled();
 					decision = "SKIP";
 				}
 				else if (!sig.equals(lastProseSig))
 				{
 					lastProseSig = sig; // a non-owned slot changed: wait for it to hold still
+					settleTicks = 0;
 					decision = "DEBOUNCE";
 				}
 				else
 				{
 					committedSig = null; // stable divergent frame: drop the commit so the next tick re-lays
+					settleTicks = 0;
 					decision = "DEBOUNCE";
 				}
 			}
@@ -469,14 +487,18 @@ public class InterfaceTranslator
 			if (!sig.equals(lastProseSig))
 			{
 				lastProseSig = sig;
+				settleTicks = 0;
 				decision = "DEBOUNCE"; // still settling: wait for two identical ticks
 			}
 			else if (sig.equals(failedSig) && pendingCooldown-- > 0)
 			{
+				settleTicks++;
 				decision = "LAID_WAIT"; // translation still pending: don't re-attempt 50x/s
 			}
 			else
 			{
+				settleTicks++;
+				collectOk = settleTicks >= COLLECT_SETTLE_TICKS;
 				// Re-lay from a clean English frame (revert our slots first, all within this one tick). The
 				// native-coordinate snapshot is taken BEFORE the revert: relative coordinates only refresh
 				// when the client re-lays the frame, so reading them back mid-tick after our own writes is
@@ -1287,6 +1309,9 @@ public class InterfaceTranslator
 		return px;
 	}
 
+	private static final String SKILLGUIDE_TAG = "skillguide860"; // provenance tag on every collected 860 row
+	private static final Pattern LEADING_PUNCT = Pattern.compile("^[,.;:!?]+\\s*");
+
 	/** Translate a stripped English fragment to plain Chinese (tags removed), or null if pending. */
 	private String plainZh(String english, boolean ai)
 	{
@@ -1295,20 +1320,48 @@ public class InterfaceTranslator
 		{
 			return null;
 		}
-		// The exact key first: every table row and AI-cache entry accumulated so far lives under it.
-		String zh = translator.translateJournalSentence(raw, ai);
-		if (zh == null)
+		// A run that starts right after an inline link keeps the link's trailing punctuation (", first
+		// obtain a mould..."); the SANITISED form is the true table key, so only that form may ever be
+		// collected - recording the punctuated raw would bake an unreachable key.
+		Matcher lead = LEADING_PUNCT.matcher(raw);
+		String key = lead.find() ? raw.substring(lead.end()) : raw;
+		boolean clean = key.equals(raw);
+		if (!collectOk && !key.isEmpty())
 		{
-			// A run that starts right after an inline link keeps the link's trailing punctuation (", first
-			// obtain a mould..."), and the AI refuses that opening outright - retry under the sanitised key
-			// so those pages (Prayer, Crafting) can translate instead of pending forever.
-			String plain = raw.replaceFirst("^[,.;:!?]+\\s*", "");
-			if (!plain.isEmpty() && !plain.equals(raw))
+			// gate closed (frame still settling): translate for the screen now, collect once it holds
+			if (pendingCollect.size() < 400 && !pendingCollect.contains(key))
 			{
-				zh = translator.translateJournalSentence(plain, ai);
+				pendingCollect.add(key);
 			}
+			gatedRuns++;
+		}
+		// The exact key first: every table row and AI-cache entry accumulated so far lives under it.
+		String zh = translator.translateJournalSentence(raw, ai, SKILLGUIDE_TAG, collectOk && clean);
+		if (zh == null && !clean && !key.isEmpty())
+		{
+			zh = translator.translateJournalSentence(key, ai, SKILLGUIDE_TAG, collectOk);
 		}
 		return zh == null ? null : zh.replaceAll("<[^>]*>", ""); // char images can't carry residual tags
+	}
+
+	/**
+	 * The frame held still long enough: replay the (cheap, lookup-only) translations of everything
+	 * laid before the gate opened, this time with collection on - so committing a fast layout never
+	 * silently loses the rows, and nothing mid-relayout ever reaches the file.
+	 */
+	private void collectSettled()
+	{
+		if (settleTicks < COLLECT_SETTLE_TICKS || pendingCollect.isEmpty())
+		{
+			return;
+		}
+		for (String en : pendingCollect)
+		{
+			translator.translateJournalSentence(en, config.aiFillInterface(), SKILLGUIDE_TAG, true);
+		}
+		log.info("OSRSCN-860 settle-collect: {} runs recorded after {} stable ticks",
+				pendingCollect.size(), settleTicks);
+		pendingCollect.clear();
 	}
 
 	/**
@@ -1577,6 +1630,8 @@ public class InterfaceTranslator
 		committedSig = null;
 		failedSig = null;
 		lastProseSig = "";
+		settleTicks = 0;
+		pendingCollect.clear();
 	}
 
 	/** Most common colour among a segment's words, so a stray coloured word doesn't tint the paragraph. */
@@ -2331,7 +2386,11 @@ public class InterfaceTranslator
 		// Look the whole widget up as one templated string (numbers -> <Num0>...), so multi-line info
 		// boxes (prayer/spell/XP) and any numbered label match a single table entry. Info boxes also
 		// fall back to AI for description lines the table doesn't have (e.g. "Requires Mage Arena I").
-		Translator.Rendered r = translator.renderUi(text, w.getTextColor(), maxChars, size, aiFallback);
+		// Reconstruct groups reaching this point mean the reflow toggle is OFF: their per-widget lines
+		// are wrapped sentence halves, so translate them but never collect (same for noCollect panels).
+		Translator.Rendered r = (s.reconstruct || s.noCollect)
+				? translator.renderUiNoCollect(text, w.getTextColor(), maxChars, size, aiFallback)
+				: translator.renderUi(text, w.getTextColor(), maxChars, size, aiFallback);
 		if (r == null)
 		{
 			return;
@@ -2385,6 +2444,8 @@ public class InterfaceTranslator
 		committedSig = null;
 		failedSig = null;
 		lastProseSig = "";
+		settleTicks = 0;
+		pendingCollect.clear();
 	}
 
 	private void restoreWalk(Widget w)

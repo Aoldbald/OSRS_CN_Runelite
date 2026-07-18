@@ -74,6 +74,10 @@ public class AiTranslator
 	private java.util.concurrent.ScheduledExecutorService executor;
 	private final ConcurrentHashMap<String, String> cache = new ConcurrentHashMap<>();
 	private final Set<String> inFlight = ConcurrentHashMap.newKeySet();
+	// Keys known to be on disk. A cache hit re-requested with persist=true gets written on the spot:
+	// the 860 settle gate fires its first requests persist=false (frame unsettled) and replays them
+	// persist=true once stable - without this, guide translations would never survive a restart.
+	private final Set<String> persisted = ConcurrentHashMap.newKeySet();
 	private final File dir = new File(RuneLite.RUNELITE_DIR, "osrscn");
 	private String loadedModel; // model whose cache is currently in memory (per-model on disk)
 	private File cacheFile;
@@ -116,6 +120,10 @@ public class AiTranslator
 		{
 			// Serve already-cached translations even when AI is switched off: they cost nothing (no GPU,
 			// no network), so turning AI off should only stop *new* translations, not hide finished ones.
+			if (persist && isPersistable(english) && persisted.add(english))
+			{
+				persistToDisk(english, cached); // memory-only entry re-requested with persist on
+			}
 			return cached;
 		}
 		if (!config.useLocalAi())
@@ -179,6 +187,7 @@ public class AiTranslator
 		loadedModel = model;
 		cache.clear();
 		inFlight.clear();
+		persisted.clear();
 		failStreak.set(0);
 		backoffUntil = 0;
 		//noinspection ResultOfMethodCallIgnored
@@ -197,12 +206,14 @@ public class AiTranslator
 						String k = line.substring(0, t);
 						String v = line.substring(t + 1);
 						cache.putIfAbsent(k, v);
+						persisted.add(k);
 						// Entries written before a normalize() change keep their old key; re-normalize on
 						// load so the current query key still hits and the AI isn't re-run for them.
 						String nk = TranslationStore.normalize(k);
 						if (!nk.equals(k))
 						{
 							cache.putIfAbsent(nk, v);
+							persisted.add(nk);
 						}
 					}
 				}
@@ -261,6 +272,7 @@ public class AiTranslator
 	{
 		cache.clear();
 		inFlight.clear();
+		persisted.clear();
 		if (cacheFile != null)
 		{
 			//noinspection ResultOfMethodCallIgnored
@@ -313,7 +325,7 @@ public class AiTranslator
 						{
 							String zh = clean(content);
 							cache.put(english, zh);
-							if (persist && isPersistable(english))
+							if (persist && isPersistable(english) && persisted.add(english))
 							{
 								persistToDisk(english, zh);
 							}

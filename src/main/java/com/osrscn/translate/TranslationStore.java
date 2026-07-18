@@ -351,6 +351,40 @@ public class TranslationStore
 		return maps.get(category).get(normalizedKey);
 	}
 
+	// Tables that carry long reconstructed prose, where drift healing is safe and useful.
+	private static final Category[] DRIFT_CATEGORIES = {
+			Category.SUPPLEMENT, Category.SKILL_GUIDE, Category.INTERFACE,
+	};
+
+	/**
+	 * Drift heal for reconstructed prose: after a scroll/tab re-layout the word-run assembly can lose
+	 * its first word(s) ("Your Strength level..." -> "Strength level..."), so an exact key that hit on
+	 * the first visit misses forever after. Serve any known key that ends with the query and only has
+	 * a few extra leading characters. Long queries only - short labels must stay exact-match. The
+	 * linear scan is fine: this runs only on whole-run misses, which are rare and cooldown-paced.
+	 */
+	public String lookupProseDrift(String english)
+	{
+		if (english == null || english.length() < 40)
+		{
+			return null;
+		}
+		String q = normalize(english);
+		for (Category c : DRIFT_CATEGORIES)
+		{
+			for (Map.Entry<String, String> e : maps.get(c).entrySet())
+			{
+				String k = e.getKey();
+				int extra = k.length() - q.length();
+				if (extra > 0 && extra <= 16 && k.endsWith(q))
+				{
+					return e.getValue();
+				}
+			}
+		}
+		return null;
+	}
+
 	/** Case-insensitive lookup; {@code lowerKey} must be an already-normalized, lower-cased key.
 	 *  Only the {@link #LOOSE} categories have a lower-cased index (others return null). */
 	public String lookupLower(Category category, String lowerKey)

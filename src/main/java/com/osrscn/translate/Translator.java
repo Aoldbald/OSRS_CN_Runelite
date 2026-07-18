@@ -30,6 +30,12 @@ public class Translator
 	private static final Pattern TOP_THREE_WERE = Pattern.compile("(?i)(top three .+? were )(.+?)([.!?])");
 	private static final Pattern TOP_CRAB_WAS = Pattern.compile("(?i)the top crab crusher was (.+?)([.!?])");
 	private static final Pattern MEMBERS_LINE = Pattern.compile("(?i)^Members:\\s*(.+)$");
+	// GE transaction lines are parameterized by item: one hard row per item would never end, so the
+	// frame is composed here and the item goes through the name table (17k entries) instead.
+	private static final Pattern GE_TRADE_LINE = Pattern.compile(
+			"(?i)^Grand Exchange: Finished (buying|selling) (<Num\\d+>) x (.+?)\\.?$");
+	private static final Pattern GE_OFFER_LINE = Pattern.compile(
+			"(?i)^(Buy|Sell): (<Num\\d+>) x (.+)$");
 	// Combat-achievement "Monster: <name>" line: the prefix is fixed and the name lives in the name
 	// table (incl. bosses), so compose "怪物：" + looked-up name instead of needing a whole-line entry.
 	private static final Pattern MONSTER_LINE = Pattern.compile("(?i)^Monster:\\s*(.+)$");
@@ -221,7 +227,7 @@ public class Translator
 		String zh = templateLookup(Tags.placeholdColors(option), MENU_ORDER);
 		if (zh == null)
 		{
-			missing.record(Tags.stripTags(option).trim(), "interface", "", "");
+			missing.record(collectKey(option), "interface", "", "");
 			return null;
 		}
 		return glyph.toImgTags(Tags.restoreColors(zh, colors), colorRgb, 0, size);
@@ -300,6 +306,16 @@ public class Translator
 		return renderWithOrder(text, colorRgb, maxChars, size, aiFallback, persist, CHAT_ORDER, persist ? "gameText" : null);
 	}
 
+	/**
+	 * Like {@link #renderUi} but never writes missing rows and keeps AI results memory-only - for
+	 * surfaces whose text is player-controlled (boat names, hiscores) or mid-reflow (reconstruct
+	 * groups while the reflow toggle is off).
+	 */
+	public Rendered renderUiNoCollect(String text, int colorRgb, int maxChars, int size, boolean aiFallback)
+	{
+		return renderWithOrder(text, colorRgb, maxChars, size, aiFallback, false, UI_ORDER, null);
+	}
+
 	private Rendered renderWithOrder(String text, int colorRgb, int maxChars, int size, boolean aiFallback, boolean persist,
 			TranslationStore.Category[] order, String collectSource)
 	{
@@ -370,7 +386,7 @@ public class Translator
 						all = false; // a real line is still untranslated (table miss + AI not ready)
 						if (collectSource != null)
 						{
-							missing.record(Tags.stripTags(line).trim(), collectSource, "", "");
+							missing.record(collectKey(line), collectSource, "", "");
 						}
 					}
 				}
@@ -384,9 +400,20 @@ public class Translator
 		}
 		if (collectSource != null && !text.contains("<br>"))
 		{
-			missing.record(Tags.stripTags(text).trim(), collectSource, "", "");
+			missing.record(collectKey(text), collectSource, "", "");
 		}
 		return null;
+	}
+
+	/**
+	 * Collection form of a UI line: the exact key the lookups use (colours placeholded, styling
+	 * stripped) with the local player's name masked, so collected rows are directly usable table keys.
+	 */
+	private String collectKey(String s)
+	{
+		String k = Tags.placeholdColors(Tags.stripStyle(s)).trim();
+		String name = playerName();
+		return (name != null && !name.isEmpty()) ? k.replace(name, PLAYER_NAME) : k;
 	}
 
 	// Tables and live messages disagree on trailing punctuation ("You catch some raw shrimps" in the
@@ -602,6 +629,13 @@ public class Translator
 		{
 			return null;
 		}
+		// Letter-free text (bare numbers, "31/31", "200!") needs no translation - and looking it up is
+		// actively dangerous: the period-tolerant retry once matched a dialogue row "31." -> "31岁。",
+		// painting every widget that showed 31. Dialogue lookups use lookupAny, not this path.
+		if (!HAS_LETTER.matcher(Tags.stripColorPlaceholders(text)).find())
+		{
+			return null;
+		}
 		String playerList = playerListTemplateLookup(text);
 		if (playerList != null)
 		{
@@ -701,6 +735,23 @@ public class Translator
 
 	private String syntheticLookup(String text, TranslationStore.Category[] order)
 	{
+		Matcher ge = GE_TRADE_LINE.matcher(text);
+		if (ge.matches())
+		{
+			String zhName = lookupAnyOf(Tags.stripColorPlaceholders(ge.group(3)).trim(), order);
+			return zhName == null ? null
+					: "大交易所：已完成" + ("buying".equalsIgnoreCase(ge.group(1)) ? "购买" : "出售")
+					+ " " + ge.group(2) + " × " + zhName + "。";
+		}
+		Matcher offer = GE_OFFER_LINE.matcher(text);
+		if (offer.matches())
+		{
+			String zhName = lookupAnyOf(Tags.stripColorPlaceholders(offer.group(3)).trim(), order);
+			return zhName == null ? null
+					: ("Buy".equalsIgnoreCase(offer.group(1)) ? "购买" : "出售")
+					+ "：" + offer.group(2) + " × " + zhName;
+		}
+
 		Matcher members = MEMBERS_LINE.matcher(text);
 		if (members.matches())
 		{
@@ -779,6 +830,17 @@ public class Translator
 	 */
 	public String translateJournalSentence(String plain, boolean aiFallback)
 	{
+		return translateJournalSentence(plain, aiFallback, "", true);
+	}
+
+	/**
+	 * @param subCategory provenance tag for collected rows ({@code "skillguide860"} for the group-860
+	 *                    reflow), so the reflow pipeline can route by source
+	 * @param collect     false while the source frame is still settling: no missing row is written and
+	 *                    the AI result stays memory-only, so mid-relayout scrambles never persist
+	 */
+	public String translateJournalSentence(String plain, boolean aiFallback, String subCategory, boolean collect)
+	{
 		if (plain == null || plain.trim().isEmpty())
 		{
 			return "";
@@ -788,11 +850,21 @@ public class Translator
 		{
 			return zh;
 		}
+		// A re-layout can drop the run's leading word(s), so the composed key misses a table entry that
+		// hit on the first visit; heal from the known key instead of collecting the drifted variant.
+		zh = store.lookupProseDrift(plain);
+		if (zh != null)
+		{
+			return zh;
+		}
 		// Capture the verbatim reconstructed journal sentence (quest journal / achievement diary) so it
 		// can be batch-translated and baked into the tables later. This is the only drift-free source for
 		// journal recaps: they are server-sent, absent from both the cache dump and (accurately) the wiki.
-		missing.record(plain, "journal", "", "");
-		return aiFallback ? aiLine(plain, true) : null;
+		if (collect)
+		{
+			missing.record(collectKey(plain), "journal", subCategory, "");
+		}
+		return aiFallback ? aiLine(plain, collect) : null;
 	}
 
 	// Sentinel: this requirement segment carries a real name that the AI is still translating, so the

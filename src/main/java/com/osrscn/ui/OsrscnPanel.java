@@ -2,6 +2,8 @@ package com.osrscn.ui;
 
 import com.osrscn.OsrscnConfig;
 import com.osrscn.translate.AiTranslator;
+import com.osrscn.translate.MissingCollector;
+import com.osrscn.translate.MissingUploader;
 import com.osrscn.translate.TranslationStore;
 import com.osrscn.translate.Translator;
 import java.awt.BorderLayout;
@@ -14,6 +16,9 @@ import java.awt.GridLayout;
 import java.awt.Toolkit;
 import java.awt.datatransfer.StringSelection;
 import java.io.File;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import javax.swing.BorderFactory;
@@ -21,6 +26,7 @@ import javax.swing.BoxLayout;
 import javax.swing.JButton;
 import javax.swing.JComponent;
 import javax.swing.JLabel;
+import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.JTextArea;
@@ -48,6 +54,7 @@ public class OsrscnPanel extends PluginPanel
 	private static final Color ACCENT = ColorScheme.BRAND_ORANGE;
 	private static final String QQ_GROUP = "978108806";
 	private static final String SURVEY_URL = "https://docs.qq.com/form/page/DWW5BcmpRZmRORFho";
+	private static final String MISSING_ISSUE_URL = "https://github.com/Aoldbald/OSRS_CN_Data_Runelite/issues/new";
 	private static final int SEARCH_LIMIT = 40;
 	private static final long TRANSLATE_TIMEOUT_MS = 15_000;
 	private static final String K_TAB = "panelTab";
@@ -64,6 +71,8 @@ public class OsrscnPanel extends PluginPanel
 	private final DialogueHistory history;
 	private final TranslationStore store;
 	private final Translator translator;
+	private final MissingCollector missing;
+	private final MissingUploader uploader;
 
 	private final JPanel display = new JPanel(new BorderLayout());
 	private final JPanel tabBar = new JPanel(new BorderLayout());
@@ -106,7 +115,8 @@ public class OsrscnPanel extends PluginPanel
 
 	@Inject
 	OsrscnPanel(AiTranslator ai, OsrscnConfig config, ConfigManager configManager,
-			DialogueHistory history, TranslationStore store, Translator translator)
+			DialogueHistory history, TranslationStore store, Translator translator, MissingCollector missing,
+			MissingUploader uploader)
 	{
 		this.ai = ai;
 		this.config = config;
@@ -114,6 +124,8 @@ public class OsrscnPanel extends PluginPanel
 		this.history = history;
 		this.store = store;
 		this.translator = translator;
+		this.missing = missing;
+		this.uploader = uploader;
 		this.showZh = getBool(K_SHOW_ZH, true);
 		this.showEn = getBool(K_SHOW_EN, false);
 
@@ -182,18 +194,18 @@ public class OsrscnPanel extends PluginPanel
 		survey.setToolTipText("打开反馈问卷");
 		styleButton(survey);
 		survey.addActionListener(e -> LinkBrowser.browse(SURVEY_URL));
-		JButton missingDir = new JButton("缺词");
-		missingDir.setToolTipText("打开缺词文件夹（missing.tsv 所在位置）");
-		styleButton(missingDir);
-		missingDir.addActionListener(e -> openMissingDir());
+		JButton missingBtn = new JButton("缺词");
+		missingBtn.setToolTipText("查看并提交收集到的缺词");
+		styleButton(missingBtn);
+		missingBtn.addActionListener(e -> missingSubmitDialog());
 		btns.add(copy);
 		btns.add(survey);
-		btns.add(missingDir);
+		btns.add(missingBtn);
 		bar.add(btns, BorderLayout.CENTER);
 		return bar;
 	}
 
-	/** Open the folder holding the collected {@code missing.tsv}; fall back to copying the path. */
+	/** Open the folder holding the collected missing file; fall back to copying the path. */
 	private void openMissingDir()
 	{
 		File dir = new File(RuneLite.RUNELITE_DIR, "osrscn");
@@ -208,6 +220,104 @@ public class OsrscnPanel extends PluginPanel
 			Toolkit.getDefaultToolkit().getSystemClipboard()
 					.setContents(new StringSelection(dir.getPath()), null);
 		}
+	}
+
+	/**
+	 * Submission helper for the collected missing file. Everything is user-driven: the dialog explains
+	 * exactly what would be shared, and only the user's click copies the file to the clipboard and opens
+	 * a prefilled GitHub issue page to paste it into. The plugin itself never uploads anything.
+	 */
+	private void missingSubmitDialog()
+	{
+		missing.flushPending();
+		File f = missing.missingFile();
+		String content = "";
+		int rows = 0;
+		try
+		{
+			if (f.exists())
+			{
+				content = new String(Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8);
+				for (String line : content.split("\n"))
+				{
+					if (!line.trim().isEmpty())
+					{
+						rows++;
+					}
+				}
+				rows = Math.max(0, rows - 1); // header row
+			}
+		}
+		catch (Exception ex)
+		{
+			content = "";
+		}
+		if (rows <= 0 || content.isEmpty())
+		{
+			Object[] opts = {"打开文件夹", "关闭"};
+			String text = config.collectMissing()
+					? "还没有收集到缺词。\n带着插件玩一阵，游戏里查不到的文本会自动记到本地：\n" + f.getName()
+					: "「帮忙补全汉化」还没开启。\n在插件设置的「联系作者 / 反馈」里打开它，游戏里查不到的\n文本会记录到本地文件，之后可以在这里一键提交。";
+			int c = JOptionPane.showOptionDialog(this, message(text), "提交缺词",
+					JOptionPane.DEFAULT_OPTION, JOptionPane.INFORMATION_MESSAGE, null, opts, opts[1]);
+			if (c == 0)
+			{
+				openMissingDir();
+			}
+			return;
+		}
+		boolean auto = config.uploadMissing();
+		String text = "已收集 " + rows + " 条缺词（" + f.getName() + "）。\n\n"
+				+ (auto
+						? "自动上传已开启：每半小时发送新增内容，已传过的不会重复发。\n"
+								+ "当前未上传：" + uploader.pendingRows() + " 条。"
+								+ "点「立即上传」可以马上发送，不用等。\n\n"
+						: "点「复制并去 GitHub 提交」会：\n"
+								+ "1. 把文件内容复制到剪贴板；\n"
+								+ "2. 打开 GitHub 新建 issue 页面（需要 GitHub 账号）；\n"
+								+ "3. 你在页面里粘贴、确认后才算提交——插件自己不会上传任何东西。\n\n")
+				+ "内容只有游戏英文原文和来源分类，不含聊天和账号信息。\n"
+				+ (auto ? "" : "没有 GitHub 账号的话，把文件发到 QQ 群也可以。");
+		Object[] opts = auto
+				? new Object[]{"立即上传", "打开文件夹", "取消"}
+				: new Object[]{"复制并去 GitHub 提交", "打开文件夹", "取消"};
+		int choice = JOptionPane.showOptionDialog(this, message(text), "提交缺词",
+				JOptionPane.DEFAULT_OPTION, JOptionPane.QUESTION_MESSAGE, null, opts, opts[0]);
+		if (choice == 0)
+		{
+			if (auto)
+			{
+				uploader.uploadNow();
+			}
+			else
+			{
+				Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(content), null);
+				LinkBrowser.browse(issueUrl(rows));
+			}
+		}
+		else if (choice == 1)
+		{
+			openMissingDir();
+		}
+	}
+
+	private String issueUrl(int rows)
+	{
+		String title = "[missing] " + missing.installId() + " +" + rows;
+		String body = "提交 ID：" + missing.installId() + "，共 " + rows + " 条。\n\n"
+				+ "请把剪贴板里的缺词内容粘贴到这行下面：\n\n";
+		return MISSING_ISSUE_URL + "?title=" + URLEncoder.encode(title, StandardCharsets.UTF_8)
+				+ "&body=" + URLEncoder.encode(body, StandardCharsets.UTF_8);
+	}
+
+	/** Multi-line dialog body in the panel's CJK-friendly font. */
+	private JComponent message(String text)
+	{
+		JTextArea area = new JTextArea(text);
+		area.setEditable(false);
+		area.setOpaque(false);
+		area.setFont(uiFont(Font.PLAIN, 13));
+		return area;
 	}
 
 	// ---- 对话 history ----

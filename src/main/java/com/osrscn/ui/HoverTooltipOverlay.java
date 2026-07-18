@@ -71,7 +71,7 @@ public class HoverTooltipOverlay extends Overlay
 			return null;
 		}
 
-		String optZh = menuTranslator.translateOption(option, glyph.smallSize());
+		String optZh = menuTranslator.translateOption(option, entry.getType(), glyph.smallSize());
 		String tgtZh = (target == null || target.isEmpty()) ? null
 				: menuTranslator.translateTarget(target, glyph.smallSize());
 		if (optZh == null && tgtZh == null)

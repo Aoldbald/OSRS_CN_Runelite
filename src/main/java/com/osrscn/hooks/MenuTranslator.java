@@ -12,6 +12,7 @@ import javax.inject.Inject;
 import javax.inject.Singleton;
 import net.runelite.api.Client;
 import net.runelite.api.Menu;
+import net.runelite.api.MenuAction;
 import net.runelite.api.MenuEntry;
 import net.runelite.api.events.MenuOpened;
 
@@ -32,6 +33,13 @@ public class MenuTranslator
 	private static final int DEFAULT_TARGET_COLOR = 0xffffff;
 
 	private static final Pattern LEVEL = Pattern.compile("\\((?:level|combat)-(\\d+)\\)", Pattern.CASE_INSENSITIVE);
+
+	// "Use" on an inventory item selects it to apply to something else, and the confirm step reads
+	// "Use <item> -> <target>" as a sentence; the generic table word (使用) only suits a direct "Use"
+	// on an object/NPC. The distinction is the entry's MenuAction - runtime state the TSV schema can't
+	// express - so the two scene words live here instead of in the actions table.
+	private static final String USE_SELECT_ZH = "选用";
+	private static final String USE_APPLY_ZH = "用";
 
 	@Inject
 	private Client client;
@@ -92,7 +100,7 @@ public class MenuTranslator
 			return; // keep custom plugin actions matchable by their English text
 		}
 		String origOption = entry.getOption();
-		String opt = translateOption(origOption, glyph.uiSize());
+		String opt = translateOption(origOption, entry.getType(), glyph.uiSize());
 		if (opt != null)
 		{
 			originalText.put(opt, origOption);
@@ -130,9 +138,18 @@ public class MenuTranslator
 		}
 	}
 
-	/** @return rendered option, or null to leave the English option unchanged */
-	public String translateOption(String option, int size)
+	/**
+	 * @param type the entry's MenuAction, used to pick the scene word for "Use" (null = generic)
+	 * @return rendered option, or null to leave the English option unchanged
+	 */
+	public String translateOption(String option, MenuAction type, int size)
 	{
+		// Scene-specific "Use" must run before the table lookups, which would return the generic word.
+		String use = useZh(Tags.stripTags(option), type);
+		if (use != null)
+		{
+			return glyph.toImgTags(use, OPTION_COLOR, 0, size);
+		}
 		// Whole-option entries that embed a coloured name ("Open <col=..>Ardougne Journal</col>") are stored
 		// colour-templated in ACTIONS; match that first so the embedded name is translated and keeps its colour.
 		String whole = translator.lookupRenderMenuOption(option, OPTION_COLOR, size);
@@ -157,6 +174,28 @@ public class MenuTranslator
 			r = translator.lookupRender(Category.INTERFACE, plain, OPTION_COLOR, 0, size);
 		}
 		return r;
+	}
+
+	/** Scene word for a "Use" option, or null to fall through to the table translation (使用). */
+	private static String useZh(String plainOption, MenuAction type)
+	{
+		if (type == null || !"Use".equals(plainOption))
+		{
+			return null;
+		}
+		switch (type)
+		{
+			case WIDGET_TARGET:
+				return USE_SELECT_ZH; // selecting the inventory item to use on something else
+			case WIDGET_TARGET_ON_WIDGET:
+			case WIDGET_TARGET_ON_GAME_OBJECT:
+			case WIDGET_TARGET_ON_NPC:
+			case WIDGET_TARGET_ON_PLAYER:
+			case WIDGET_TARGET_ON_GROUND_ITEM:
+				return USE_APPLY_ZH; // "Use <item> -> <target>" reads as 用 <item> -> <target>
+			default:
+				return null; // direct "Use" on an object/NPC keeps the generic word
+		}
 	}
 
 	/** @return rendered target (name + localised level), or null to leave the English target */

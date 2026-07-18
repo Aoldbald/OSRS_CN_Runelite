@@ -27,7 +27,7 @@ dependencies {
 }
 
 group = 'com.osrscn'
-version = '0.1.6'
+version = '0.1.7'
 
 tasks.withType(JavaCompile).configureEach {
 	options.encoding = 'UTF-8'

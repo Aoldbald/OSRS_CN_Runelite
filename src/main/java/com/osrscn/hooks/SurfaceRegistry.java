@@ -47,6 +47,7 @@ final class SurfaceRegistry
 		boolean small;            // render at the smaller info-box / tooltip glyph size
 		boolean noAi;             // never AI-translate misses (HP bar: don't guess monster names)
 		boolean reconstruct;      // owned by reconstructJournals (whole-task reflow), not the generic walk
+		boolean noCollect;        // translated normally but never written to the missing file
 	}
 
 	private static final Surface DEFAULT = new Surface();
@@ -130,6 +131,11 @@ final class SurfaceRegistry
 		// ===== RECONSTRUCT: whole-task reflow owns these (tick, debounced) =====
 		r.row(grp(InterfaceID.Journalscroll.UNIVERSE)).reconstruct = true;
 		r.row(grp(InterfaceID.Questjournal.UNIVERSE)).reconstruct = true;
+
+		// ===== NO-COLLECT: translate but never write missing rows =====
+		// For panels dominated by player-controlled text (boat naming, hiscore name lists). Populate
+		// after an in-game group survey - only the player-text subpanels, NOT high-value label lists
+		// like the report reasons. The mechanism ships first so the survey is one builder line each.
 
 		// ===== SCRIPT hooks: a build script writes these on open/switch -> translate the instant it fires =====
 		// Account summary: named TEXT_FORMAT(3948)/SECTION_FORMAT(3950) + the unnamed XP/play-time siblings 3947/3949.

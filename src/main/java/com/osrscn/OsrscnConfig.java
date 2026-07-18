@@ -53,12 +53,25 @@ public interface OsrscnConfig extends Config
 	@ConfigItem(
 			keyName = "collectMissing",
 			name = "帮忙补全汉化",
-			description = "想为汉化出份力就开它。游戏里查不到的文本会存到本地 missing.tsv"
-					+ "（不含聊天），攒一阵把文件通过反馈问卷发给我们即可。",
+			description = "想为汉化出份力就开它。游戏里查不到的文本会存到本地缺词文件"
+					+ "（不含聊天，插件不会自动上传），攒一阵点侧边栏「缺词」按钮即可一键提交。",
 			section = feedback,
 			position = 1
 	)
 	default boolean collectMissing()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+			keyName = "uploadMissing",
+			name = "自动上传缺词",
+			description = "定期把收集到的缺词自动发送给汉化组，免去手动提交。只发送游戏英文原文"
+					+ "和匿名安装 ID（不含聊天、不含账号信息）。开启时会弹窗确认，随时可关。",
+			section = feedback,
+			position = 2
+	)
+	default boolean uploadMissing()
 	{
 		return false;
 	}
