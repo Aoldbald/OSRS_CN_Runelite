@@ -4,9 +4,11 @@ import com.osrscn.glyph.GlyphService;
 import com.osrscn.text.Tags;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.inject.Inject;
@@ -16,7 +18,8 @@ import net.runelite.api.Player;
 
 /**
  * Translation facade: lookup table first, AI fallback second, then render to char-image tags.
- * Returns {@code null} when no translation is available yet (caller keeps the original text).
+ * Returns {@code null} when no translation is available yet, and also when the table says this text
+ * stays English (see {@link #keepEnglish}); either way the caller keeps the original text untouched.
  *
  * <p>Call on the client thread (reads the local player name).
  */
@@ -24,6 +27,7 @@ import net.runelite.api.Player;
 public class Translator
 {
 	private static final String PLAYER_NAME = "[player name]";
+	private static final int CJK_MIN = 0x2E80; // same cut-off the glyph renderer uses for "needs a char-image"
 	private static final Pattern NUMBER = Pattern.compile("\\d+(?:[.,]\\d+)*");
 	private static final Pattern WORDY = Pattern.compile("[A-Za-z]{3,}"); // has a real word worth AI-translating
 	private static final Pattern HAS_LETTER = Pattern.compile("[A-Za-z]");
@@ -49,6 +53,7 @@ public class Translator
 	private static final Pattern PRICE_EACH = Pattern.compile("(?i)\\((<Num\\d+>)\\s*ea\\)");
 	private static final Pattern LEVEL_REQUIREMENT = Pattern.compile(
 			"(?i)^(<colNum\\d+>)?\\s*Level\\s+((?:<Num\\d+>)|\\d+(?:[.,]\\d+)*)\\s+(.+?)(</col>)?$");
+	private static final Pattern PLAYER_NAME_CHARS = Pattern.compile("[A-Za-z0-9 _-]+");
 
 	@Inject
 	private Client client;
@@ -60,6 +65,11 @@ public class Translator
 	private GlyphService glyph;
 	@Inject
 	private MissingCollector missing;
+
+	// Nearby-player names, compiled into one alternation and rebuilt at most once per game tick. Built
+	// and read on the client thread only; published as an immutable snapshot so a stray read from
+	// anywhere else still sees a matching tick/pattern pair.
+	private volatile NearbyNames nearby = NearbyNames.EMPTY;
 
 	/**
 	 * @param english  plain English source text (tags already stripped by the caller)
@@ -73,7 +83,41 @@ public class Translator
 		{
 			return null;
 		}
-		return glyph.toImgTags(zh, colorRgb, maxChars);
+		return render(zh, colorRgb, maxChars, glyph.uiSize());
+	}
+
+	/**
+	 * True when a lookup result carries no CJK, i.e. the data deliberately keeps this text in English:
+	 * fairy-ring dial letters ("A" -&gt; "A"), "PvP", ":-(", orc speech ("Kl-Kra!"), untranslated proper
+	 * nouns. Such a row is a real table hit, never a miss - it must not reach the AI or the missing
+	 * collector - but there is nothing for us to draw, so the surface is told "nothing to do" and leaves
+	 * the text (and the native bitmap font that draws it best) alone.
+	 *
+	 * <p>Tested on the value rather than {@code zh.equals(en)} because the harm comes from taking a widget
+	 * over, not from the two columns matching: near-identity rows ("Bosses" -&gt; "Boss") and accented-Latin
+	 * flavour lines have nothing to render either. Anything with real Chinese in it fails this test and
+	 * takes the normal path.
+	 */
+	private static boolean keepEnglish(String zh)
+	{
+		int i = 0;
+		int len = zh.length();
+		while (i < len)
+		{
+			int cp = zh.codePointAt(i);
+			if (cp >= CJK_MIN)
+			{
+				return false;
+			}
+			i += Character.charCount(cp);
+		}
+		return true;
+	}
+
+	/** Render to char-image tags, or null when there is nothing to render (see {@link #keepEnglish}). */
+	private String render(String zh, int colorRgb, int maxChars, int size)
+	{
+		return keepEnglish(zh) ? null : glyph.toImgTags(zh, colorRgb, maxChars, size);
 	}
 
 	/**
@@ -108,19 +152,21 @@ public class Translator
 			String zh = store.lookupAny(query);
 			if (zh != null)
 			{
-				return zh.replace(PLAYER_NAME, name);
+				return keepEnglish(zh) ? null : zh.replace(PLAYER_NAME, name);
 			}
 		}
 		String zh = store.lookupAny(english);
-		if (zh == null)
+		// A hit is final either way: an English-only value means "checked, keep English", so it must not
+		// fall through to the collector or the AI (which would mistranslate it).
+		if (zh != null)
 		{
-			if (collect)
-			{
-				missing.record(query, category, subCategory, source);
-			}
-			zh = aiTranslate(english, true);
+			return keepEnglish(zh) ? null : zh;
 		}
-		return zh;
+		if (collect)
+		{
+			missing.record(query, category, subCategory, source);
+		}
+		return aiTranslate(english, true);
 	}
 
 	/**
@@ -155,7 +201,9 @@ public class Translator
 
 	/**
 	 * Plain-text translation with no client access (no player-name substitution), safe to call from
-	 * the Swing thread - used by the side panel's manual translate box.
+	 * the Swing thread - used by the side panel's manual translate box. English-only rows are returned
+	 * verbatim rather than suppressed: the panel draws with a real font, so showing what the table holds
+	 * is the useful answer there.
 	 */
 	public String plainNoPlayer(String english)
 	{
@@ -200,7 +248,7 @@ public class Translator
 		{
 			return null;
 		}
-		return glyph.toImgTags(zh, colorRgb, maxChars, size);
+		return render(zh, colorRgb, maxChars, size);
 	}
 
 	// Menu options: action verbs first, then item actions and interface / name labels.
@@ -230,7 +278,8 @@ public class Translator
 			missing.record(collectKey(option), "interface", "", "");
 			return null;
 		}
-		return glyph.toImgTags(Tags.restoreColors(zh, colors), colorRgb, 0, size);
+		// render() may still return null (English-only row): that is a hit, so nothing is collected here.
+		return render(Tags.restoreColors(zh, colors), colorRgb, 0, size);
 	}
 
 	// Tables tried, in order, for generic interface text (LVL_UP covers level-up chat messages).
@@ -330,7 +379,9 @@ public class Translator
 		String whole = lookupPeriodTolerant(Tags.placeholdColors(text), order);
 		if (whole != null)
 		{
-			String img = glyph.toImgTags(Tags.restoreColors(whole, wholeColors), colorRgb, maxChars, size);
+			// A hit ends the walk even when render() declines it (English-only row): no per-line retry, no
+			// collected row, no AI - the caller just keeps the text the client already drew.
+			String img = render(Tags.restoreColors(whole, wholeColors), colorRgb, maxChars, size);
 			return img == null ? null : new Rendered(img, true);
 		}
 		if (text.contains("<br>") || text.contains("<u") || text.contains("<str") || aiFallback)
@@ -395,7 +446,8 @@ public class Translator
 			{
 				return null;
 			}
-			String img = glyph.toImgTags(sb.toString(), colorRgb, maxChars, size);
+			// Every line that hit was English-only: nothing to draw, leave the widget as the client drew it.
+			String img = render(sb.toString(), colorRgb, maxChars, size);
 			return img == null ? null : new Rendered(img, all);
 		}
 		if (collectSource != null && !text.contains("<br>"))
@@ -460,17 +512,46 @@ public class Translator
 
 	private String aiTranslate(String query, boolean protectPlayerNames, boolean persist)
 	{
-		ProtectedText p = protectPlayerNames ? protectDynamicPlayerNames(query) : new ProtectedText(query);
+		String key = TranslationStore.normalize(query);
+		if (!protectPlayerNames)
+		{
+			return ai.translate(key, persist);
+		}
+		// Cache first: an entry stored under the raw key was translated with nothing to protect, so on a
+		// hit for name-free text this is the very entry the protected path would find - reached without
+		// paying for name protection at all. Text that does carry a name is keyed on its placeholder form
+		// and deliberately falls through to the full path below, so cache keys are unchanged.
+		if (ai.cached(key) != null && !hasProtectableName(query))
+		{
+			return ai.translate(key, persist);
+		}
+		ProtectedText p = protectDynamicPlayerNames(query);
 		String zh = ai.translate(TranslationStore.normalize(p.text), persist);
 		return zh == null ? null : p.restore(zh);
+	}
+
+	/** Cheap "does protection change anything?" test, on the client thread. */
+	private boolean hasProtectableName(String text)
+	{
+		Pattern any = nearbyNamePattern();
+		return (any != null && any.matcher(text).find())
+				|| TOP_THREE_WERE.matcher(text).find()
+				|| TOP_CRAB_WAS.matcher(text).find();
 	}
 
 	private ProtectedText protectDynamicPlayerNames(String text)
 	{
 		ProtectedText p = new ProtectedText(text);
-		for (String name : currentPlayerNames())
+		Pattern any = nearbyNamePattern();
+		if (any != null)
 		{
-			p.protectName(name);
+			// One pass yields the (usually zero) nearby names actually present, instead of matching the
+			// whole nearby-player list against the text name by name.
+			Matcher m = any.matcher(text);
+			while (m.find())
+			{
+				p.protectName(m.group());
+			}
 		}
 		for (String name : topThreeNames(text))
 		{
@@ -483,12 +564,68 @@ public class Translator
 		return p;
 	}
 
+	/** Immutable snapshot of the nearby-name alternation and the tick it was built on. */
+	private static final class NearbyNames
+	{
+		static final NearbyNames EMPTY = new NearbyNames(Integer.MIN_VALUE, null);
+
+		final int tick;
+		final Pattern any; // alternation over every nearby name, longest first; null when there are none
+
+		NearbyNames(int tick, Pattern any)
+		{
+			this.tick = tick;
+			this.any = any;
+		}
+	}
+
+	/**
+	 * One pattern matching any nearby player's name, rebuilt at most once per game tick. Rebuilding the
+	 * list and compiling one Pattern per name on every call was the crowded-place lag: at a busy Grand
+	 * Exchange that was ~150 Pattern.compile per untranslated line per frame. Up to a tick of staleness is
+	 * harmless - AI translation is asynchronous and lands seconds later anyway.
+	 *
+	 * <p>Client thread only (reads the player list).
+	 */
+	private Pattern nearbyNamePattern()
+	{
+		int tick = client.getTickCount();
+		NearbyNames cached = nearby;
+		if (cached.tick == tick)
+		{
+			return cached.any;
+		}
+		Pattern any = compileNames(currentPlayerNames());
+		nearby = new NearbyNames(tick, any);
+		return any;
+	}
+
+	/** Names are joined longest-first so a name that is a prefix of a longer one can't win over it. */
+	private static Pattern compileNames(List<String> names)
+	{
+		if (names.isEmpty())
+		{
+			return null;
+		}
+		StringBuilder sb = new StringBuilder("(?<![A-Za-z0-9_])(?:");
+		for (int i = 0; i < names.size(); i++)
+		{
+			if (i > 0)
+			{
+				sb.append('|');
+			}
+			sb.append(Pattern.quote(names.get(i)));
+		}
+		return Pattern.compile(sb.append(")(?![A-Za-z0-9_])").toString());
+	}
+
 	private List<String> currentPlayerNames()
 	{
 		List<String> names = new ArrayList<>();
+		Set<String> seen = new HashSet<>();
 		if (client.getLocalPlayer() != null)
 		{
-			addName(names, client.getLocalPlayer().getName());
+			addName(names, seen, client.getLocalPlayer().getName());
 		}
 		List<Player> players = client.getPlayers();
 		if (players == null)
@@ -499,11 +636,24 @@ public class Translator
 		{
 			if (p != null)
 			{
-				addName(names, p.getName());
+				addName(names, seen, p.getName());
 			}
 		}
 		names.sort(Comparator.comparingInt(String::length).reversed());
 		return names;
+	}
+
+	private static void addName(List<String> names, Set<String> seen, String name)
+	{
+		if (name == null)
+		{
+			return;
+		}
+		String n = name.trim();
+		if (!n.isEmpty() && seen.add(n))
+		{
+			names.add(n);
+		}
 	}
 
 	private static void addName(List<String> names, String name)
@@ -557,7 +707,7 @@ public class Translator
 	{
 		int len = name.length();
 		return len >= 1 && len <= 12
-				&& name.matches("[A-Za-z0-9 _-]+")
+				&& PLAYER_NAME_CHARS.matcher(name).matches()
 				&& HAS_LETTER.matcher(name).find();
 	}
 

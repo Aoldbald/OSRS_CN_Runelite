@@ -7,12 +7,16 @@ import java.io.FileWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.security.SecureRandom;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.inject.Inject;
 import javax.inject.Singleton;
@@ -58,7 +62,39 @@ public class MissingCollector
 	// Parameterized transaction messages: one instance per traded item would collect forever; the
 	// synthetic GE lookup (Translator.syntheticLookup) composes them from the name table instead.
 	private static final Pattern TEMPLATE_MSG = Pattern.compile(
-			"(?i)^Grand Exchange: (Finished )?(buying|selling) |^(Buy|Sell): \\d+ x ");
+			"(?i)^Grand Exchange: (Finished )?(buying|selling) |^(Buy|Sell): \\d+ x |^(Bought|Sold): ");
+	private static final Pattern TAGS = Pattern.compile("<[^>]+>");
+	private static final Pattern WS = Pattern.compile("\\s+");
+
+	// --- word salad (mid-fill scramble) -------------------------------------------------------------
+	// The new-style skill guide (group 860) fills a paragraph word by word across frames, so a snapshot
+	// taken mid-fill reads like a sentence but is scrambled ("Range , such as the one in Lumbridge
+	// Castle.", "...select an to Accurate"). Rows like that were translated and shipped, and the upstream
+	// settle gate proved leaky, so the check sits here: record() is the one choke point every collection
+	// path goes through. Only the cheap, high-confidence tells from tools/clean_inbox.py (stages 3-4) are
+	// ported - containment, cross-row dedup and library comparison need the whole batch and stay in the
+	// pipeline. Precision over recall: a false reject silently loses a real missing line, a false accept
+	// is one junk row the pipeline still catches.
+
+	// A space before a comma or full stop is a relayout join scar in reflowed prose. NOT a general rule:
+	// 137 published rows match it, including ordinary dialogue ("Hey , what are you doing here?"), which
+	// is why isSalad() only runs on the reflow surfaces. See REFLOW_SOURCE.
+	private static final Pattern FLOAT_PUNCT = Pattern.compile("\\s[,.](?:\\s|$)");
+	// Word pairs English never produces: doubled articles, doubled prepositions, or an article glued
+	// straight onto a preposition ("select an to Accurate"). Case is load-bearing - the trailing word is
+	// matched lower-case only so real text like "the On switch" survives, and the article+preposition
+	// rule takes a lower-case article only so a capitalised letter label ("The A to Z") survives too.
+	// The lookahead keeps hyphenated words ("the in-game clock") out.
+	private static final Pattern SALAD_PAIR = Pattern.compile(
+			"\\b(?:[Tt]he|[Aa]n?)\\s+(?:the|an?)\\b"
+			+ "|\\b(?:the|an?)\\s+(?:to|of|in|on|for|with|and|or|at|by|from)(?=\\s|$)"
+			+ "|\\b(to|of|in|on|for|with)\\s+\\1\\b");
+	// Text that continues in lower case after a full stop is two pieces joined mid-fill ("...combat
+	// skills. and"). Needs two letters before the stop, so "e.g." / "i.e." never match; the remaining
+	// abbreviations are listed out. URLs and decimals are safe (no space after the stop / not letters).
+	private static final Pattern MID_PERIOD = Pattern.compile("([A-Za-z]{2,})\\.\\s+[a-z]");
+	private static final Set<String> ABBREV = new HashSet<>(Arrays.asList(
+			"etc", "eg", "ie", "vs", "approx", "min", "max", "sec", "hr", "lvl", "mr", "mrs", "dr", "st", "no"));
 
 	@Inject
 	private OsrscnConfig config;
@@ -95,16 +131,25 @@ public class MissingCollector
 			return;
 		}
 		String t = english.trim();
-		// the prose check ignores "[player name]" masks, so a widget that was ONLY a name is rejected
-		if (t.isEmpty() || t.length() > MAX_LEN || t.indexOf('\t') >= 0 || t.indexOf('\n') >= 0
-				|| !WORDY.matcher(t.replace("[player name]", "")).find())
+		if (t.isEmpty() || t.length() > MAX_LEN || t.indexOf('\t') >= 0 || t.indexOf('\n') >= 0)
 		{
 			return;
 		}
-		if (isFragment(t) || DYNAMIC.matcher(t).find() || NOISE.matcher(t).find()
-				|| TEMPLATE_MSG.matcher(t).find() || hasCjk(t))
+		// Test for prose on the tag-stripped text, never the raw string: our own output is a run of
+		// <img=N> char-image tags, and "img" is three letters, so a fully translated widget passed the
+		// prose test and our own translations were collected as missing words. The "[player name]" mask
+		// is dropped too, so a widget that was only a name is rejected.
+		String bare = TAGS.matcher(t).replaceAll("").trim();
+		if (!WORDY.matcher(bare.replace("[player name]", "")).find())
 		{
-			return; // fragment, live value label, join noise, per-item template instance, or player CJK
+			return;
+		}
+		if (isFragment(bare) || DYNAMIC.matcher(t).find() || NOISE.matcher(t).find()
+				|| TEMPLATE_MSG.matcher(t).find() || hasCjk(t)
+				|| ((isReflowSource(source) || isReflowSource(subCategory)) && isSalad(bare)))
+		{
+			// fragment, live value label, join noise, per-item template instance, player CJK, mid-fill salad
+			return;
 		}
 		ensureLoaded();
 		if (seen.add(dedupKey(t)))
@@ -127,10 +172,13 @@ public class MissingCollector
 		return TranslationStore.normalize(DEDUP_NUM.matcher(DEDUP_COL.matcher(t).replaceAll(" ")).replaceAll("#"));
 	}
 
-	/** A wrapped-line fragment (mid-sentence), which must not be collected as a translatable unit. */
-	private static boolean isFragment(String t)
+	/**
+	 * A wrapped-line fragment (mid-sentence), which must not be collected as a translatable unit.
+	 *
+	 * @param bare the text with tags stripped
+	 */
+	private static boolean isFragment(String bare)
 	{
-		String bare = t.replaceAll("<[^>]+>", "").trim();
 		if (bare.isEmpty())
 		{
 			return false;
@@ -141,7 +189,46 @@ public class MissingCollector
 		}
 		char last = bare.charAt(bare.length() - 1);
 		boolean terminal = last == '.' || last == '!' || last == '?' || last == ':' || last == ')' || last == '"';
-		return !terminal && bare.split("\\s+").length >= 4 && FRAG_END.matcher(bare).find();
+		return !terminal && WS.split(bare).length >= 4 && FRAG_END.matcher(bare).find();
+	}
+
+	/**
+	 * Word salad only comes from the surfaces that reflow prose frame by frame (the new-style skill guide
+	 * and the journal reconstruction), and their provenance tag is knowledge only the client has. Scoping
+	 * the check to them keeps the shape rules away from ordinary dialogue and UI text, where they draw
+	 * false positives. A client-side reject is invisible and can never be hot-fixed, so it stays narrow.
+	 */
+	private static boolean isReflowSource(String tag)
+	{
+		return tag != null && (tag.startsWith("skillguide") || tag.startsWith("journal"));
+	}
+
+	/**
+	 * Word salad: a paragraph snapshot taken while the client was still filling it word by word. Only
+	 * mechanical, high-confidence tells (see the pattern comments above); anything ambiguous is accepted
+	 * and left to the offline cleaner.
+	 *
+	 * @param bare the text with tags stripped
+	 */
+	private static boolean isSalad(String bare)
+	{
+		if (bare.isEmpty())
+		{
+			return false;
+		}
+		if (FLOAT_PUNCT.matcher(bare).find() || SALAD_PAIR.matcher(bare).find())
+		{
+			return true;
+		}
+		Matcher m = MID_PERIOD.matcher(bare);
+		while (m.find())
+		{
+			if (!ABBREV.contains(m.group(1).toLowerCase(java.util.Locale.ROOT)))
+			{
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/** Game English is never CJK, so any CJK codepoint means player-authored content (setup / tab names). */

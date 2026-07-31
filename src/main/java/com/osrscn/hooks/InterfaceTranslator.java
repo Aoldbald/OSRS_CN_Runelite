@@ -1,6 +1,8 @@
 package com.osrscn.hooks;
 
 import com.osrscn.glyph.GlyphService;
+import com.osrscn.translate.AiTranslator;
+import com.osrscn.translate.TranslationStore;
 import com.osrscn.translate.Translator;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -74,13 +76,25 @@ public class InterfaceTranslator
 	private GlyphService glyph;
 	@Inject
 	private com.osrscn.OsrscnConfig config;
+	// read only for their sizes, as invalidation signals for the negative memo (see revalidateMisses)
+	@Inject
+	private TranslationStore store;
+	@Inject
+	private AiTranslator aiTranslator;
 
 	// keyed by id+index: dynamic children (skill/quest lists) share one id, so id alone collides
 	private final Map<Long, String> lastSet = new HashMap<>();
+	// the exact English that missed every table (and the AI) per widget: without it every untranslatable
+	// label - item names, numbers, world rows - re-runs the whole lookup pipeline on every client tick AND
+	// every frame, forever. Keyed on widget + exact text, so a widget whose text changed still translates
+	// on the very same frame. See revalidateMisses() for how entries are invalidated.
+	private final Map<Long, String> lastMiss = new HashMap<>();
 	private final Map<Long, Integer> lastColor = new HashMap<>(); // colour baked into the glyphs, for hover re-render
 	private final Map<Long, String> original = new HashMap<>(); // -> original text, for instant restore
 	// per journal root: the raw slot text the last tick saw, to debounce the client's multi-stage population
 	private final Map<Integer, String> journalSig = new HashMap<>();
+	// per journal root: consecutive ticks that signature has held, gating collection (see reconstructRoot)
+	private final Map<Integer, Integer> journalStable = new HashMap<>();
 	// widgets we translated only partially (some AI lines pending): re-translate until complete
 	private final Set<Long> incomplete = new HashSet<>();
 	// prose slots (860) whose position we changed while compacting: original x/y to revert on restore/decommit
@@ -105,13 +119,103 @@ public class InterfaceTranslator
 		return ((long) w.getId() << 21) | (w.getIndex() & 0x1FFFFF);
 	}
 
+	// ===== Per-pass state =====
+	// Config values the walk needs, read once per pass: a RuneLite config proxy call costs far more than
+	// the check it guards, and the walk touches thousands of widgets per client tick AND per frame.
+	private boolean cfgAiInterface;
+	private boolean cfgReconstruct;
+	private boolean cfgDebug;
+	private boolean cfgSearchResults;
+	// A memoised miss may survive at most this many passes: anything we failed to detect (a glyph sprite
+	// that finished uploading, a config toggle, a backend that came back) then costs a fraction of a second
+	// of English instead of sticking forever. ~4 revalidations/s across the tick + frame lanes.
+	private static final int MISS_REVALIDATE_PASSES = 25;
+	private int missPasses;
+	private int missStoreSize = -1;
+	private int missAiCacheSize = -1;
+	// debugMonitor-only counters; every increment sits behind cfgDebug so they cost nothing when off
+	private int statVisited;
+	private int statMissRun;
+	private int statMissSkip;
+	private int statPasses;
+	private long statSince;
+	private volatile String statLine = "";
+	private boolean promptPerFrame;
+	private String promptDump; // debugMonitor: last logged chatbox prompt layout, to log each one once
+
+	/** Start one walk: refresh the cached config values and revalidate the negative memo. */
+	private void beginPass()
+	{
+		cfgAiInterface = config.aiFillInterface();
+		cfgReconstruct = config.reconstructJournals();
+		cfgDebug = config.debugMonitor();
+		cfgSearchResults = config.translateSearchResults();
+		revalidateMisses();
+		if (cfgDebug)
+		{
+			statPasses++;
+		}
+	}
+
+	/**
+	 * Drop the negative memo whenever a miss could have become a hit: the translation tables finished an
+	 * (async) load or reload, an AI translation landed in the cache, or the revalidation timeout expired.
+	 * Both sizes are O(1)-ish reads of concurrent maps, taken once per pass and never per widget.
+	 */
+	private void revalidateMisses()
+	{
+		if (lastMiss.isEmpty())
+		{
+			return;
+		}
+		int tables = store.size();
+		int aiCache = aiTranslator.cacheSize();
+		if (++missPasses >= MISS_REVALIDATE_PASSES || tables != missStoreSize || aiCache != missAiCacheSize)
+		{
+			missPasses = 0;
+			missStoreSize = tables;
+			missAiCacheSize = aiCache;
+			lastMiss.clear();
+		}
+	}
+
+	/** Roll the debug counters into {@link #debugStats()} once a second. Only called with debugMonitor on. */
+	private void reportStats()
+	{
+		long now = System.currentTimeMillis();
+		if (statSince == 0)
+		{
+			statSince = now;
+			return;
+		}
+		if (now - statSince < 1000)
+		{
+			return;
+		}
+		int passes = Math.max(statPasses, 1);
+		statLine = statVisited / passes + " widgets/pass, " + statMissRun + " misses/s, "
+				+ statMissSkip + " memo hits/s, " + passes + " passes/s";
+		log.info("OSRSCN-perf {}", statLine);
+		statVisited = 0;
+		statMissRun = 0;
+		statMissSkip = 0;
+		statPasses = 0;
+		statSince = now;
+	}
+
 	/** Re-translate every loaded interface root. Lookup self-scopes (only table hits are replaced). */
 	public void translateOpen()
 	{
+		beginPass();
 		scan(false);
 		translateChatTabs();
+		translateChatPrompts(false);
 		reconstructJournals();
 		reconstructWordSplit(); // PROTOTYPE Phase 3: new-style (word-per-widget) skill guide, group 860
+		if (cfgDebug)
+		{
+			reportStats();
+		}
 	}
 
 	// ===== Experimental whole-task journal translation (config.reconstructJournals) =====
@@ -130,7 +234,7 @@ public class InterfaceTranslator
 	 */
 	private void reconstructJournals()
 	{
-		if (!config.reconstructJournals())
+		if (!cfgReconstruct)
 		{
 			return;
 		}
@@ -303,7 +407,7 @@ public class InterfaceTranslator
 		}
 		// Full interface render: splits <br> (item name + "Requires:" line), looks each line up, and keeps
 		// the <col> requirement colour - item / quest names sit in the tables like any other UI text.
-		Translator.Rendered r = translator.renderUi(t, w.getTextColor(), maxChars, size, config.aiFillInterface());
+		Translator.Rendered r = translator.renderUi(t, w.getTextColor(), maxChars, size, cfgAiInterface);
 		if (r == null)
 		{
 			return;
@@ -443,8 +547,7 @@ public class InterfaceTranslator
 			committedSig = null;
 			failedSig = null;
 			lastProseSig = effectiveEnglishSig(container, prose);
-			settleTicks = 0;
-			pendingCollect.clear();
+			restartSettling();
 			decision = "REPOP[" + repop + "]";
 		}
 		else if (committedSig != null)
@@ -470,13 +573,13 @@ public class InterfaceTranslator
 				else if (!sig.equals(lastProseSig))
 				{
 					lastProseSig = sig; // a non-owned slot changed: wait for it to hold still
-					settleTicks = 0;
+					restartSettling();
 					decision = "DEBOUNCE";
 				}
 				else
 				{
 					committedSig = null; // stable divergent frame: drop the commit so the next tick re-lays
-					settleTicks = 0;
+					restartSettling();
 					decision = "DEBOUNCE";
 				}
 			}
@@ -487,7 +590,7 @@ public class InterfaceTranslator
 			if (!sig.equals(lastProseSig))
 			{
 				lastProseSig = sig;
-				settleTicks = 0;
+				restartSettling();
 				decision = "DEBOUNCE"; // still settling: wait for two identical ticks
 			}
 			else if (sig.equals(failedSig) && pendingCooldown-- > 0)
@@ -643,6 +746,7 @@ public class InterfaceTranslator
 	{
 		java.util.function.Predicate<Long> isProse = k -> (k >>> 21) == (PROSE_COMPONENT_ID & 0xFFFFFFFFL);
 		lastSet.keySet().removeIf(isProse);
+		lastMiss.keySet().removeIf(isProse);
 		original.keySet().removeIf(isProse);
 		lastColor.keySet().removeIf(isProse);
 		incomplete.removeIf(isProse);
@@ -686,6 +790,7 @@ public class InterfaceTranslator
 			original.remove(key);
 			lastColor.remove(key);
 			lastSet.remove(key);
+			lastMiss.remove(key);
 			incomplete.remove(key);
 		}
 	}
@@ -721,7 +826,7 @@ public class InterfaceTranslator
 	{
 		int gw = glyph.glyphWidth(size);
 		int lineH = glyph.glyphHeight(size) + 2; // +2 leading: the raw glyph ink height sets lines touching
-		boolean ai = config.aiFillInterface();
+		boolean ai = cfgAiInterface;
 
 		// All geometry below reads the pre-revert native snapshot (nat), never live relative coordinates:
 		// mid-tick relative values are stale after our own writes and would corrupt grouping and the ledger.
@@ -1345,6 +1450,21 @@ public class InterfaceTranslator
 	}
 
 	/**
+	 * The frame stopped holding still (debounce / repopulation): restart the settle count AND drop the
+	 * queue. Anything queued belonged to a frame that never proved stable - the client fills the guide's
+	 * prose word by word across frames, so those fragments are half-sentences ("word salad"), and
+	 * replaying them once a LATER frame settles is exactly how they used to reach the missing file.
+	 * Nothing legitimate is lost: a frame that did hold still for {@link #COLLECT_SETTLE_TICKS} was
+	 * already flushed by {@link #collectSettled()} on one of those ticks, which empties the queue.
+	 */
+	private void restartSettling()
+	{
+		settleTicks = 0;
+		collectOk = false;
+		pendingCollect.clear();
+	}
+
+	/**
 	 * The frame held still long enough: replay the (cheap, lookup-only) translations of everything
 	 * laid before the gate opened, this time with collection on - so committing a fast layout never
 	 * silently loses the rows, and nothing mid-relayout ever reaches the file.
@@ -1357,7 +1477,7 @@ public class InterfaceTranslator
 		}
 		for (String en : pendingCollect)
 		{
-			translator.translateJournalSentence(en, config.aiFillInterface(), SKILLGUIDE_TAG, true);
+			translator.translateJournalSentence(en, cfgAiInterface, SKILLGUIDE_TAG, true);
 		}
 		log.info("OSRSCN-860 settle-collect: {} runs recorded after {} stable ticks",
 				pendingCollect.size(), settleTicks);
@@ -1681,8 +1801,16 @@ public class InterfaceTranslator
 		String sig = sigBuf.toString();
 		if (!sig.equals(journalSig.put(componentId, sig)))
 		{
+			journalStable.put(componentId, 0);
 			return; // still settling: wait one more tick before translating
 		}
+		// One identical tick is enough to translate, but NOT to persist: this path used to record every
+		// reconstructed sentence unconditionally, so a journal caught mid-population wrote half-sentences
+		// into the missing file. Collection now needs the same COLLECT_SETTLE_TICKS the group-860 reflow
+		// uses (~300ms of an unchanged frame); the screen still updates on the first stable tick.
+		int stable = journalStable.merge(componentId, 1, Integer::sum);
+		boolean collect = stable >= COLLECT_SETTLE_TICKS;
+		String journalTag = "journal" + (componentId >>> 16); // provenance, like the 860 reflow's tag
 		// When the diary / difficulty is switched (or the scroll rebuilt) the client reuses these widgets and
 		// overwrites at least one slot we translated with fresh English. That can leave a *mixed* frame - one
 		// slot fresh English, a sibling still our char-image - which the reconstructor mis-groups (it treats a
@@ -1719,6 +1847,7 @@ public class InterfaceTranslator
 				}
 				original.remove(key);
 				lastSet.remove(key);
+				lastMiss.remove(key);
 				incomplete.remove(key);
 			}
 		}
@@ -1730,7 +1859,7 @@ public class InterfaceTranslator
 		List<JournalReconstructor.Unit> units = JournalReconstructor.reconstruct(texts);
 
 		int size = glyph.uiSize();
-		boolean aiFallback = config.aiFillInterface();
+		boolean aiFallback = cfgAiInterface;
 		for (JournalReconstructor.Unit unit : units)
 		{
 			if (!unit.content)
@@ -1754,7 +1883,7 @@ public class InterfaceTranslator
 			String sentenceRaw = reqStart >= 0 ? raw.substring(0, reqStart) : raw;
 			String reqRaw = reqStart >= 0 ? raw.substring(reqStart) : "";
 			String sentenceZh = translator.translateJournalSentence(
-					JournalReconstructor.strip(sentenceRaw).trim(), aiFallback);
+					JournalReconstructor.strip(sentenceRaw).trim(), aiFallback, journalTag, collect);
 			if (sentenceZh == null)
 			{
 				continue; // prose not translatable yet (AI off/pending): leave the task in English
@@ -2073,6 +2202,192 @@ public class InterfaceTranslator
 	 * tucks against the bottom, keeping the native top/bottom stacking without the two glyph lines
 	 * touching. The "All" tab has no filter, so its name is centred instead of pinned to the top.
 	 */
+	/**
+	 * Chatbox prompt panel: GE item search, bank search, "enter a name". The whole chatbox group is
+	 * excluded from the generic walk, so these had no owner and stayed English. Reach them directly from
+	 * MES_LAYER rather than relying on the walk to descend into an excluded group, the same way the chat
+	 * tab labels are handled. Skipped on purpose: the two widgets holding what the player is typing, and
+	 * the result list, which core RuneLite rewrites with {@code </u>} highlights that would cut an img tag
+	 * in half.
+	 */
+	/**
+	 * The prompt line holds the question and, once the player starts typing, their own text too. Table
+	 * lookups only ever match the untouched question, so a typed line simply misses and is left alone -
+	 * but only as long as the AI never sees it, and it is never written to the missing file.
+	 */
+	private static final SurfaceRegistry.Surface PROMPT_SURFACE = SurfaceRegistry.promptSurface();
+
+	/**
+	 * Result rows carry core RuneLite's fuzzy-search underline markup, inserted at a character offset
+	 * into whatever the widget currently holds. Once a name is char-images that offset can land inside
+	 * an img tag, so drop the markup before we take the widget over: the highlight is lost, a cut tag
+	 * would be visible garbage.
+	 */
+	private static final Pattern SEARCH_UNDERLINE = Pattern.compile("</?u(?:=[^>]*)?>");
+
+	private void translateChatPrompts(boolean perFrame)
+	{
+		Widget layer = client.getWidget(InterfaceID.Chatbox.MES_LAYER);
+		if (cfgDebug && !perFrame)
+		{
+			dumpPrompts(layer);
+		}
+		promptPerFrame = perFrame;
+		if (layer == null || layer.isHidden())
+		{
+			return;
+		}
+		// Static children only. RuneLite builds its own chatbox panels (bank tag search, wiki search,
+		// anything using ChatboxPanelManager) as DYNAMIC children of this same layer, and dynamic children
+		// inherit the parent's id, so they cannot be told apart by id. Those hold what the player is
+		// typing: a table lookup would hit the 21k-entry name table and turn "logs" into Chinese as they
+		// type. The vanilla prompt, hints and results we do want are all static components of group 162.
+		promptWalkArray(layer.getStaticChildren());
+		promptWalkArray(layer.getNestedChildren());
+	}
+
+	/** debugMonitor only: log the prompt subtree once per distinct layout, to identify components by eye. */
+	private void dumpPrompts(Widget layer)
+	{
+		if (layer == null || layer.isHidden())
+		{
+			promptDump = null;
+			return;
+		}
+		StringBuilder sb = new StringBuilder();
+		collectPrompts(layer, sb, "root");
+		String s = sb.toString();
+		if (!s.equals(promptDump))
+		{
+			promptDump = s;
+			log.info("OSRSCN-prompt\n{}", s);
+		}
+	}
+
+	private void collectPrompts(Widget w, StringBuilder sb, String kind)
+	{
+		if (w == null || w.isHidden())
+		{
+			return;
+		}
+		String t = w.getText();
+		if (t != null && !t.isEmpty())
+		{
+			sb.append(String.format("  %s id=%d (grp=%d child=%d) item=%d text=%s%n",
+					kind, w.getId(), w.getId() >>> 16, w.getId() & 0xffff,
+					w.getItemId(), t));
+		}
+		collectPromptsArray(w.getStaticChildren(), sb, "static");
+		collectPromptsArray(w.getDynamicChildren(), sb, "dynamic");
+		collectPromptsArray(w.getNestedChildren(), sb, "nested");
+	}
+
+	private void collectPromptsArray(Widget[] children, StringBuilder sb, String kind)
+	{
+		if (children != null)
+		{
+			for (Widget c : children)
+			{
+				collectPrompts(c, sb, kind);
+			}
+		}
+	}
+
+	private void promptWalk(Widget w)
+	{
+		if (w == null || w.isHidden())
+		{
+			return;
+		}
+		int id = w.getId();
+		if (id == InterfaceID.Chatbox.INPUT || id == InterfaceID.Chatbox.MES_LAYER)
+		{
+			// INPUT is the player's own typing. A widget still carrying the layer's id is one of
+			// RuneLite's dynamically built panels (see translateChatPrompts) and is equally off limits.
+			return;
+		}
+		boolean results = id == InterfaceID.Chatbox.MES_LAYER_SCROLLCONTENTS;
+		if (results && promptPerFrame)
+		{
+			// Results only change when the player types, so a screen of them does not need redrawing
+			// every frame; the tick pass picks them up 20ms later, which nobody can see.
+			return;
+		}
+		String text = w.getText();
+		if (results && !cfgSearchResults && text != null && isItemName(text))
+		{
+			// Switch off: candidate names stay English, but the prompt and hints stay Chinese, which is
+			// what the setting promises. Names carry no terminal punctuation, hints and labels always do.
+			return;
+		}
+		if (id == InterfaceID.Chatbox.MES_TEXT2 && text != null && translateTypedPrompt(w, text))
+		{
+			return;
+		}
+		if (results && text != null && text.indexOf('<') >= 0 && !text.contains("<img="))
+		{
+			// Drop core RuneLite's fuzzy-search highlight before taking the widget over: it is inserted
+			// at a character offset, and once the name is char-images that offset can land inside an img
+			// tag. Losing the underline is cosmetic, a cut tag is visible garbage.
+			String bare = SEARCH_UNDERLINE.matcher(text).replaceAll("");
+			if (!bare.equals(text))
+			{
+				w.setText(bare);
+				text = bare;
+			}
+		}
+		translateWidget(w, false, PROMPT_SURFACE);
+		promptWalkArray(w.getStaticChildren());
+		promptWalkArray(w.getDynamicChildren());
+		promptWalkArray(w.getNestedChildren());
+	}
+
+	/** A candidate item name, as opposed to a prompt or hint: those always end in a full stop or colon. */
+	private static boolean isItemName(String text)
+	{
+		String t = text.trim();
+		return !t.isEmpty() && !t.endsWith(".") && !t.endsWith(":") && !t.endsWith("：");
+	}
+
+	private void promptWalkArray(Widget[] children)
+	{
+		if (children == null)
+		{
+			return;
+		}
+		for (Widget c : children)
+		{
+			promptWalk(c);
+		}
+	}
+
+	private boolean translateTypedPrompt(Widget w, String text)
+	{
+		if (text.contains("<img="))
+		{
+			return true; // already translated for this keystroke; the game rewrites it on the next one
+		}
+		int end = text.lastIndexOf("</col>");
+		if (end < 0)
+		{
+			return false;
+		}
+		String tail = text.substring(end + 6);
+		if (tail.equals(" *"))
+		{
+			return false;
+		}
+		String zh = translator.lookupRenderUi(text.substring(0, end + 6) + " *",
+				w.getTextColor(), 0, glyph.uiSize(), false);
+		if (zh == null || !zh.endsWith(" *"))
+		{
+			return false;
+		}
+		w.setText(zh.substring(0, zh.length() - 2) + tail);
+		w.setTextShadowed(false);
+		return true;
+	}
+
 	private void translateChatTabs()
 	{
 		for (int id : CHAT_TAB_WIDGETS)
@@ -2097,7 +2412,7 @@ public class InterfaceTranslator
 			boolean isFilter = CHAT_TAB_FILTERS.contains(id);
 			boolean nameOnly = id == InterfaceID.Chatbox.CHAT_ALL_TEXT1; // "All" tab has no filter line
 			int size = isFilter ? CHAT_TAB_FILTER_SIZE : CHAT_TAB_NAME_SIZE;
-			String r = translator.lookupRenderUi(clean, w.getTextColor(), 0, size, config.aiFillInterface());
+			String r = translator.lookupRenderUi(clean, w.getTextColor(), 0, size, cfgAiInterface);
 			if (r == null)
 			{
 				continue;
@@ -2158,6 +2473,7 @@ public class InterfaceTranslator
 	 */
 	public void translateRedraw()
 	{
+		beginPass();
 		// Per-frame freshness pass: walk every visible interface root and re-translate, so any text the
 		// client rewrote to English this frame (panel switch/redraw, per-frame tooltip rewrite, etc.) is
 		// translated before it is drawn. This is what kills the "flash" generally instead of per-panel.
@@ -2166,6 +2482,7 @@ public class InterfaceTranslator
 		// here and kept fresh by the per-tick backstop + their script hook.
 		scan(true);
 		translateChatTabs();
+		translateChatPrompts(true);
 	}
 
 	private void scan(boolean perFrame)
@@ -2190,6 +2507,7 @@ public class InterfaceTranslator
 	 */
 	public void translateGroup(int rootComponentId)
 	{
+		beginPass();
 		Widget root = client.getWidget(rootComponentId);
 		if (root == null || root.isHidden())
 		{
@@ -2211,6 +2529,7 @@ public class InterfaceTranslator
 	 */
 	public void translateComponent(int componentId)
 	{
+		beginPass();
 		Widget w = client.getWidget(componentId);
 		if (w == null || w.isHidden())
 		{
@@ -2231,6 +2550,7 @@ public class InterfaceTranslator
 	 */
 	public void translateSlowGroups()
 	{
+		beginPass();
 		slowLane = true;
 		try
 		{
@@ -2244,6 +2564,7 @@ public class InterfaceTranslator
 
 	public void translateGroupId(int groupId)
 	{
+		beginPass();
 		Widget[] roots = client.getWidgetRoots();
 		if (roots == null)
 		{
@@ -2297,14 +2618,21 @@ public class InterfaceTranslator
 		{
 			return;
 		}
+		// One registry lookup per widget, handed down to translateWidget (it used to repeat both this and
+		// the isHidden() check above on every widget of every pass).
+		SurfaceRegistry.Surface s = registry.forGroup(w.getId() >>> 16);
 		// Prune slow-scan subtrees from the fast lanes entirely: merely skipping them in
 		// translateWidget still recurses hundreds of rows and clones their child arrays 50x/s,
 		// which is what actually tanked FPS with the world switcher open.
-		if (!slowLane && registry.forGroup(w.getId() >>> 16).slowScan)
+		if (!slowLane && s.slowScan)
 		{
 			return;
 		}
-		translateWidget(w, perFrame);
+		if (cfgDebug)
+		{
+			statVisited++;
+		}
+		translateWidget(w, perFrame, s);
 		walkArray(w.getStaticChildren(), perFrame);
 		walkArray(w.getDynamicChildren(), perFrame);
 		walkArray(w.getNestedChildren(), perFrame);
@@ -2322,36 +2650,33 @@ public class InterfaceTranslator
 		}
 	}
 
-	private void translateWidget(Widget w, boolean perFrame)
+	private void translateWidget(Widget w, boolean perFrame, SurfaceRegistry.Surface s)
 	{
-		if (w == null || w.isHidden())
-		{
-			return;
-		}
-		// Decide by the widget's own group (info boxes can be nested under another group's root). All policy
-		// comes from the registry: excluded/chatbox never translate; the per-frame pass additionally skips
-		// hit-test-sensitive panels (kept on the tick backstop + their script hook, to not break mouseover);
-		// reconstruct groups are owned by reconstructJournals.
-		int grp = w.getId() >>> 16;
-		SurfaceRegistry.Surface s = registry.forGroup(grp);
+		// Policy comes from the widget's own group (info boxes can be nested under another group's root),
+		// resolved once by walk() and passed in: excluded/chatbox never translate; the per-frame pass
+		// additionally skips hit-test-sensitive panels (kept on the tick backstop + their script hook, to
+		// not break mouseover); reconstruct groups are owned by reconstructJournals.
 		if (s.excluded || (perFrame && s.perFrameExcluded) || (s.slowScan != slowLane))
 		{
 			// slowScan != slowLane: fast lanes skip slow groups; the slow lane only translates them
 			// (it re-walks the whole tree to reach nested side panels, so skip everything else).
 			return;
 		}
-		if (s.reconstruct && config.reconstructJournals())
+		if (s.reconstruct && cfgReconstruct)
 		{
 			return; // whole-task reconstruction owns these groups (see reconstructJournals)
 		}
 		int size = s.small ? glyph.smallSize() : glyph.uiSize();
-		boolean aiFallback = config.aiFillInterface() && !s.noAi;
+		boolean aiFallback = cfgAiInterface && !s.noAi;
 		long key = widgetKey(w);
 		String text = w.getText();
 		if (text == null || text.isEmpty())
 		{
 			return;
 		}
+		// true when we came in through our own char-images (partial AI box / recolour): those retries must
+		// never consult or feed the negative memo, or a hover recolour would stall until revalidation
+		boolean retranslate = false;
 		if (text.contains("<img="))
 		{
 			// already shows our translation. Revisit if it was partial (AI pending), or if the widget's
@@ -2370,9 +2695,20 @@ public class InterfaceTranslator
 				return;
 			}
 			text = eng; // re-translate from the stored English, not the partial char-images
+			retranslate = true;
 		}
 		else if (text.equals(lastSet.get(key)))
 		{
+			return;
+		}
+		else if (text.equals(lastMiss.get(key)))
+		{
+			// exactly the text that missed every table last time: skip the whole pipeline until something
+			// could have changed (revalidateMisses). Any edit to the widget's text fails this test.
+			if (cfgDebug)
+			{
+				statMissSkip++;
+			}
 			return;
 		}
 
@@ -2393,8 +2729,17 @@ public class InterfaceTranslator
 				: translator.renderUi(text, w.getTextColor(), maxChars, size, aiFallback);
 		if (r == null)
 		{
+			if (!retranslate)
+			{
+				lastMiss.put(key, text);
+			}
+			if (cfgDebug)
+			{
+				statMissRun++;
+			}
 			return;
 		}
+		lastMiss.remove(key);
 		original.put(key, text); // remember the English we are replacing, for instant restore
 		w.setText(r.text);
 		// native text shadow draws the glyph twice at a 1px offset, which on char-images looks
@@ -2431,6 +2776,7 @@ public class InterfaceTranslator
 		restoreChatTabs();
 		restoreProseScroll();
 		lastSet.clear();
+		lastMiss.clear();
 		lastColor.clear();
 		original.clear();
 		incomplete.clear();
@@ -2493,11 +2839,13 @@ public class InterfaceTranslator
 		// (the column would keep old-size char-images with no way back until the client rebuilds it)
 		revertSkillGuide();
 		lastSet.clear();
+		lastMiss.clear();
 		lastColor.clear();
 		original.clear();
 		incomplete.clear();
 		tabOriginal.clear();
 		journalSig.clear();
+		journalStable.clear();
 		movedX.clear();
 		movedY.clear();
 		movedW.clear();

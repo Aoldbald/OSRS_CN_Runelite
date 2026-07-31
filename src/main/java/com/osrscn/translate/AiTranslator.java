@@ -102,6 +102,22 @@ public class AiTranslator
 	}
 
 	/**
+	 * Cache-only peek: no request is dispatched and nothing is written, so callers can skip expensive
+	 * pre-processing when the answer is already known and re-ask through {@link #translate} for it.
+	 *
+	 * @return the cached translation, or null if this text has never been translated
+	 */
+	public String cached(String english)
+	{
+		if (english == null || english.isEmpty())
+		{
+			return null;
+		}
+		ensureLoaded();
+		return cache.get(english);
+	}
+
+	/**
 	 * @param persist whether a fresh translation is written to the on-disk cache. Player chat passes
 	 *                {@code false}: player slang rarely recurs verbatim, so persisting it only bloats
 	 *                the cache file and slows start-up loading. It is still cached in memory.

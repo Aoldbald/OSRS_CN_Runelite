@@ -52,13 +52,28 @@ final class SurfaceRegistry
 
 	private static final Surface DEFAULT = new Surface();
 
+	// Build-time maps. They are sealed into the flat lookup structures below by seal(), because forGroup()
+	// runs once per widget on every walk (~thousands of calls per client tick): an Integer-keyed map boxes
+	// the group id on every one of them.
 	private final Map<Integer, Surface> byGroup = new HashMap<>();
 	private final Map<Integer, List<Target>> byScript = new HashMap<>();
+
+	private Surface[] groups = new Surface[0]; // group id -> policy, null = DEFAULT
 
 	/** Policy for a widget group; never null (unlisted groups get the default UI-text policy). */
 	Surface forGroup(int groupId)
 	{
-		return byGroup.getOrDefault(groupId, DEFAULT);
+		Surface s = (groupId >= 0 && groupId < groups.length) ? groups[groupId] : null;
+		return s == null ? DEFAULT : s;
+	}
+
+	/** Table-only policy for the chatbox prompt line, which can also carry what the player is typing. */
+	static Surface promptSurface()
+	{
+		Surface s = new Surface();
+		s.noAi = true;
+		s.noCollect = true;
+		return s;
 	}
 
 	/** Targets to re-translate when {@code scriptId} fired, or null if no surface cares about it. */
@@ -80,6 +95,21 @@ final class SurfaceRegistry
 	private static int grp(int componentId)
 	{
 		return componentId >>> 16;
+	}
+
+	/** Freeze the builder maps into the flat arrays the hot lookups read. Group ids are &lt; 65536. */
+	private void seal()
+	{
+		int max = 0;
+		for (int g : byGroup.keySet())
+		{
+			max = Math.max(max, g);
+		}
+		groups = new Surface[max + 1];
+		for (Map.Entry<Integer, Surface> e : byGroup.entrySet())
+		{
+			groups[e.getKey()] = e.getValue();
+		}
 	}
 
 	static SurfaceRegistry build()
@@ -151,6 +181,7 @@ final class SurfaceRegistry
 		// Prayer hover tooltip draw-time rewrite (9444).
 		r.script(9444, new Target(Reach.COMPONENT, InterfaceID.Prayerbook.TOOLTIP));
 
+		r.seal();
 		return r;
 	}
 }

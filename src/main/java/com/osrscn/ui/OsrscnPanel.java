@@ -1,9 +1,9 @@
 package com.osrscn.ui;
 
 import com.osrscn.OsrscnConfig;
+import com.osrscn.OsrscnPlugin;
 import com.osrscn.translate.AiTranslator;
 import com.osrscn.translate.MissingCollector;
-import com.osrscn.translate.MissingUploader;
 import com.osrscn.translate.TranslationStore;
 import com.osrscn.translate.Translator;
 import java.awt.BorderLayout;
@@ -22,6 +22,7 @@ import java.nio.file.Files;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import javax.swing.BorderFactory;
+import javax.swing.Box;
 import javax.swing.BoxLayout;
 import javax.swing.JButton;
 import javax.swing.JComponent;
@@ -52,9 +53,14 @@ import net.runelite.client.util.LinkBrowser;
 public class OsrscnPanel extends PluginPanel
 {
 	private static final Color ACCENT = ColorScheme.BRAND_ORANGE;
-	private static final String QQ_GROUP = "978108806";
+	private static final String QQ_GROUP = OsrscnPlugin.QQ_GROUP;
 	private static final String SURVEY_URL = "https://docs.qq.com/form/page/DWW5BcmpRZmRORFho";
 	private static final String MISSING_ISSUE_URL = "https://github.com/Aoldbald/OSRS_CN_Data_Runelite/issues/new";
+	private static final String REPO_URL = "https://github.com/Aoldbald/OSRS_CN_Runelite";
+	private static final String HUB_URL = "https://runelite.net/plugin-hub/show/osrscn";
+	private static final String NOTICE_TEXT =
+			"本插件永久免费，不会向你索要账号或密码。\n"
+					+ "只在 RuneLite 插件库发布。别处收费或私发的都不是我们。";
 	private static final int SEARCH_LIMIT = 40;
 	private static final long TRANSLATE_TIMEOUT_MS = 15_000;
 	private static final String K_TAB = "panelTab";
@@ -72,7 +78,6 @@ public class OsrscnPanel extends PluginPanel
 	private final TranslationStore store;
 	private final Translator translator;
 	private final MissingCollector missing;
-	private final MissingUploader uploader;
 
 	private final JPanel display = new JPanel(new BorderLayout());
 	private final JPanel tabBar = new JPanel(new BorderLayout());
@@ -115,8 +120,7 @@ public class OsrscnPanel extends PluginPanel
 
 	@Inject
 	OsrscnPanel(AiTranslator ai, OsrscnConfig config, ConfigManager configManager,
-			DialogueHistory history, TranslationStore store, Translator translator, MissingCollector missing,
-			MissingUploader uploader)
+			DialogueHistory history, TranslationStore store, Translator translator, MissingCollector missing)
 	{
 		this.ai = ai;
 		this.config = config;
@@ -125,7 +129,6 @@ public class OsrscnPanel extends PluginPanel
 		this.store = store;
 		this.translator = translator;
 		this.missing = missing;
-		this.uploader = uploader;
 		this.showZh = getBool(K_SHOW_ZH, true);
 		this.showEn = getBool(K_SHOW_EN, false);
 
@@ -144,6 +147,8 @@ public class OsrscnPanel extends PluginPanel
 		JPanel north = new JPanel();
 		north.setLayout(new BoxLayout(north, BoxLayout.Y_AXIS));
 		north.setBackground(ColorScheme.DARK_GRAY_COLOR);
+		north.add(buildIdentityBar());
+		north.add(Box.createVerticalStrut(4));
 		north.add(buildContactBar());
 		north.add(tabBar);
 		add(north, BorderLayout.NORTH);
@@ -169,6 +174,58 @@ public class OsrscnPanel extends PluginPanel
 		tabGroup.addTab(tab);
 		tabList.add(tab);
 		return tab;
+	}
+
+	/**
+	 * Identity strip: the running version plus the only official links, so users can tell a genuine
+	 * install from a repackaged copy.
+	 */
+	private JComponent buildIdentityBar()
+	{
+		JPanel bar = new JPanel(new BorderLayout(0, 4));
+		bar.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+		bar.setBorder(BorderFactory.createEmptyBorder(6, 6, 6, 6));
+
+		String version = OsrscnPlugin.version();
+		JLabel title = new JLabel(version == null ? "OSRSCN 开发版" : "OSRSCN 版本 " + version);
+		title.setForeground(ACCENT);
+		title.setFont(uiFont(Font.BOLD, 15));
+		title.setToolTipText(version == null
+				? "从源码运行，没有插件库版本号"
+				: "当前运行的插件版本");
+		bar.add(title, BorderLayout.NORTH);
+
+		JPanel links = new JPanel(new GridLayout(1, 2, 4, 0));
+		links.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+		JButton repo = new JButton("GitHub");
+		repo.setToolTipText("打开官方源码仓库");
+		styleButton(repo);
+		repo.addActionListener(e -> LinkBrowser.browse(REPO_URL));
+		JButton hub = new JButton("插件库");
+		hub.setToolTipText("打开 RuneLite 插件库页面");
+		styleButton(hub);
+		hub.addActionListener(e -> LinkBrowser.browse(HUB_URL));
+		links.add(repo);
+		links.add(hub);
+		bar.add(links, BorderLayout.CENTER);
+
+		// A JLabel needs an explicit pixel width to wrap html, and any width that is not exactly the
+		// usable width either clips the line or wastes space. A wrapping text area sizes itself to
+		// whatever width the panel actually gives it, which is the only thing that stays correct.
+		JTextArea notice = new JTextArea(NOTICE_TEXT);
+		notice.setEditable(false);
+		notice.setFocusable(false);
+		notice.setLineWrap(true);
+		notice.setWrapStyleWord(true);
+		notice.setOpaque(false);
+		notice.setFont(uiFont(Font.PLAIN, 11));
+		notice.setForeground(Color.LIGHT_GRAY);
+		// accent bar down the left edge: reads as a notice at a glance without animating anything
+		notice.setBorder(BorderFactory.createCompoundBorder(
+				BorderFactory.createMatteBorder(0, 3, 0, 0, ACCENT),
+				BorderFactory.createEmptyBorder(4, 6, 2, 0)));
+		bar.add(notice, BorderLayout.SOUTH);
+		return bar;
 	}
 
 	// Always-visible contact strip pinned above the tabs so feedback channels are easy to find.
@@ -266,34 +323,20 @@ public class OsrscnPanel extends PluginPanel
 			}
 			return;
 		}
-		boolean auto = config.uploadMissing();
 		String text = "已收集 " + rows + " 条缺词（" + f.getName() + "）。\n\n"
-				+ (auto
-						? "自动上传已开启：每半小时发送新增内容，已传过的不会重复发。\n"
-								+ "当前未上传：" + uploader.pendingRows() + " 条。"
-								+ "点「立即上传」可以马上发送，不用等。\n\n"
-						: "点「复制并去 GitHub 提交」会：\n"
-								+ "1. 把文件内容复制到剪贴板；\n"
-								+ "2. 打开 GitHub 新建 issue 页面（需要 GitHub 账号）；\n"
-								+ "3. 你在页面里粘贴、确认后才算提交——插件自己不会上传任何东西。\n\n")
+				+ "点「复制并去 GitHub 提交」会：\n"
+				+ "1. 把文件内容复制到剪贴板；\n"
+				+ "2. 打开 GitHub 新建 issue 页面（需要 GitHub 账号）；\n"
+				+ "3. 你在页面里粘贴、确认后才算提交——插件自己不会上传任何东西。\n\n"
 				+ "内容只有游戏英文原文和来源分类，不含聊天和账号信息。\n"
-				+ (auto ? "" : "没有 GitHub 账号的话，把文件发到 QQ 群也可以。");
-		Object[] opts = auto
-				? new Object[]{"立即上传", "打开文件夹", "取消"}
-				: new Object[]{"复制并去 GitHub 提交", "打开文件夹", "取消"};
+				+ "没有 GitHub 账号的话，把文件发到 QQ 群也可以。";
+		Object[] opts = {"复制并去 GitHub 提交", "打开文件夹", "取消"};
 		int choice = JOptionPane.showOptionDialog(this, message(text), "提交缺词",
 				JOptionPane.DEFAULT_OPTION, JOptionPane.QUESTION_MESSAGE, null, opts, opts[0]);
 		if (choice == 0)
 		{
-			if (auto)
-			{
-				uploader.uploadNow();
-			}
-			else
-			{
-				Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(content), null);
-				LinkBrowser.browse(issueUrl(rows));
-			}
+			Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(content), null);
+			LinkBrowser.browse(issueUrl(rows));
 		}
 		else if (choice == 1)
 		{

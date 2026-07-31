@@ -9,7 +9,6 @@ import com.osrscn.hooks.MenuTranslator;
 import com.osrscn.hooks.OverheadHandler;
 import com.osrscn.translate.AiTranslator;
 import com.osrscn.translate.MissingCollector;
-import com.osrscn.translate.MissingUploader;
 import com.osrscn.translate.TranslationStore;
 import com.osrscn.translate.Translator;
 import com.osrscn.ui.HoverTooltipOverlay;
@@ -23,8 +22,10 @@ import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
+import net.runelite.api.GameState;
 import net.runelite.api.events.BeforeRender;
 import net.runelite.api.events.ClientTick;
+import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.MenuOpened;
 import net.runelite.api.events.ScriptPostFired;
 import net.runelite.api.events.WidgetLoaded;
@@ -32,6 +33,8 @@ import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+import net.runelite.client.externalplugins.PluginHubManifest;
 import net.runelite.client.input.KeyManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
@@ -66,8 +69,6 @@ public class OsrscnPlugin extends Plugin
 	@Inject
 	private MissingCollector missingCollector;
 	@Inject
-	private MissingUploader missingUploader;
-	@Inject
 	private DialogueHandler dialogueHandler;
 	@Inject
 	private MenuTranslator menuTranslator;
@@ -96,7 +97,22 @@ public class OsrscnPlugin extends Plugin
 	// (~thousands of chars) stays well under a frame; the lazy path still covers anything not yet warmed.
 	private static final int PREWARM_CODEPOINTS_PER_TICK = 8;
 
+	/** Official QQ group. Shown in the side panel and in the login notice. */
+	public static final String QQ_GROUP = "978108806";
+
+	// Origin notice printed once per login, so a repackaged/resold copy is easy to spot. Orange is one of
+	// the pre-warmed glyph colours, so it needs no extra sprite uploads.
+	// The chatbox draws on parchment by default and on the game world when transparency is on, so one
+	// colour cannot read on both: pale orange vanishes against parchment, dark red vanishes against the
+	// world. Pick per mode, like the client does for its own messages.
+	private static final int NOTICE_RGB_OPAQUE = 0x8f1010;
+	private static final int NOTICE_RGB_TRANSPARENT = 0xff981f;
+	private static final long NOTICE_TIMEOUT_MS = 15_000;
+
 	private boolean announced;
+	// volatile: armed from startUp / cleared from shutDown (plugin thread), drained on the client thread
+	private volatile boolean noticeDone;  // this login already had its notice handled
+	private volatile long noticeDeadline; // >0 while the notice is queued, waiting for its glyphs to upload
 	private NavigationButton navButton;
 
 	private final HotkeyListener toggleHotkey = new HotkeyListener(() -> config.toggleHotkey())
@@ -259,7 +275,11 @@ public class OsrscnPlugin extends Plugin
 		overlayManager.add(toggleOverlay);
 		loginBanner.apply();
 		addPanel();
-		missingUploader.start();
+		// enabled mid-session: no LOGGED_IN event is coming, so arm the notice here instead
+		if (client.getGameState() == GameState.LOGGED_IN)
+		{
+			armLoginNotice();
+		}
 		log.info("OSRSCN started");
 	}
 
@@ -289,10 +309,11 @@ public class OsrscnPlugin extends Plugin
 			interfaceTranslator.reset();
 			chatHandler.clear();
 		});
-		missingUploader.stop();
 		missingCollector.stop();
 		stopMacUiFontSweep();
 		announced = false;
+		noticeDone = false;
+		noticeDeadline = 0;
 		log.info("OSRSCN stopped");
 	}
 
@@ -310,6 +331,10 @@ public class OsrscnPlugin extends Plugin
 		if (glyph.prewarmPending())
 		{
 			glyph.prewarmStep(PREWARM_CODEPOINTS_PER_TICK);
+		}
+		if (noticeDeadline > 0)
+		{
+			tryLoginNotice();
 		}
 		if (toggle.isChineseEnabled())
 		{
@@ -337,6 +362,95 @@ public class OsrscnPlugin extends Plugin
 		{
 			interfaceTranslator.translateSlowGroups();
 		}
+	}
+
+	@Subscribe
+	public void onGameStateChanged(GameStateChanged event)
+	{
+		switch (event.getGameState())
+		{
+			case LOGIN_SCREEN:
+				// only a real logout re-arms the notice: a world hop or a region load goes back to
+				// LOGGED_IN without passing through here, so neither re-prints it.
+				noticeDone = false;
+				noticeDeadline = 0;
+				break;
+			case LOGGED_IN:
+				armLoginNotice();
+				break;
+			default:
+				break;
+		}
+	}
+
+	/**
+	 * Queue the once-per-login origin notice. In English mode nothing is printed and nothing is queued:
+	 * the toggle means "keep Chinese out of the game UI", and the same text stays in the side panel.
+	 */
+	private void armLoginNotice()
+	{
+		if (noticeDone)
+		{
+			return;
+		}
+		noticeDone = true;
+		if (config.loginNotice() && toggle.isChineseEnabled())
+		{
+			noticeDeadline = System.currentTimeMillis() + NOTICE_TIMEOUT_MS;
+		}
+	}
+
+	/**
+	 * Print the notice once its glyphs are uploaded. Glyph sprites go up a cycle after registration, so
+	 * right after login toImgTags returns null for a character that is not ready; retry on the next tick
+	 * like the chat/interface handlers do, and give up at the deadline so it can never retry forever.
+	 */
+	private void tryLoginNotice()
+	{
+		int rgb = client.getVarbitValue(net.runelite.api.gameval.VarbitID.CHATBOX_TRANSPARENCY) != 0
+				? NOTICE_RGB_TRANSPARENT
+				: NOTICE_RGB_OPAQUE;
+		String zh = "<col=" + String.format("%06x", rgb) + ">" + versionLabel()
+				+ " 永久免费，只在 RuneLite 插件库发布</col>";
+		String msg = glyph.toImgTags(zh, rgb);
+		if (msg != null)
+		{
+			client.addChatMessage(ChatMessageType.CONSOLE, "", "OSRSCN: " + msg, null);
+			noticeDeadline = 0;
+		}
+		else if (System.currentTimeMillis() > noticeDeadline)
+		{
+			noticeDeadline = 0;
+		}
+	}
+
+	/**
+	 * Version of the running build, read from the Plugin Hub manifest so it always matches the installed
+	 * release with no constant to bump. Null when loaded from source (dev client), which has no hub
+	 * manifest, or on clients that predate the API.
+	 */
+	public static String version()
+	{
+		try
+		{
+			PluginHubManifest.DisplayData data = ExternalPluginManager.getDisplayData(OsrscnPlugin.class);
+			if (data != null && data.getVersion() != null && !data.getVersion().isEmpty())
+			{
+				return data.getVersion();
+			}
+		}
+		catch (Throwable ignored)
+		{
+			// no manifest available
+		}
+		return null;
+	}
+
+	/** Short version label for user-facing text. */
+	public static String versionLabel()
+	{
+		String v = version();
+		return v == null ? "开发版" : v;
 	}
 
 	@Subscribe
@@ -446,26 +560,6 @@ public class OsrscnPlugin extends Plugin
 		// Explicit consent gate for the voluntary missing-word upload: turning the toggle on pops a
 		// dialog spelling out what is sent; declining flips it straight back off. Accepting also turns
 		// on the collector (uploading without collecting would silently do nothing).
-		if ("uploadMissing".equals(key) && config.uploadMissing())
-		{
-			javax.swing.SwingUtilities.invokeLater(() ->
-			{
-				int choice = javax.swing.JOptionPane.showConfirmDialog(null,
-						"开启后，插件会定期把缺词文件里的内容自动发送给汉化组，\n"
-								+ "用于补全翻译。发送的只有：游戏英文原文 + 匿名安装 ID。\n"
-								+ "不含聊天记录、不含账号信息。随时可以关闭此开关。\n\n"
-								+ "确定开启吗？（会同时开启「帮忙补全汉化」收集开关）",
-						"自动上传缺词", javax.swing.JOptionPane.OK_CANCEL_OPTION);
-				if (choice == javax.swing.JOptionPane.OK_OPTION)
-				{
-					configManager.setConfiguration(OsrscnConfig.GROUP, "collectMissing", true);
-				}
-				else
-				{
-					configManager.setConfiguration(OsrscnConfig.GROUP, "uploadMissing", false);
-				}
-			});
-		}
 		// Only re-render when a setting that changes glyph output changed. Other settings
 		// (AI params, toggles, data URL) take effect on the next translation without dropping
 		// the whole glyph cache and re-walking every interface.

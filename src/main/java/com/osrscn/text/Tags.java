@@ -86,6 +86,13 @@ public final class Tags
 		{
 			return "";
 		}
+		// OPEN_COL can only match text starting with a literal lower-case "<col" (it is case-sensitive,
+		// and "</col>" does not contain that substring), so anything else is returned unchanged - skip
+		// the split + StringBuilder allocation. This runs several times per widget per lookup.
+		if (s.indexOf("<col") < 0)
+		{
+			return s;
+		}
 		String[] parts = OPEN_COL.split(s);
 		StringBuilder sb = new StringBuilder(s.length());
 		for (int i = 0; i < parts.length; i++)

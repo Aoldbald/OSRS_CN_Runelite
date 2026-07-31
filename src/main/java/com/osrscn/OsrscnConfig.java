@@ -47,7 +47,20 @@ public interface OsrscnConfig extends Config
 	)
 	default String qqGroup()
 	{
-		return "978108806";
+		return OsrscnPlugin.QQ_GROUP;
+	}
+
+	@ConfigItem(
+			keyName = "loginNotice",
+			name = "登录提示",
+			description = "每次登录时，在聊天框显示一行插件版本和发布渠道。"
+					+ "本插件永久免费，只在 RuneLite 插件库发布，这一行是为了让你认出别处收费转卖的假冒版本。不想看可以关掉。",
+			section = feedback,
+			position = 3
+	)
+	default boolean loginNotice()
+	{
+		return true;
 	}
 
 	@ConfigItem(
@@ -59,19 +72,6 @@ public interface OsrscnConfig extends Config
 			position = 1
 	)
 	default boolean collectMissing()
-	{
-		return false;
-	}
-
-	@ConfigItem(
-			keyName = "uploadMissing",
-			name = "自动上传缺词",
-			description = "定期把收集到的缺词自动发送给汉化组，免去手动提交。只发送游戏英文原文"
-					+ "和匿名安装 ID（不含聊天、不含账号信息）。开启时会弹窗确认，随时可关。",
-			section = feedback,
-			position = 2
-	)
-	default boolean uploadMissing()
 	{
 		return false;
 	}
@@ -129,11 +129,25 @@ public interface OsrscnConfig extends Config
 	}
 
 	@ConfigItem(
+			keyName = "translateSearchResults",
+			name = "搜索结果物品名",
+			description = "大交易所和银行搜索时，把候选物品名显示成中文。"
+					+ "只打一两个字母时候选很多，一屏几十个名字要现画，配置较低的机器会掉帧，卡就关掉。"
+					+ "关掉只影响候选列表，搜索框的提示文字照常是中文。",
+			section = translate,
+			position = 1
+	)
+	default boolean translateSearchResults()
+	{
+		return true;
+	}
+
+	@ConfigItem(
 			keyName = "translateGameMessages",
 			name = "游戏消息",
 			description = "翻译聊天框里的游戏消息（物品/NPC 查看、升级、系统提示等）。不影响玩家发言。",
 			section = translate,
-			position = 1
+			position = 2
 	)
 	default boolean translateGameMessages()
 	{
@@ -148,7 +162,7 @@ public interface OsrscnConfig extends Config
 					+ "「翻译并另起一行」保留英文行，下面另插一条中文翻译（如 OSRS_CN: 玩家名: 你好）。"
 					+ "玩家黑话翻译质量不稳，且会占用 AI 翻译队列。",
 			section = translate,
-			position = 2
+			position = 3
 	)
 	default PlayerChatMode playerChatMode()
 	{
@@ -369,8 +383,8 @@ public interface OsrscnConfig extends Config
 	@ConfigItem(
 			keyName = "debugMonitor",
 			name = "AI 翻译状态",
-			description = "侧边栏多出一个「调试」tab，显示 AI 翻译进度（已缓存/翻译中/最近翻译）。"
-					+ "只是查看，不影响性能，随便开。",
+			description = "侧边栏多出一个「调试」tab，显示 AI 翻译进度（已缓存/翻译中/最近翻译），"
+					+ "同时往日志写走查耗时和聊天框控件明细。排查问题时才需要开。",
 			section = debug,
 			position = 0
 	)

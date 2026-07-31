@@ -99,6 +99,16 @@ public class GlyphService
 		return Math.max(8, Math.min(28, size));
 	}
 
+	/**
+	 * The resolved glyph font at {@code size}, or null if none is available. For the rare surface that
+	 * draws Chinese with Java2D instead of {@code <img>} tags (the login banner), so it uses the same
+	 * font as the in-game glyphs. Call after {@link #reloadFont}.
+	 */
+	public Font font(int size)
+	{
+		return fontFor(size);
+	}
+
 	// Colours pre-warmed for every translated character so its first appearance never flashes English
 	// while the sprite uploads: white (menu/UI), OSRS blue (public chat), yellow (overhead/highlight),
 	// near-black (game messages / dialogue / default widget text), and the skill-guide prose orange
