@@ -40,6 +40,12 @@ public class Translator
 			"(?i)^Grand Exchange: Finished (buying|selling) (<Num\\d+>) x (.+?)\\.?$");
 	private static final Pattern GE_OFFER_LINE = Pattern.compile(
 			"(?i)^(Buy|Sell): (<Num\\d+>) x (.+)$");
+	// Offer labels in the exchange window: same deal, the item is the only variable part.
+	private static final Pattern GE_DONE_LINE = Pattern.compile("(?i)^(Bought|Sold|Buying|Selling):\\s*(.+?)\\.?$");
+	// Quest list entry. Both halves are already in the tables (every quest name, and the three states),
+	// so composing it covers all ~200 quests instead of one collected row per quest per state.
+	private static final Pattern QUEST_STATE_LINE = Pattern.compile(
+			"^Quest: (.+?) \\((Not Started|In Progress|Completed)\\)$");
 	// Combat-achievement "Monster: <name>" line: the prefix is fixed and the name lives in the name
 	// table (incl. bosses), so compose "怪物：" + looked-up name instead of needing a whole-line entry.
 	private static final Pattern MONSTER_LINE = Pattern.compile("(?i)^Monster:\\s*(.+)$");
@@ -900,6 +906,29 @@ public class Translator
 			return zhName == null ? null
 					: ("Buy".equalsIgnoreCase(offer.group(1)) ? "购买" : "出售")
 					+ "：" + offer.group(2) + " × " + zhName;
+		}
+
+		Matcher done = GE_DONE_LINE.matcher(text);
+		if (done.matches())
+		{
+			String zhName = lookupAnyOf(Tags.stripColorPlaceholders(done.group(2)).trim(), order);
+			if (zhName == null)
+			{
+				return null;
+			}
+			String verb = done.group(1).toLowerCase(java.util.Locale.ROOT);
+			String zhVerb = "bought".equals(verb) ? "已购买"
+					: "sold".equals(verb) ? "已售出"
+					: "buying".equals(verb) ? "购买中" : "出售中";
+			return zhVerb + "：" + zhName;
+		}
+
+		Matcher quest = QUEST_STATE_LINE.matcher(text);
+		if (quest.matches())
+		{
+			String zhName = lookupAnyOf(quest.group(1).trim(), order);
+			String zhState = lookupAnyOf(quest.group(2), order);
+			return zhName == null || zhState == null ? null : "任务：" + zhName + "（" + zhState + "）";
 		}
 
 		Matcher members = MEMBERS_LINE.matcher(text);

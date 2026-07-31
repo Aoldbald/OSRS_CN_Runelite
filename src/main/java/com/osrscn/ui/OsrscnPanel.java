@@ -4,6 +4,7 @@ import com.osrscn.OsrscnConfig;
 import com.osrscn.OsrscnPlugin;
 import com.osrscn.translate.AiTranslator;
 import com.osrscn.translate.MissingCollector;
+import com.osrscn.translate.MissingUploader;
 import com.osrscn.translate.TranslationStore;
 import com.osrscn.translate.Translator;
 import java.awt.BorderLayout;
@@ -78,6 +79,7 @@ public class OsrscnPanel extends PluginPanel
 	private final TranslationStore store;
 	private final Translator translator;
 	private final MissingCollector missing;
+	private final MissingUploader uploader;
 
 	private final JPanel display = new JPanel(new BorderLayout());
 	private final JPanel tabBar = new JPanel(new BorderLayout());
@@ -120,7 +122,8 @@ public class OsrscnPanel extends PluginPanel
 
 	@Inject
 	OsrscnPanel(AiTranslator ai, OsrscnConfig config, ConfigManager configManager,
-			DialogueHistory history, TranslationStore store, Translator translator, MissingCollector missing)
+			DialogueHistory history, TranslationStore store, Translator translator, MissingCollector missing,
+			MissingUploader uploader)
 	{
 		this.ai = ai;
 		this.config = config;
@@ -129,6 +132,7 @@ public class OsrscnPanel extends PluginPanel
 		this.store = store;
 		this.translator = translator;
 		this.missing = missing;
+		this.uploader = uploader;
 		this.showZh = getBool(K_SHOW_ZH, true);
 		this.showEn = getBool(K_SHOW_EN, false);
 
@@ -323,20 +327,49 @@ public class OsrscnPanel extends PluginPanel
 			}
 			return;
 		}
-		String text = "已收集 " + rows + " 条缺词（" + f.getName() + "）。\n\n"
-				+ "点「复制并去 GitHub 提交」会：\n"
-				+ "1. 把文件内容复制到剪贴板；\n"
-				+ "2. 打开 GitHub 新建 issue 页面（需要 GitHub 账号）；\n"
-				+ "3. 你在页面里粘贴、确认后才算提交——插件自己不会上传任何东西。\n\n"
+		boolean auto = config.uploadMissing();
+		int pending = auto ? uploader.pendingRows() : 0;
+		// Lead with what is still waiting, not the running total: the total is much the larger number and
+		// reads as "nothing was ever sent" when in fact everything was.
+		String text = (auto
+						? (pending > 0
+								? "有 " + pending + " 条还没上传。\n每半小时自动发送一次，点「立即上传」可以马上发。\n\n"
+								: "全部已上传，没有新的内容要发。\n以后收集到新的会自动发送，已传过的不会重复发。\n\n")
+						: "点「复制并去 GitHub 提交」会：\n"
+								+ "1. 把文件内容复制到剪贴板；\n"
+								+ "2. 打开 GitHub 新建 issue 页面（需要 GitHub 账号）；\n"
+								+ "3. 你在页面里粘贴、确认后才算提交——插件自己不会上传任何东西。\n\n")
+				+ "累计收集 " + rows + " 条（" + f.getName() + "）。\n"
 				+ "内容只有游戏英文原文和来源分类，不含聊天和账号信息。\n"
-				+ "没有 GitHub 账号的话，把文件发到 QQ 群也可以。";
-		Object[] opts = {"复制并去 GitHub 提交", "打开文件夹", "取消"};
+				+ (auto ? "" : "没有 GitHub 账号的话，把文件发到 QQ 群也可以。");
+		Object[] opts = auto
+				? (pending > 0
+						? new Object[]{"立即上传 " + pending + " 条", "打开文件夹", "取消"}
+						: new Object[]{"打开文件夹", "取消"})
+				: new Object[]{"复制并去 GitHub 提交", "打开文件夹", "取消"};
+		if (auto && pending == 0)
+		{
+			int c = JOptionPane.showOptionDialog(this, message(text), "提交缺词",
+					JOptionPane.DEFAULT_OPTION, JOptionPane.INFORMATION_MESSAGE, null, opts, opts[0]);
+			if (c == 0)
+			{
+				openMissingDir();
+			}
+			return;
+		}
 		int choice = JOptionPane.showOptionDialog(this, message(text), "提交缺词",
 				JOptionPane.DEFAULT_OPTION, JOptionPane.QUESTION_MESSAGE, null, opts, opts[0]);
 		if (choice == 0)
 		{
-			Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(content), null);
-			LinkBrowser.browse(issueUrl(rows));
+			if (auto)
+			{
+				uploader.uploadNow();
+			}
+			else
+			{
+				Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(content), null);
+				LinkBrowser.browse(issueUrl(rows));
+			}
 		}
 		else if (choice == 1)
 		{

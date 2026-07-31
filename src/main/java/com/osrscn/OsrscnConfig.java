@@ -76,6 +76,19 @@ public interface OsrscnConfig extends Config
 		return false;
 	}
 
+	@ConfigItem(
+			keyName = "uploadMissing",
+			name = "自动上传缺词",
+			description = "定期把收集到的缺词自动发送给汉化组，免去手动提交。只发送游戏英文原文"
+					+ "和匿名安装 ID（不含聊天、不含账号信息）。开启时会弹窗确认，随时可关。",
+			section = feedback,
+			position = 2
+	)
+	default boolean uploadMissing()
+	{
+		return false;
+	}
+
 	// ===== 通用 =====
 
 	@ConfigItem(

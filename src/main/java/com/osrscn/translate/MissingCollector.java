@@ -52,8 +52,10 @@ public class MissingCollector
 			+ "|and|or|as|your|my|his|her|its|their|our|that|which|you|we|they|is|are|was|were|be|been)$");
 	// Live/dynamic labels that recur with a changing value (bank tab totals "Tab 2 (96.9K)", amount
 	// buttons "Deposit-15000"): not translatable content, and they spam the file as the value ticks.
+	// "Showing items: <what the player typed>" is one row per search term, and the tail is the player's
+	// own text, which must never reach the collected file at all.
 	private static final Pattern DYNAMIC = Pattern.compile(
-			"\\([\\d.,]+[KkMmBb]\\)|^(?:Deposit|Withdraw)-\\d+$");
+			"\\([\\d.,]+[KkMmBb]\\)|^(?:Deposit|Withdraw)-\\d+$|^Showing items: |^Tab \\d+$");
 	// Non-content classes observed in collected files (2026-07-16 field audit): bare count labels
 	// ("0 cannonballs") and widget-join artifacts that start with punctuation (real sentences never
 	// do). News broadcasts (trailing "|p" link marker, "Click here...") stay collectable - maintainer
