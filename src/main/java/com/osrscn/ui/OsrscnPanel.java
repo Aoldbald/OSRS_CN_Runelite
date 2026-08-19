@@ -9,7 +9,6 @@ import com.osrscn.translate.TranslationStore;
 import com.osrscn.translate.Translator;
 import java.awt.BorderLayout;
 import java.awt.Color;
-import java.awt.Desktop;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Font;
@@ -274,7 +273,7 @@ public class OsrscnPanel extends PluginPanel
 		dir.mkdirs();
 		try
 		{
-			Desktop.getDesktop().open(dir);
+			LinkBrowser.open(dir.getPath());
 		}
 		catch (Exception ex)
 		{

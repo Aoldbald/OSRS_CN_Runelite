@@ -84,6 +84,8 @@ public class TranslationStore
 
 	@Inject
 	private OkHttpClient httpClient;
+	@Inject
+	private java.util.concurrent.ScheduledExecutorService executor;
 
 	public TranslationStore()
 	{
@@ -149,12 +151,10 @@ public class TranslationStore
 		return out;
 	}
 
-	/** Loads the store on a background thread. Safe to call once at start-up. */
+	/** Loads the store on the client's background executor. Safe to call once at start-up. */
 	public void loadAsync()
 	{
-		Thread t = new Thread(this::load, "osrscn-translation-load");
-		t.setDaemon(true);
-		t.start();
+		executor.execute(this::load);
 	}
 
 	private void load()
