@@ -265,21 +265,14 @@ public class OsrscnPanel extends PluginPanel
 		return bar;
 	}
 
-	/** Open the folder holding the collected missing file; fall back to copying the path. */
-	private void openMissingDir()
+	/** Copy the path of the folder holding the collected missing file. */
+	private void copyMissingDirPath()
 	{
 		File dir = new File(RuneLite.RUNELITE_DIR, "osrscn");
 		//noinspection ResultOfMethodCallIgnored
 		dir.mkdirs();
-		try
-		{
-			LinkBrowser.open(dir.getPath());
-		}
-		catch (Exception ex)
-		{
-			Toolkit.getDefaultToolkit().getSystemClipboard()
-					.setContents(new StringSelection(dir.getPath()), null);
-		}
+		Toolkit.getDefaultToolkit().getSystemClipboard()
+				.setContents(new StringSelection(dir.getPath()), null);
 	}
 
 	/**
@@ -314,7 +307,7 @@ public class OsrscnPanel extends PluginPanel
 		}
 		if (rows <= 0 || content.isEmpty())
 		{
-			Object[] opts = {"打开文件夹", "关闭"};
+			Object[] opts = {"复制文件夹路径", "关闭"};
 			String text = config.collectMissing()
 					? "还没有收集到缺词。\n带着插件玩一阵，游戏里查不到的文本会自动记到本地：\n" + f.getName()
 					: "「帮忙补全汉化」还没开启。\n在插件设置的「联系作者 / 反馈」里打开它，游戏里查不到的\n文本会记录到本地文件，之后可以在这里一键提交。";
@@ -322,7 +315,7 @@ public class OsrscnPanel extends PluginPanel
 					JOptionPane.DEFAULT_OPTION, JOptionPane.INFORMATION_MESSAGE, null, opts, opts[1]);
 			if (c == 0)
 			{
-				openMissingDir();
+				copyMissingDirPath();
 			}
 			return;
 		}
@@ -343,16 +336,16 @@ public class OsrscnPanel extends PluginPanel
 				+ (auto ? "" : "没有 GitHub 账号的话，把文件发到 QQ 群也可以。");
 		Object[] opts = auto
 				? (pending > 0
-						? new Object[]{"立即上传 " + pending + " 条", "打开文件夹", "取消"}
-						: new Object[]{"打开文件夹", "取消"})
-				: new Object[]{"复制并去 GitHub 提交", "打开文件夹", "取消"};
+						? new Object[]{"立即上传 " + pending + " 条", "复制文件夹路径", "取消"}
+						: new Object[]{"复制文件夹路径", "取消"})
+				: new Object[]{"复制并去 GitHub 提交", "复制文件夹路径", "取消"};
 		if (auto && pending == 0)
 		{
 			int c = JOptionPane.showOptionDialog(this, message(text), "提交缺词",
 					JOptionPane.DEFAULT_OPTION, JOptionPane.INFORMATION_MESSAGE, null, opts, opts[0]);
 			if (c == 0)
 			{
-				openMissingDir();
+				copyMissingDirPath();
 			}
 			return;
 		}
@@ -372,7 +365,7 @@ public class OsrscnPanel extends PluginPanel
 		}
 		else if (choice == 1)
 		{
-			openMissingDir();
+			copyMissingDirPath();
 		}
 	}
 
