@@ -251,7 +251,7 @@ public class TranslationStore
 		try
 		{
 			Request request = new Request.Builder().url(baseUrl + "hashList_zh.txt").build();
-			try (Response response = httpClient.newCall(request).execute())
+			try (Response response = http(5).newCall(request).execute())
 			{
 				if (!response.isSuccessful() || response.body() == null)
 				{
@@ -300,11 +300,22 @@ public class TranslationStore
 		}
 	}
 
+	/**
+	 * The injected client has no call timeout, and these blocking calls run on the client's shared
+	 * scheduled executor - a hung connection would stall every plugin's periodic tasks with it.
+	 * The hash list is a tiny probe (5s); table downloads reach ~18 MB and need slow-network
+	 * headroom (60s still bounds a hang, but covers ~2.5 Mbps links).
+	 */
+	private OkHttpClient http(int callTimeoutSeconds)
+	{
+		return httpClient.newBuilder().callTimeout(callTimeoutSeconds, java.util.concurrent.TimeUnit.SECONDS).build();
+	}
+
 	private void download(String url, File dest) throws Exception
 	{
 		log.info("OSRSCN: downloading {}", url);
 		Request request = new Request.Builder().url(url).build();
-		try (Response response = httpClient.newCall(request).execute())
+		try (Response response = http(60).newCall(request).execute())
 		{
 			if (!response.isSuccessful() || response.body() == null)
 			{

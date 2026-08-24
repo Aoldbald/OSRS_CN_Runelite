@@ -92,7 +92,10 @@ public class MissingUploader
 				return 0;
 			}
 			int lines = Files.readAllLines(f.toPath(), StandardCharsets.UTF_8).size();
-			return Math.max(0, lines - Math.max(1, readWatermark(f.getName())));
+			int sent = readWatermark(f.getName());
+			// No watermark yet: the first tick starts it at the current size (the backlog is never
+			// sent), so nothing is actually pending.
+			return sent == 0 ? 0 : Math.max(0, lines - sent);
 		}
 		catch (Exception e)
 		{
@@ -154,7 +157,14 @@ public class MissingUploader
 			return false;
 		}
 		List<String> lines = Files.readAllLines(f.toPath(), StandardCharsets.UTF_8);
-		int sent = Math.max(1, readWatermark(f.getName())); // line 0 is the header, never sent
+		int sent = readWatermark(f.getName()); // line 0 is the header, never sent
+		if (sent == 0)
+		{
+			// First upload for this file: start the watermark at the current size. The backlog was
+			// collected before the client-side quality gates existed and must never be replayed.
+			writeWatermark(f.getName(), Math.max(1, lines.size()));
+			return false;
+		}
 		if (lines.size() <= sent)
 		{
 			return false;

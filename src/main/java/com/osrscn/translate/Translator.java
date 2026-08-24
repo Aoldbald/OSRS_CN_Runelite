@@ -46,6 +46,15 @@ public class Translator
 	// so composing it covers all ~200 quests instead of one collected row per quest per state.
 	private static final Pattern QUEST_STATE_LINE = Pattern.compile(
 			"^Quest: (.+?) \\((Not Started|In Progress|Completed)\\)$");
+	// Quest-complete scroll / chat congratulation: the quest name is the only variable and every
+	// quest name is already in the tables, so compose these instead of one row per quest.
+	private static final Pattern QUEST_DONE_LINE = Pattern.compile("^You have completed (.+?)!$");
+	private static final Pattern QUEST_DONE_CHAT = Pattern.compile("(?i)^Congratulations, you've completed a quest:\\s*(.+)$");
+	// Reward-scroll XP line ("3,875 Crafting XP"): the skill is the only variable part.
+	private static final Pattern SKILL_XP_LINE = Pattern.compile("^(<Num\\d+>) ([A-Za-z]+) XP$");
+	// Level-up chat lines arrive as "<skillId>|Check the skill guide ...": the engine reads the
+	// prefix to make "skill guide" clickable, so it must survive translation untouched.
+	private static final Pattern CHAT_LINK_PREFIX = Pattern.compile("^(\\d{1,3}\\|)(.+)$", Pattern.DOTALL);
 	// Combat-achievement "Monster: <name>" line: the prefix is fixed and the name lives in the name
 	// table (incl. bosses), so compose "怪物：" + looked-up name instead of needing a whole-line entry.
 	private static final Pattern MONSTER_LINE = Pattern.compile("(?i)^Monster:\\s*(.+)$");
@@ -358,6 +367,13 @@ public class Translator
 	{
 		// Game messages pass persist=true and are safe to collect; player chat passes persist=false
 		// and must never be written to missing.tsv.
+		Matcher link = text == null ? null : CHAT_LINK_PREFIX.matcher(text);
+		if (link != null && link.matches())
+		{
+			Rendered r = renderWithOrder(link.group(2), colorRgb, maxChars, size, aiFallback, persist,
+					CHAT_ORDER, persist ? "gameText" : null);
+			return r == null ? null : new Rendered(link.group(1) + r.text, r.complete);
+		}
 		return renderWithOrder(text, colorRgb, maxChars, size, aiFallback, persist, CHAT_ORDER, persist ? "gameText" : null);
 	}
 
@@ -929,6 +945,27 @@ public class Translator
 			String zhName = lookupAnyOf(quest.group(1).trim(), order);
 			String zhState = lookupAnyOf(quest.group(2), order);
 			return zhName == null || zhState == null ? null : "任务：" + zhName + "（" + zhState + "）";
+		}
+
+		Matcher done2 = QUEST_DONE_LINE.matcher(Tags.stripColorPlaceholders(text).trim());
+		if (done2.matches())
+		{
+			String zhName = lookupAnyOf(done2.group(1).trim(), order);
+			return zhName == null ? null : "你已完成任务：" + zhName + "！";
+		}
+
+		Matcher congrats = QUEST_DONE_CHAT.matcher(Tags.stripColorPlaceholders(text).trim());
+		if (congrats.matches())
+		{
+			String zhName = lookupAnyOf(congrats.group(1).trim(), order);
+			return zhName == null ? null : "恭喜，你完成了一个任务：" + zhName;
+		}
+
+		Matcher xp = SKILL_XP_LINE.matcher(Tags.stripColorPlaceholders(text).trim());
+		if (xp.matches())
+		{
+			String zhSkill = lookupAnyOf(xp.group(2), order);
+			return zhSkill == null ? null : xp.group(1) + "点" + zhSkill + "经验值";
 		}
 
 		Matcher members = MEMBERS_LINE.matcher(text);
