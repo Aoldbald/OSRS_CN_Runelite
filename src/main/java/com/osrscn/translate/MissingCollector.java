@@ -63,8 +63,10 @@ public class MissingCollector
 	private static final Pattern NOISE = Pattern.compile("^\\d+\\s+\\S+$|^[.,;)\\]]");
 	// Parameterized transaction messages: one instance per traded item would collect forever; the
 	// synthetic GE lookup (Translator.syntheticLookup) composes them from the name table instead.
+	// "Unable to find <name>" (player search) carries the searched player's name - never collectable.
 	private static final Pattern TEMPLATE_MSG = Pattern.compile(
-			"(?i)^Grand Exchange: (Finished )?(buying|selling) |^(Buy|Sell): \\d+ x |^(Bought|Sold): ");
+			"(?i)^Grand Exchange: (Finished )?(buying|selling) |^(Buy|Sell): \\d+ x |^(Bought|Sold): "
+			+ "|^Unable to find ");
 	private static final Pattern TAGS = Pattern.compile("<[^>]+>");
 	private static final Pattern WS = Pattern.compile("\\s+");
 

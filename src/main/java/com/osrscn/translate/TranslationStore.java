@@ -201,6 +201,7 @@ public class TranslationStore
 					parse(f, c);
 				}
 			}
+			buildPlaceholderIndex();
 			loaded = true;
 			log.info("OSRSCN translations loaded: {} entries", size());
 		}
@@ -391,6 +392,88 @@ public class TranslationStore
 				{
 					return e.getValue();
 				}
+			}
+		}
+		return null;
+	}
+
+	// Rows keyed on a name placeholder ("Greetings, Thane [Fremennik name].") can never match live
+	// text exactly: the client only knows the account name, not the second name the game hands the
+	// player (Fremennik Trials). Each such key is split on its placeholder once at load, so a miss
+	// can match around the on-screen name and backfill it. Single-occurrence keys with at least
+	// 8 chars of fixed context only, so a near-bare-name row can never swallow an ordinary short line.
+	private static final String[] NAME_PLACEHOLDERS = {"[Fremennik name]", "[player name]"};
+	// OSRS display names: up to 12 chars of letters/digits/space/_/-, at least one letter.
+	private static final Pattern PLACEHOLDER_NAME = Pattern.compile("(?=[0-9 _-]*[A-Za-z])[A-Za-z0-9 _-]{1,12}");
+
+	private static final class PlaceholderRow
+	{
+		final String prefix;
+		final String suffix;
+		final String placeholder;
+		final String zh;
+
+		PlaceholderRow(String prefix, String suffix, String placeholder, String zh)
+		{
+			this.prefix = prefix;
+			this.suffix = suffix;
+			this.placeholder = placeholder;
+			this.zh = zh;
+		}
+	}
+
+	private volatile List<PlaceholderRow> placeholderRows = java.util.Collections.emptyList();
+
+	// Rebuilt whenever the tables are (re)parsed - never per query, so there is no negative cache to
+	// go stale (the render()-null-is-ambiguous trap does not apply here).
+	private void buildPlaceholderIndex()
+	{
+		List<PlaceholderRow> rows = new ArrayList<>();
+		for (Category c : ANY_ORDER) // priority order, so a curated-table row wins the scan
+		{
+			for (Map.Entry<String, String> e : maps.get(c).entrySet())
+			{
+				String k = e.getKey();
+				for (String p : NAME_PLACEHOLDERS)
+				{
+					int i = k.indexOf(p);
+					if (i >= 0 && k.indexOf(p, i + 1) < 0 && k.length() - p.length() >= 8)
+					{
+						rows.add(new PlaceholderRow(k.substring(0, i), k.substring(i + p.length()), p, e.getValue()));
+					}
+				}
+			}
+		}
+		placeholderRows = rows;
+	}
+
+	/**
+	 * Match {@code english} against the placeholder-keyed rows, backfilling the on-screen name into
+	 * the translation (values keep their placeholder verbatim, so a plain replace restores the name).
+	 * Returns null when no row fits. A hit here is a real table hit: the caller must treat it as
+	 * final - recording it or sending it to the AI would leak the name it carries off the machine.
+	 * The linear scan (~4k rows) only runs after every exact lookup missed, with a cheap length
+	 * pre-filter, so it stays off the per-frame hot path.
+	 */
+	public String lookupPlaceholderTolerant(String english)
+	{
+		List<PlaceholderRow> rows = placeholderRows;
+		if (english == null || english.isEmpty() || rows.isEmpty())
+		{
+			return null;
+		}
+		String q = normalize(english);
+		for (PlaceholderRow r : rows)
+		{
+			int nameLen = q.length() - r.prefix.length() - r.suffix.length();
+			if (nameLen < 1 || nameLen > 12 || !q.startsWith(r.prefix) || !q.endsWith(r.suffix))
+			{
+				continue;
+			}
+			String name = q.substring(r.prefix.length(), r.prefix.length() + nameLen);
+			if (PLACEHOLDER_NAME.matcher(name).matches())
+			{
+				return r.zh.replace(r.placeholder, name);
 			}
 		}
 		return null;

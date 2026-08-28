@@ -166,6 +166,12 @@ final class SurfaceRegistry
 		// For panels dominated by player-controlled text (boat naming, hiscore name lists). Populate
 		// after an in-game group survey - only the player-text subpanels, NOT high-value label lists
 		// like the report reasons. The mechanism ships first so the survey is one builder line each.
+		// Trade screens carry the partner's display name in static labels ("Trading with: X"), a name
+		// no fixed list can know in advance, so nothing from them may reach the missing file.
+		for (int g : new int[]{334 /* trade confirm */, 335 /* trade offer */, 336 /* trade inventory side */})
+		{
+			r.row(g).noCollect = true;
+		}
 
 		// ===== SCRIPT hooks: a build script writes these on open/switch -> translate the instant it fires =====
 		// Account summary: named TEXT_FORMAT(3948)/SECTION_FORMAT(3950) + the unnamed XP/play-time siblings 3947/3949.

@@ -160,28 +160,46 @@ public class Translator
 		{
 			return null;
 		}
-		String name = playerName();
-		String query = name != null ? english.replace(name, PLAYER_NAME) : english;
-		if (name != null)
+		String zh = tableHit(english);
+		if (zh != null)
 		{
-			String zh = store.lookupAny(query);
-			if (zh != null)
-			{
-				return keepEnglish(zh) ? null : zh.replace(PLAYER_NAME, name);
-			}
+			return keepEnglish(zh) ? null : zh;
 		}
-		String zh = store.lookupAny(english);
-		// A hit is final either way: an English-only value means "checked, keep English", so it must not
-		// fall through to the collector or the AI (which would mistranslate it).
+		// Rows keyed on a name placeholder ("[Fremennik name]") can never match exactly: the client only
+		// knows the account name, not the second name the game hands the player. A tolerant hit backfills
+		// the on-screen name and is final - recording or AI-translating it would leak that name off the
+		// machine (missing.tsv / the AI disk cache).
+		zh = store.lookupPlaceholderTolerant(english);
 		if (zh != null)
 		{
 			return keepEnglish(zh) ? null : zh;
 		}
 		if (collect)
 		{
-			missing.record(query, category, subCategory, source);
+			String name = playerName();
+			missing.record(name != null ? english.replace(name, PLAYER_NAME) : english, category, subCategory, source);
 		}
 		return aiTranslate(english, true);
+	}
+
+	/**
+	 * Name-masked table hit for {@code english}, or null on a genuine miss. A hit is final either way:
+	 * an English-only value means "checked, keep English", so it must not fall through to the collector
+	 * or the AI (which would mistranslate it). The value is returned raw - the caller applies
+	 * {@link #keepEnglish} itself, so it can tell "hit but nothing to draw" from a miss.
+	 */
+	private String tableHit(String english)
+	{
+		String name = playerName();
+		if (name != null)
+		{
+			String zh = store.lookupAny(english.replace(name, PLAYER_NAME));
+			if (zh != null)
+			{
+				return keepEnglish(zh) ? zh : zh.replace(PLAYER_NAME, name);
+			}
+		}
+		return store.lookupAny(english);
 	}
 
 	/**
@@ -204,10 +222,29 @@ public class Translator
 		{
 			return plainCollect(Tags.stripTags(text), category, subCategory, source);
 		}
-		String zh = plainCore(Tags.placeholdColors(text), category, subCategory, source, true);
+		// The tables often hold only the plain form of a coloured line, so a <colNumN> miss retries with
+		// colours stripped before anything is recorded or sent to the AI; the placeholder-count check
+		// below then renders such a hit single-colour, which still beats leaving the line English.
+		String templated = Tags.placeholdColors(text);
+		String zh = tableHit(templated);
 		if (zh == null)
 		{
-			return null;
+			zh = tableHit(Tags.stripTags(text));
+		}
+		if (zh != null)
+		{
+			if (keepEnglish(zh))
+			{
+				return null;
+			}
+		}
+		else
+		{
+			zh = plainCore(templated, category, subCategory, source, true);
+			if (zh == null)
+			{
+				return null;
+			}
 		}
 		return Tags.placeholderCount(zh) == colors.size()
 				? Tags.restoreColors(zh, colors)
@@ -482,16 +519,29 @@ public class Translator
 	/**
 	 * Collection form of a UI line: the exact key the lookups use (colours placeholded, styling
 	 * stripped) with the local player's name masked, so collected rows are directly usable table keys.
+	 * Nearby players' names are masked too (trade / friends-style panels show them in static labels,
+	 * and a name list can't know names it has never seen); a nearby name that collides with an
+	 * ordinary word over-masks that word - precision over recall, the pipeline can't un-leak a name.
 	 */
 	private String collectKey(String s)
 	{
 		String k = Tags.placeholdColors(Tags.stripStyle(s)).trim();
 		String name = playerName();
-		return (name != null && !name.isEmpty()) ? k.replace(name, PLAYER_NAME) : k;
+		if (name != null && !name.isEmpty())
+		{
+			k = k.replace(name, PLAYER_NAME);
+		}
+		Pattern any = nearbyNamePattern();
+		if (any != null)
+		{
+			k = any.matcher(k).replaceAll(Matcher.quoteReplacement(PLAYER_NAME));
+		}
+		return k;
 	}
 
 	// Tables and live messages disagree on trailing punctuation ("You catch some raw shrimps" in the
-	// table vs "...shrimps." in game), so on a miss retry once with it stripped, or with '.' added.
+	// table vs "...shrimps." in game; label "Sailing:" vs table "Sailing"), so on a miss retry once
+	// with it stripped, or with '.' added.
 	private String lookupPeriodTolerant(String key, TranslationStore.Category[] order)
 	{
 		String zh = templateLookup(key, order);
@@ -505,7 +555,7 @@ public class Translator
 			return null;
 		}
 		char last = t.charAt(t.length() - 1);
-		if ((last == '.' || last == '!' || last == '?') && !t.endsWith(".."))
+		if ((last == '.' || last == '!' || last == '?' || last == ':') && !t.endsWith(".."))
 		{
 			return templateLookup(t.substring(0, t.length() - 1), order);
 		}
@@ -1061,7 +1111,7 @@ public class Translator
 		{
 			return "";
 		}
-		String zh = templateLookup(plain, UI_ORDER);
+		String zh = lookupPeriodTolerant(plain, UI_ORDER);
 		if (zh != null)
 		{
 			return zh;
