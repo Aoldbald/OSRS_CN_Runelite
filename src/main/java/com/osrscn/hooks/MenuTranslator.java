@@ -4,7 +4,7 @@ import com.osrscn.glyph.GlyphService;
 import com.osrscn.text.Tags;
 import com.osrscn.translate.TranslationStore.Category;
 import com.osrscn.translate.Translator;
-import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -14,6 +14,7 @@ import net.runelite.api.Client;
 import net.runelite.api.Menu;
 import net.runelite.api.MenuAction;
 import net.runelite.api.MenuEntry;
+import net.runelite.api.Point;
 import net.runelite.api.events.MenuOpened;
 
 /**
@@ -31,6 +32,13 @@ public class MenuTranslator
 	// two named constants because they describe different fields, even though the value is the same.
 	private static final int OPTION_COLOR = 0xffffff;
 	private static final int DEFAULT_TARGET_COLOR = 0xffffff;
+	// Current native menu renderer (Client build 32956056058.238): one 15px row, with strict
+	// (baseline-13, baseline+3) mouse bounds and a baseline offset of 31px from menuY.
+	private static final int NATIVE_HOVER_COLOR = 0xffff00;
+	private static final int NATIVE_ROW_HEIGHT = 15;
+	private static final int NATIVE_BASELINE_OFFSET = 31;
+	private static final int NATIVE_HIT_TOP = 13;
+	private static final int NATIVE_HIT_BOTTOM = 3;
 
 	private static final Pattern LEVEL = Pattern.compile("\\((?:level|combat)-(\\d+)\\)", Pattern.CASE_INSENSITIVE);
 
@@ -48,16 +56,40 @@ public class MenuTranslator
 	@Inject
 	private GlyphService glyph;
 
-	// translated option/target string -> original English, so we can hand the English back to other
-	// plugins at click time (they often match menu entries by their English text, e.g. the core
-	// Examine plugin needs option.equals("Examine") to show vendor/GE prices).
-	private final Map<String, String> originalText = new HashMap<>();
+	// Entry identity -> original English and last completed native colour. Identity avoids duplicate
+	// option/target strings sharing state and keeps click restoration exact after base -> hover -> base.
+	private final Map<MenuEntry, EntryState> entryStates = new IdentityHashMap<>();
+
+	private static final class EntryState
+	{
+		final String option;
+		final String target;
+		final MenuAction type;
+		int optionColor = -1;
+		int targetColor = -1;
+		boolean optionRendered;
+		boolean targetRendered;
+
+		EntryState(String option, String target, MenuAction type)
+		{
+			this.option = option;
+			this.target = target;
+			this.type = type;
+		}
+	}
 
 	/** Translate every entry (and sub-entries) of a freshly opened right-click menu, in place. */
 	public void handleMenuOpened(MenuOpened event)
 	{
-		originalText.clear();
-		translateEntries(event.getMenuEntries());
+		entryStates.clear();
+		if (client.getMenu() != null)
+		{
+			refreshNativeColors();
+		}
+		else
+		{
+			translateEntries(event.getMenuEntries(), OPTION_COLOR);
+		}
 	}
 
 	/**
@@ -77,41 +109,133 @@ public class MenuTranslator
 		{
 			return;
 		}
-		translateEntries(client.getMenuEntries());
+		refreshNativeColors();
 	}
 
-	private void translateEntries(MenuEntry[] entries)
+	private void refreshNativeColors()
 	{
-		for (MenuEntry entry : entries)
+		Menu root = client.getMenu();
+		if (root == null)
 		{
-			translateInPlace(entry);
+			translateEntries(client.getMenuEntries(), OPTION_COLOR);
+			return;
+		}
+		Point mouse = client.getMouseCanvasPosition();
+		MenuEntry hovered = hoveredEntry(root, client.getMenuScroll(), mouse);
+		applyMenu(root, hovered);
+	}
+
+	private void applyMenu(Menu menu, MenuEntry hovered)
+	{
+		for (MenuEntry entry : menu.getMenuEntries())
+		{
+			translateInPlace(entry, entry == hovered ? NATIVE_HOVER_COLOR : OPTION_COLOR);
 			Menu sub = entry.getSubMenu();
 			if (sub != null)
 			{
-				translateEntries(sub.getMenuEntries());
+				applyMenu(sub, hovered);
 			}
 		}
 	}
 
-	private void translateInPlace(MenuEntry entry)
+	private MenuEntry hoveredEntry(Menu menu, int scroll, Point mouse)
+	{
+		if (mouse == null)
+		{
+			return null;
+		}
+		MenuEntry[] entries = menu.getMenuEntries();
+		// The native renderer draws an active submenu over its parent. Prefer the deepest menu whose
+		// real bounds contain the mouse so root and submenu rows never share hover state.
+		for (MenuEntry entry : entries)
+		{
+			Menu sub = entry.getSubMenu();
+			if (sub != null)
+			{
+				MenuEntry hit = hoveredEntry(sub, 0, mouse);
+				if (hit != null)
+				{
+					return hit;
+				}
+			}
+		}
+		int index = nativeEntryAt(menu.getMenuX(), menu.getMenuY(), menu.getMenuWidth(), entries.length,
+				scroll, mouse.getX(), mouse.getY());
+		return index >= 0 ? entries[index] : null;
+	}
+
+	static int nativeEntryAt(int menuX, int menuY, int menuWidth, int entryCount, int scroll,
+			int mouseX, int mouseY)
+	{
+		for (int index = 0; index < entryCount; index++)
+		{
+			if (entryCount - 1 - index < scroll)
+			{
+				continue;
+			}
+			int baseline = menuY + (entryCount - 1 - index - scroll) * NATIVE_ROW_HEIGHT
+					+ NATIVE_BASELINE_OFFSET;
+			if (mouseX > menuX && mouseX < menuX + menuWidth
+					&& mouseY > baseline - NATIVE_HIT_TOP && mouseY < baseline + NATIVE_HIT_BOTTOM)
+			{
+				return index;
+			}
+		}
+		return -1;
+	}
+
+	private void translateEntries(MenuEntry[] entries, int color)
+	{
+		for (MenuEntry entry : entries)
+		{
+			translateInPlace(entry, color);
+			Menu sub = entry.getSubMenu();
+			if (sub != null)
+			{
+				translateEntries(sub.getMenuEntries(), color);
+			}
+		}
+	}
+
+	private void translateInPlace(MenuEntry entry, int rowColor)
 	{
 		if (entry.getType().name().startsWith("RUNELITE"))
 		{
 			return; // keep custom plugin actions matchable by their English text
 		}
-		String origOption = entry.getOption();
-		String opt = translateOption(origOption, entry.getType(), glyph.uiSize());
-		if (opt != null)
+		EntryState state = entryStates.get(entry);
+		if (state == null)
 		{
-			originalText.put(opt, origOption);
-			entry.setOption(opt);
+			String option = entry.getOption();
+			String target = entry.getTarget();
+			if (option == null || target == null || option.contains("<img=") || target.contains("<img="))
+			{
+				return;
+			}
+			state = new EntryState(option, target, entry.getType());
+			entryStates.put(entry, state);
 		}
-		String origTarget = entry.getTarget();
-		String tgt = translateTarget(origTarget, glyph.uiSize());
-		if (tgt != null)
+
+		if (!state.optionRendered || state.optionColor != rowColor)
 		{
-			originalText.put(tgt, origTarget);
-			entry.setTarget(tgt);
+			String opt = translateOption(state.option, state.type, glyph.uiSize(), rowColor);
+			if (opt != null)
+			{
+				entry.setOption(opt);
+				state.optionRendered = true;
+				state.optionColor = rowColor;
+			}
+		}
+		int targetColor = Tags.firstColor(state.target, rowColor);
+		if (!state.targetRendered || state.targetColor != targetColor)
+		{
+			String tgt = translateTarget(state.target, glyph.uiSize(), rowColor);
+			if (tgt != null)
+			{
+				entry.setTarget(tgt);
+				state.targetRendered = true;
+				state.targetColor = targetColor;
+			}
 		}
 	}
 
@@ -122,20 +246,17 @@ public class MenuTranslator
 	 */
 	public void restoreForClick(MenuEntry entry)
 	{
-		if (originalText.isEmpty() || entry == null)
+		if (entry == null)
 		{
 			return;
 		}
-		String o = originalText.get(entry.getOption());
-		if (o != null)
+		EntryState state = entryStates.get(entry);
+		if (state == null)
 		{
-			entry.setOption(o);
+			return;
 		}
-		String t = originalText.get(entry.getTarget());
-		if (t != null)
-		{
-			entry.setTarget(t);
-		}
+		entry.setOption(state.option);
+		entry.setTarget(state.target);
 	}
 
 	/**
@@ -144,15 +265,20 @@ public class MenuTranslator
 	 */
 	public String translateOption(String option, MenuAction type, int size)
 	{
+		return translateOption(option, type, size, OPTION_COLOR);
+	}
+
+	private String translateOption(String option, MenuAction type, int size, int color)
+	{
 		// Scene-specific "Use" must run before the table lookups, which would return the generic word.
 		String use = useZh(Tags.stripTags(option), type);
 		if (use != null)
 		{
-			return glyph.toImgTags(use, OPTION_COLOR, 0, size);
+			return glyph.toImgTags(use, color, 0, size);
 		}
 		// Whole-option entries that embed a coloured name ("Open <col=..>Ardougne Journal</col>") are stored
 		// colour-templated in ACTIONS; match that first so the embedded name is translated and keeps its colour.
-		String whole = translator.lookupRenderMenuOption(option, OPTION_COLOR, size);
+		String whole = translator.lookupRenderMenuOption(option, color, size);
 		if (whole != null)
 		{
 			return whole;
@@ -163,15 +289,15 @@ public class MenuTranslator
 			return null;
 		}
 		// general world actions live in ACTIONS; item actions (Wear/Wield/Eat/Drink/...) in INVENTORY_ACTIONS
-		String r = translator.lookupRender(Category.ACTIONS, plain, OPTION_COLOR, 0, size);
+		String r = translator.lookupRender(Category.ACTIONS, plain, color, 0, size);
 		if (r == null)
 		{
-			r = translator.lookupRender(Category.INVENTORY_ACTIONS, plain, OPTION_COLOR, 0, size);
+			r = translator.lookupRender(Category.INVENTORY_ACTIONS, plain, color, 0, size);
 		}
 		if (r == null)
 		{
 			// some menu options are interface/tab labels (e.g. "Sailing Options") stored in INTERFACE
-			r = translator.lookupRender(Category.INTERFACE, plain, OPTION_COLOR, 0, size);
+			r = translator.lookupRender(Category.INTERFACE, plain, color, 0, size);
 		}
 		return r;
 	}
@@ -201,6 +327,11 @@ public class MenuTranslator
 	/** @return rendered target (name + localised level), or null to leave the English target */
 	public String translateTarget(String target, int size)
 	{
+		return translateTarget(target, size, DEFAULT_TARGET_COLOR);
+	}
+
+	private String translateTarget(String target, int size, int rowColor)
+	{
 		// "Use <item> -> <target>" (item selected, hovering another) joins two names; the combined
 		// string never matches the name table, so translate each side and keep the separator.
 		int arrow = target.indexOf(" -> ");
@@ -208,8 +339,8 @@ public class MenuTranslator
 		{
 			String left = target.substring(0, arrow);
 			String right = target.substring(arrow + 4);
-			String lr = translateTarget(left, size);
-			String rr = translateTarget(right, size);
+			String lr = translateTarget(left, size, rowColor);
+			String rr = translateTarget(right, size, rowColor);
 			if (lr == null && rr == null)
 			{
 				return null;
@@ -221,7 +352,7 @@ public class MenuTranslator
 		{
 			return null;
 		}
-		int color = Tags.firstColor(target, DEFAULT_TARGET_COLOR);
+		int color = Tags.firstColor(target, rowColor);
 
 		String levelSuffix = "";
 		Matcher lm = LEVEL.matcher(plainTarget);

@@ -803,24 +803,45 @@ public class GlyphService
 	/**
 	 * The OSRS bitmap font can't draw the interpunct used in foreign names (shows as '?'), nor most
 	 * other non-ASCII punctuation below the CJK range - ellipsis, em-dash, curly quotes pass through
-	 * as garbage glyphs (chars &lt; 0x2E80 are kept native, see the render loop). Fold them to ASCII
-	 * the font does have; CJK punctuation at U+3000+ is glyph-rendered and unaffected.
+	 * as garbage glyphs (chars &lt; 0x2E80 are kept native, see the render loop). Full-width Latin
+	 * letters and digits have the opposite problem: they enter the glyph path and render with CJK
+	 * spacing. Fold only those three compatibility ranges and the known separators to ASCII; leave
+	 * full-width punctuation and all other compatibility characters untouched.
 	 */
-	private static String normalizeSeparators(String s)
+	static String normalizeSeparators(String s)
 	{
 		boolean dirty = false;
+		boolean fullWidthAlphanumeric = false;
 		for (int i = 0; i < s.length(); i++)
 		{
 			char c = s.charAt(i);
+			if ((c >= '０' && c <= '９') || (c >= 'Ａ' && c <= 'Ｚ') || (c >= 'ａ' && c <= 'ｚ'))
+			{
+				dirty = true;
+				fullWidthAlphanumeric = true;
+			}
 			if (c >= 0x80 && c < 0x2E80)
 			{
 				dirty = true;
-				break;
 			}
 		}
 		if (!dirty)
 		{
 			return s;
+		}
+		if (fullWidthAlphanumeric)
+		{
+			StringBuilder folded = new StringBuilder(s.length());
+			for (int i = 0; i < s.length(); i++)
+			{
+				char c = s.charAt(i);
+				if ((c >= '０' && c <= '９') || (c >= 'Ａ' && c <= 'Ｚ') || (c >= 'ａ' && c <= 'ｚ'))
+				{
+					c -= 0xFEE0;
+				}
+				folded.append(c);
+			}
+			s = folded.toString();
 		}
 		return s.replace('·', '.').replace('・', '.').replace('‧', '.').replace('•', '.')
 				.replace("…", "...")

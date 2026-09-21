@@ -2485,9 +2485,16 @@ public class InterfaceTranslator
 		translateChatPrompts(true);
 	}
 
+	private Widget[] widgetRootsWhenAvailable()
+	{
+		// Root enumeration dereferences widget definitions before checking whether they exist.
+		// The sprite-cache accessor is null-safe for that same container during client startup.
+		return client.getWidgetSpriteCache() == null ? null : client.getWidgetRoots();
+	}
+
 	private void scan(boolean perFrame)
 	{
-		Widget[] roots = client.getWidgetRoots();
+		Widget[] roots = widgetRootsWhenAvailable();
 		if (roots == null)
 		{
 			return;
@@ -2565,7 +2572,7 @@ public class InterfaceTranslator
 	public void translateGroupId(int groupId)
 	{
 		beginPass();
-		Widget[] roots = client.getWidgetRoots();
+		Widget[] roots = widgetRootsWhenAvailable();
 		if (roots == null)
 		{
 			return;
@@ -2615,6 +2622,12 @@ public class InterfaceTranslator
 		// own UI lags on deep hidden trees without this). This makes the scan cheap enough to raise to
 		// per-frame later, and lowers the current per-tick cost now. Visible widgets are unaffected.
 		if (w == null || w.isHidden())
+		{
+			return;
+		}
+		// Grouping mixes static activity labels with a player-controlled member list. Dynamic
+		// rows inherit this component id; skip the whole list before lookup, AI or collection.
+		if (w.getId() == InterfaceID.Grouping.PLAYERLIST)
 		{
 			return;
 		}
@@ -2765,7 +2778,7 @@ public class InterfaceTranslator
 	/** Put the original English back on every interface widget we translated (instant EN switch). */
 	public void restore()
 	{
-		Widget[] roots = client.getWidgetRoots();
+		Widget[] roots = widgetRootsWhenAvailable();
 		if (roots != null)
 		{
 			for (Widget root : roots)

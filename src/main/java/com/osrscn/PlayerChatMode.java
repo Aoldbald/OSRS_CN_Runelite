@@ -1,9 +1,9 @@
 package com.osrscn;
 
-/** How other players' public chat is handled. Player names are never translated in any mode. */
+/** How other players' supported chat channels are handled. Player names are never translated. */
 public enum PlayerChatMode
 {
-	/** Leave player chat in English (recoloured OSRS blue). */
+	/** Leave player chat in English using that channel's native colour. */
 	OFF("不翻译"),
 	/** Translate the message in place (the English line becomes Chinese). */
 	INLINE("翻译"),

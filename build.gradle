@@ -27,7 +27,7 @@ dependencies {
 }
 
 group = 'com.osrscn'
-version = '0.2.3'
+version = '0.3.0'
 
 tasks.withType(JavaCompile).configureEach {
 	options.encoding = 'UTF-8'
@@ -52,4 +52,19 @@ tasks.register('writeTestRuntimeClasspath') {
 				.collect { it.absolutePath }
 				.join(System.lineSeparator())
 	}
+}
+
+// Isolate tests before any RuneLite or logging class initializes.
+tasks.withType(Test).configureEach {
+    doFirst {
+        def base = file(project.findProperty('osrscnTestFixtureBase') ?: "${buildDir}/test-fixtures")
+        base.mkdirs()
+        def fixture = java.nio.file.Files.createTempDirectory(base.toPath(), 'run-').toFile()
+        def logging = new File(fixture, 'logback.xml')
+        logging.setText('<configuration><root level="OFF"/></configuration>', 'UTF-8')
+        systemProperty 'user.home', fixture.absolutePath
+        systemProperty 'logback.configurationFile', logging.absolutePath
+        systemProperty 'osrscn.test.fixtureRoot', fixture.absolutePath
+        logger.lifecycle("Isolated test fixture: ${fixture.absolutePath}")
+    }
 }

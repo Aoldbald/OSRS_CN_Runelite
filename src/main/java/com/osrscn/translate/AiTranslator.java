@@ -13,6 +13,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 import javax.inject.Inject;
 import javax.inject.Singleton;
@@ -37,6 +38,8 @@ import okhttp3.Response;
 @Singleton
 public class AiTranslator
 {
+	// Includes local model loading and inference; never an unlimited read or whole-call wait.
+	public static final long OLLAMA_REQUEST_TIMEOUT_MS = 60_000;
 	private static final MediaType JSON = MediaType.parse("application/json");
 	private static final Pattern THINK = Pattern.compile("(?s)<think>.*?</think>");
 	// Value labels (bank/GE totals "(3.6B)", "(500)") change with every gp move, so they never form a
@@ -63,6 +66,7 @@ public class AiTranslator
 
 	@Inject
 	private OkHttpClient httpClient;
+	private OkHttpClient ollamaHttpClient; // shares the injected dispatcher and connection pool
 
 	@Inject
 	private OsrscnConfig config;
@@ -80,6 +84,7 @@ public class AiTranslator
 	private final Set<String> persisted = ConcurrentHashMap.newKeySet();
 	private final File dir = new File(RuneLite.RUNELITE_DIR, "osrscn");
 	private String loadedModel; // model whose cache is currently in memory (per-model on disk)
+	private long generation; // guarded by this; model round trips never reuse request ownership
 	private File cacheFile;
 	private volatile long lastDispatch;
 
@@ -95,6 +100,40 @@ public class AiTranslator
 	private final java.util.concurrent.atomic.AtomicInteger sessionCount = new java.util.concurrent.atomic.AtomicInteger();
 	private final java.util.Deque<String> recent = new java.util.concurrent.ConcurrentLinkedDeque<>();
 
+	/** Serializes player-mode revocation with admission of a fresh asynchronous request. */
+	public static final class RequestPermit
+	{
+		private final java.util.function.BooleanSupplier allowed;
+		private final RequestPermit owner;
+		private boolean revoked;
+
+		public RequestPermit(java.util.function.BooleanSupplier allowed)
+		{
+			this.allowed = allowed;
+			owner = this;
+		}
+
+		/** Add a delivery's exact mode check while sharing its mode's cancellation boundary. */
+		public RequestPermit(RequestPermit parent, java.util.function.BooleanSupplier allowed)
+		{
+			owner = parent.owner;
+			this.allowed = () -> parent.allowed.getAsBoolean() && allowed.getAsBoolean();
+		}
+
+		public void revoke()
+		{
+			synchronized (owner) { owner.revoked = true; }
+		}
+
+		private void dispatch(Runnable action)
+		{
+			synchronized (owner)
+			{
+				if (!owner.revoked && allowed.getAsBoolean() && !owner.revoked) action.run();
+			}
+		}
+	}
+
 	/** @return cached translation, or null if disabled / still pending (request fired on miss). */
 	public String translate(String english)
 	{
@@ -107,7 +146,7 @@ public class AiTranslator
 	 *
 	 * @return the cached translation, or null if this text has never been translated
 	 */
-	public String cached(String english)
+	public synchronized String cached(String english)
 	{
 		if (english == null || english.isEmpty())
 		{
@@ -126,43 +165,76 @@ public class AiTranslator
 	 */
 	public String translate(String english, boolean persist)
 	{
+		return translate(english, persist, null);
+	}
+
+	/** Player callers retain their mode's permit through preprocessing and every per-line request. */
+	public String translate(String english, boolean persist, RequestPermit permit)
+	{
 		if (english == null || english.isEmpty())
 		{
 			return null;
 		}
-		ensureLoaded();
-		String cached = cache.get(english);
-		if (cached != null)
+		final long requestedGeneration;
+		synchronized (this)
 		{
-			// Serve already-cached translations even when AI is switched off: they cost nothing (no GPU,
-			// no network), so turning AI off should only stop *new* translations, not hide finished ones.
-			if (persist && isPersistable(english) && persisted.add(english))
+			ensureLoaded();
+			String cached = cache.get(english);
+			if (cached != null)
 			{
-				persistToDisk(english, cached); // memory-only entry re-requested with persist on
+				// AI off remains cache-only, including promotion of an existing memory-only entry.
+				if (persist && isPersistable(english) && persisted.add(english))
+				{
+					persistToDisk(english, cached);
+				}
+				return cached;
 			}
-			return cached;
+			if (!config.useLocalAi()) return null;
+			requestedGeneration = generation;
 		}
-		if (!config.useLocalAi())
+		// Never acquire a permit owner while holding this monitor. Admission order is owner -> this.
+		if (permit == null) dispatch(english, persist, requestedGeneration);
+		else permit.dispatch(() -> dispatch(english, persist, requestedGeneration));
+		return null;
+	}
+
+	private synchronized void dispatch(String english, boolean persist, long requestedGeneration)
+	{
+		ensureLoaded();
+		if (requestedGeneration != generation || !config.useLocalAi() || cache.containsKey(english))
 		{
-			return null; // AI off: cache-only, never dispatch a fresh translation request
+			return; // model/config changed or another callback filled this miss while acquiring admission
 		}
 		if (System.currentTimeMillis() < backoffUntil)
 		{
-			return null; // backend keeps failing: wait out the backoff window
+			return; // backend keeps failing: wait out the backoff window
 		}
 		// rate limit so Ollama doesn't saturate the GPU and stall the game (both configurable)
 		if (inFlight.size() >= Math.max(1, config.aiConcurrency())
 				|| System.currentTimeMillis() - lastDispatch < config.aiPaceMs())
 		{
-			return null;
+			return;
 		}
 		if (!inFlight.add(english))
 		{
-			return null; // already requested
+			return; // already requested
 		}
 		lastDispatch = System.currentTimeMillis();
-		request(english, persist);
-		return null;
+		RequestState state = new RequestState(generation, loadedModel);
+		try
+		{
+			request(english, persist, state);
+		}
+		catch (RuntimeException e)
+		{
+			if (isCurrent(state))
+			{
+				recordFailure();
+				finish(english, state);
+			}
+			if (persist) log.warn("OSRSCN AI dispatch failed", e);
+			else log.warn("OSRSCN AI dispatch failed (non-persistent request): {}", e.getClass().getSimpleName());
+		}
 	}
 
 	public int cacheSize()
@@ -200,12 +272,8 @@ public class AiTranslator
 		{
 			return;
 		}
+		configurationChanged();
 		loadedModel = model;
-		cache.clear();
-		inFlight.clear();
-		persisted.clear();
-		failStreak.set(0);
-		backoffUntil = 0;
 		//noinspection ResultOfMethodCallIgnored
 		dir.mkdirs();
 		cacheFile = new File(dir, "ai_" + model.replaceAll("[^a-zA-Z0-9._-]", "_") + ".tsv");
@@ -240,6 +308,55 @@ public class AiTranslator
 				log.warn("OSRSCN: failed to load AI cache", e);
 			}
 		}
+	}
+
+	/** Invalidate synchronously on model/connection events, even A -> B -> A without a lookup. */
+	public synchronized void configurationChanged()
+	{
+		invalidateRequests();
+		loadedModel = null;
+		cacheFile = null;
+		cache.clear();
+		persisted.clear();
+	}
+
+	private void invalidateRequests()
+	{
+		generation++;
+		inFlight.clear();
+		failStreak.set(0);
+		backoffUntil = 0;
+		lastDispatch = 0;
+	}
+
+	private static final class RequestState
+	{
+		final long generation;
+		final String model;
+		boolean completed;
+
+		RequestState(long generation, String model)
+		{
+			this.generation = generation;
+			this.model = model;
+		}
+	}
+
+	/** Called under this monitor, including a recheck after potentially reentrant config getters. */
+	private boolean isCurrent(RequestState state)
+	{
+		return !state.completed && state.generation == generation && state.model.equals(loadedModel)
+				&& state.model.equals(activeModel()) && state.generation == generation && !state.completed;
+	}
+
+	private void finish(String english, RequestState state)
+	{
+		if (isCurrent(state))
+		{
+			inFlight.remove(english);
+			lastDispatch = System.currentTimeMillis();
+		}
+		state.completed = true;
 	}
 
 	/**
@@ -284,10 +401,11 @@ public class AiTranslator
 		}
 	}
 
-	public void clearCache()
+	public synchronized void clearCache()
 	{
+		ensureLoaded(); // configuration invalidation may have cleared the current file ownership
+		invalidateRequests();
 		cache.clear();
-		inFlight.clear();
 		persisted.clear();
 		if (cacheFile != null)
 		{
@@ -296,7 +414,21 @@ public class AiTranslator
 		}
 	}
 
-	private void request(String english, boolean persist)
+	/** Called under this monitor; only local inference gets the cold-load budget. */
+	private OkHttpClient inferenceClient(boolean api)
+	{
+		if (api) return httpClient;
+		if (ollamaHttpClient == null)
+		{
+			ollamaHttpClient = httpClient.newBuilder()
+					.readTimeout(OLLAMA_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+					.callTimeout(OLLAMA_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+					.build();
+		}
+		return ollamaHttpClient;
+	}
+
+	private void request(String english, boolean persist, RequestState state)
 	{
 		JsonArray messages = new JsonArray();
 		messages.add(message("system", SYSTEM_PROMPT));
@@ -304,22 +436,28 @@ public class AiTranslator
 
 		boolean api = config.aiBackend() == AiBackend.OPENAI;
 		final String url = api ? apiEndpoint() : ollamaEndpoint();
-		Request req = api ? buildApiRequest(url, messages) : buildOllamaRequest(url, messages);
+		Request req = api ? buildApiRequest(url, messages, state.model) : buildOllamaRequest(url, messages, state.model);
 		if (req == null)
 		{
-			inFlight.remove(english); // misconfigured (e.g. online API without key/model): don't dispatch
+			finish(english, state); // misconfigured: no request, and no failure/backoff increment
 			return;
 		}
 
-		httpClient.newCall(req).enqueue(new Callback()
+		Call pending = inferenceClient(api).newCall(req);
+		if (!isCurrent(state)) return;
+		pending.enqueue(new Callback()
 		{
 			@Override
 			public void onFailure(Call call, IOException e)
 			{
-				inFlight.remove(english);
-				lastDispatch = System.currentTimeMillis(); // gap measured from completion -> idle GPU window
-				recordFailure();
-				log.warn("OSRSCN AI request failed ({}): {}", url, e.toString());
+				synchronized (AiTranslator.this)
+				{
+					if (!isCurrent(state)) return;
+					recordFailure();
+					finish(english, state);
+				}
+				if (persist) log.warn("OSRSCN AI request failed ({}): {}", url, e.toString());
+				else log.warn("OSRSCN AI request failed (non-persistent request): {}", e.getClass().getSimpleName());
 			}
 
 			@Override
@@ -329,14 +467,21 @@ public class AiTranslator
 				{
 					if (!r.isSuccessful())
 					{
-						recordFailure();
-						log.warn("OSRSCN AI HTTP {} for model '{}'", r.code(), activeModel());
+						synchronized (AiTranslator.this)
+						{
+							if (!isCurrent(state)) return;
+							recordFailure();
+						}
+						if (persist) log.warn("OSRSCN AI HTTP {} for model '{}'", r.code(), state.model);
+						else log.warn("OSRSCN AI HTTP {} (non-persistent request)", r.code());
 						return;
 					}
-					recordSuccess();
-					if (r.body() != null)
+					// Response IO/parse must not hold the model monitor: switching may happen mid-read.
+					String content = r.body() == null ? null : parseContent(r.body().string());
+					synchronized (AiTranslator.this)
 					{
-						String content = parseContent(r.body().string());
+						if (!isCurrent(state)) return;
+						recordSuccess();
 						if (content != null && !content.isEmpty())
 						{
 							String zh = clean(content);
@@ -351,18 +496,20 @@ public class AiTranslator
 							{
 								recent.pollLast();
 							}
-							log.debug("OSRSCN AI: '{}' -> '{}'", english, zh);
+							if (persist) log.debug("OSRSCN AI: '{}' -> '{}'", english, zh);
+							else log.debug("OSRSCN AI: non-persistent translation completed");
 						}
 					}
 				}
 				catch (Exception e)
 				{
-					log.warn("OSRSCN AI parse failed", e);
+					// Parsing and close errors can contain response text, even for stale requests.
+					if (persist) log.warn("OSRSCN AI parse failed", e);
+					else log.warn("OSRSCN AI parse failed (non-persistent request): {}", e.getClass().getSimpleName());
 				}
 				finally
 				{
-					inFlight.remove(english);
-					lastDispatch = System.currentTimeMillis(); // start the idle gap after completion
+					synchronized (AiTranslator.this) { finish(english, state); }
 				}
 			}
 		});
@@ -396,10 +543,10 @@ public class AiTranslator
 		return config.ollamaUrl().replaceAll("/+$", "") + "/api/chat";
 	}
 
-	private Request buildOllamaRequest(String url, JsonArray messages)
+	private Request buildOllamaRequest(String url, JsonArray messages, String model)
 	{
 		JsonObject body = new JsonObject();
-		body.addProperty("model", config.ollamaModel());
+		body.addProperty("model", model);
 		body.addProperty("stream", false);
 		body.add("messages", messages);
 		return new Request.Builder()
@@ -419,10 +566,10 @@ public class AiTranslator
 		return base.endsWith("/chat/completions") ? base : base + "/chat/completions";
 	}
 
-	private Request buildApiRequest(String url, JsonArray messages)
+	private Request buildApiRequest(String url, JsonArray messages, String model)
 	{
 		String key = config.apiKey().trim();
-		String model = config.apiModel().trim();
+		model = model.trim();
 		if (url.isEmpty() || key.isEmpty() || model.isEmpty())
 		{
 			log.warn("OSRSCN AI: 在线 API 未配置完整（API 地址 / 密钥 / 模型）");

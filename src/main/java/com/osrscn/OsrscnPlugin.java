@@ -28,7 +28,9 @@ import net.runelite.api.events.BeforeRender;
 import net.runelite.api.events.ClientTick;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.MenuOpened;
+import net.runelite.api.events.ScriptCallbackEvent;
 import net.runelite.api.events.ScriptPostFired;
+import net.runelite.api.events.ScriptPreFired;
 import net.runelite.api.events.WidgetLoaded;
 import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.callback.ClientThread;
@@ -117,15 +119,14 @@ public class OsrscnPlugin extends Plugin
 	private volatile boolean noticeDone;  // this login already had its notice handled
 	private volatile long noticeDeadline; // >0 while the notice is queued, waiting for its glyphs to upload
 	private NavigationButton navButton;
-
 	private final HotkeyListener toggleHotkey = new HotkeyListener(() -> config.toggleHotkey())
 	{
 		@Override
 		public void hotkeyPressed()
 		{
-			boolean zh = toggle.toggle();
 			clientThread.invoke(() ->
 			{
+				boolean zh = toggle.toggle();
 				if (zh)
 				{
 					// switching back to Chinese: re-translate chat history; dialogue/interface
@@ -140,8 +141,8 @@ public class OsrscnPlugin extends Plugin
 					overheadHandler.clear();
 					chatHandler.goEnglish();
 				}
+				toggleOverlay.flash(zh ? "中文" : "English");
 			});
-			toggleOverlay.flash(zh ? "中文" : "English");
 		}
 	};
 
@@ -352,12 +353,6 @@ public class OsrscnPlugin extends Plugin
 			// Scan every client tick so newly opened interfaces spend less time flashing English.
 			// If this ever costs too much, switch to dirty/adaptive scanning here.
 			interfaceTranslator.translateOpen();
-			// Re-translate the open right-click menu so options whose glyphs were not yet uploaded on the
-			// first right-click (new characters) pick up their now-ready glyphs without a second click.
-			if (config.translateMenus())
-			{
-				menuTranslator.retranslateOpenMenu();
-			}
 		}
 	}
 
@@ -378,6 +373,7 @@ public class OsrscnPlugin extends Plugin
 		switch (event.getGameState())
 		{
 			case LOGIN_SCREEN:
+				chatHandler.clear();
 				// only a real logout re-arms the notice: a world hop or a region load goes back to
 				// LOGGED_IN without passing through here, so neither re-prints it.
 				noticeDone = false;
@@ -475,8 +471,21 @@ public class OsrscnPlugin extends Plugin
 	}
 
 	@Subscribe
+	public void onScriptPreFired(ScriptPreFired event)
+	{
+		if (ChatHandler.isChatBuildScript(event.getScriptId()))
+		{
+			chatHandler.beginChatBuild();
+		}
+	}
+
+	@Subscribe
 	public void onScriptPostFired(ScriptPostFired event)
 	{
+		if (ChatHandler.isChatBuildScript(event.getScriptId()))
+		{
+			chatHandler.finishChatBuild();
+		}
 		// Some panels write their English text from a client script when opened / switched to / updated.
 		// Translate the affected surface the instant that script finishes (before the frame draws) so it
 		// does not flash English until the next per-tick scan. Which scripts map to which surface/targets
@@ -492,6 +501,15 @@ public class OsrscnPlugin extends Plugin
 	}
 
 	@Subscribe
+	public void onScriptCallbackEvent(ScriptCallbackEvent event)
+	{
+		if ("chatMessageBuilding".equals(event.getEventName()))
+		{
+			chatHandler.captureChatLine(client.getIntStack(), client.getIntStackSize());
+		}
+	}
+
+	@Subscribe
 	public void onBeforeRender(BeforeRender event)
 	{
 		// spell tooltip and other per-frame-rewritten widgets must be re-translated after their
@@ -499,6 +517,13 @@ public class OsrscnPlugin extends Plugin
 		if (toggle.isChineseEnabled())
 		{
 			interfaceTranslator.translateRedraw();
+			chatHandler.refreshNativeColors();
+			// Menu hover is drawn per frame by the client; match that cadence while still retrying
+			// not-yet-uploaded glyphs without reopening the menu.
+			if (config.translateMenus())
+			{
+				menuTranslator.retranslateOpenMenu();
+			}
 		}
 	}
 
@@ -547,6 +572,20 @@ public class OsrscnPlugin extends Plugin
 			return;
 		}
 		String key = event.getKey();
+		if ("aiBackend".equals(key) || "ollamaModel".equals(key) || "apiModel".equals(key)
+				|| "ollamaUrl".equals(key) || "apiUrl".equals(key) || "apiKey".equals(key))
+		{
+			// Synchronous invalidation retains rapid model round trips before the next lookup.
+			aiTranslator.configurationChanged();
+		}
+		if ("playerChatMode".equals(key) || "groupChatMode".equals(key))
+		{
+			// ConfigChanged is synchronous on its caller's thread. Record every transition now,
+			// including reset (null newValue), so OFF -> ON cannot outrun client-thread cleanup.
+			chatHandler.playerChatModeChanged(key);
+			clientThread.invoke(chatHandler::discardRevokedPlayerMessages);
+			return;
+		}
 		if (key != null && key.startsWith("panel"))
 		{
 			return; // panel UI state (collapse / show-English): not a translation setting

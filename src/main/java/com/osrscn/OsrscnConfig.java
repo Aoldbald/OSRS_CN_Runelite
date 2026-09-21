@@ -33,7 +33,7 @@ public interface OsrscnConfig extends Config
 			position = 4)
 	String ai = "ai";
 
-	@ConfigSection(name = "调试", description = "", position = 5, closedByDefault = true)
+	@ConfigSection(name = "调试", description = "", position = 6, closedByDefault = true)
 	String debug = "debug";
 
 	// ===== 联系作者 / 反馈 =====
@@ -169,15 +169,30 @@ public interface OsrscnConfig extends Config
 
 	@ConfigItem(
 			keyName = "playerChatMode",
-			name = "玩家发言",
-			description = "其他玩家公共聊天的处理方式。玩家名字任何情况都不翻译。"
-					+ "「不翻译」只显示蓝色英文；「翻译」直接把英文行替换成中文；"
+			name = "公屏玩家发言",
+			description = "其他玩家公共聊天的处理方式（含管理员和自动喊话）。玩家名字任何情况都不翻译。"
+					+ "「不翻译」按原频道颜色显示英文；「翻译」直接把英文行替换成中文；"
 					+ "「翻译并另起一行」保留英文行，下面另插一条中文翻译（如 OSRS_CN: 玩家名: 你好）。"
 					+ "玩家黑话翻译质量不稳，且会占用 AI 翻译队列。",
 			section = translate,
 			position = 3
 	)
 	default PlayerChatMode playerChatMode()
+	{
+		return PlayerChatMode.OFF;
+	}
+
+	@ConfigItem(
+			keyName = "groupChatMode",
+			name = "额外频道玩家发言",
+			description = "独立设置 Friends Chat、Clan、Guest、GIM 的玩家发言；不受「公屏玩家发言」影响。"
+					+ "默认不翻译；可直接翻译或保留英文另起一行。缺少译文时需开启「启用 AI 翻译」。"
+					+ "正文发送至所选 AI 后端：本机 Ollama 在本机处理，在线 API 或远程地址会发送至远端。"
+					+ "玩家名保持原样，不发送给 AI。切换后仅翻译新来信。",
+			section = translate,
+			position = 4
+	)
+	default PlayerChatMode groupChatMode()
 	{
 		return PlayerChatMode.OFF;
 	}
@@ -405,5 +420,6 @@ public interface OsrscnConfig extends Config
 	{
 		return false;
 	}
+
 
 }

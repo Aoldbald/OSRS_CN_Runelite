@@ -402,16 +402,35 @@ public class Translator
 
 	public Rendered renderChat(String text, int colorRgb, int maxChars, int size, boolean aiFallback, boolean persist)
 	{
+		return renderChat(text, colorRgb, maxChars, size, aiFallback, persist, true, null);
+	}
+
+	/** Repaint chat from tables and AI cache without requests, persistence or missing collection. */
+	public Rendered renderChatCached(String text, int colorRgb, int maxChars, int size)
+	{
+		return renderChat(text, colorRgb, maxChars, size, true, false, false, null);
+	}
+
+	/** Player-mode permit reaches each AI admission; table and cached rendering stay unchanged. */
+	public Rendered renderChat(String text, int colorRgb, int maxChars, int size, boolean aiFallback,
+			boolean persist, AiTranslator.RequestPermit permit)
+	{
+		return renderChat(text, colorRgb, maxChars, size, aiFallback, persist, true, permit);
+	}
+
+	private Rendered renderChat(String text, int colorRgb, int maxChars, int size, boolean aiFallback,
+			boolean persist, boolean allowRequests, AiTranslator.RequestPermit permit)
+	{
 		// Game messages pass persist=true and are safe to collect; player chat passes persist=false
 		// and must never be written to missing.tsv.
 		Matcher link = text == null ? null : CHAT_LINK_PREFIX.matcher(text);
 		if (link != null && link.matches())
 		{
 			Rendered r = renderWithOrder(link.group(2), colorRgb, maxChars, size, aiFallback, persist,
-					CHAT_ORDER, persist ? "gameText" : null);
+					CHAT_ORDER, persist ? "gameText" : null, allowRequests, permit);
 			return r == null ? null : new Rendered(link.group(1) + r.text, r.complete);
 		}
-		return renderWithOrder(text, colorRgb, maxChars, size, aiFallback, persist, CHAT_ORDER, persist ? "gameText" : null);
+		return renderWithOrder(text, colorRgb, maxChars, size, aiFallback, persist, CHAT_ORDER, persist ? "gameText" : null, allowRequests, permit);
 	}
 
 	/**
@@ -426,6 +445,12 @@ public class Translator
 
 	private Rendered renderWithOrder(String text, int colorRgb, int maxChars, int size, boolean aiFallback, boolean persist,
 			TranslationStore.Category[] order, String collectSource)
+	{
+		return renderWithOrder(text, colorRgb, maxChars, size, aiFallback, persist, order, collectSource, true, null);
+	}
+
+	private Rendered renderWithOrder(String text, int colorRgb, int maxChars, int size, boolean aiFallback, boolean persist,
+			TranslationStore.Category[] order, String collectSource, boolean allowRequests, AiTranslator.RequestPermit permit)
 	{
 		if (text == null || text.trim().isEmpty())
 		{
@@ -481,7 +506,7 @@ public class Translator
 				}
 				if (lzh == null && aiFallback)
 				{
-					lzh = aiLine(Tags.stripCol(line), persist);
+					lzh = aiLine(Tags.stripCol(line), persist, allowRequests, permit);
 				}
 				if (lzh != null)
 				{
@@ -569,12 +594,17 @@ public class Translator
 	/** AI-translate one line, but only if it is real prose (skip numbers/symbols like "0/1"). */
 	private String aiLine(String line, boolean persist)
 	{
+		return aiLine(line, persist, true, null);
+	}
+
+	private String aiLine(String line, boolean persist, boolean allowRequests, AiTranslator.RequestPermit permit)
+	{
 		String t = line.trim();
 		if (!WORDY.matcher(t).find())
 		{
 			return null;
 		}
-		return aiTranslate(t, true, persist);
+		return aiTranslate(t, true, persist, allowRequests, permit);
 	}
 
 	private String aiTranslate(String query, boolean protectPlayerNames)
@@ -584,10 +614,15 @@ public class Translator
 
 	private String aiTranslate(String query, boolean protectPlayerNames, boolean persist)
 	{
+		return aiTranslate(query, protectPlayerNames, persist, true, null);
+	}
+
+	private String aiTranslate(String query, boolean protectPlayerNames, boolean persist, boolean allowRequests, AiTranslator.RequestPermit permit)
+	{
 		String key = TranslationStore.normalize(query);
 		if (!protectPlayerNames)
 		{
-			return ai.translate(key, persist);
+			return allowRequests ? requestAi(key, persist, permit) : ai.cached(key);
 		}
 		// Cache first: an entry stored under the raw key was translated with nothing to protect, so on a
 		// hit for name-free text this is the very entry the protected path would find - reached without
@@ -595,11 +630,17 @@ public class Translator
 		// and deliberately falls through to the full path below, so cache keys are unchanged.
 		if (ai.cached(key) != null && !hasProtectableName(query))
 		{
-			return ai.translate(key, persist);
+			return allowRequests ? requestAi(key, persist, permit) : ai.cached(key);
 		}
 		ProtectedText p = protectDynamicPlayerNames(query);
-		String zh = ai.translate(TranslationStore.normalize(p.text), persist);
+		String protectedKey = TranslationStore.normalize(p.text);
+		String zh = allowRequests ? requestAi(protectedKey, persist, permit) : ai.cached(protectedKey);
 		return zh == null ? null : p.restore(zh);
+	}
+
+	private String requestAi(String key, boolean persist, AiTranslator.RequestPermit permit)
+	{
+		return permit == null ? ai.translate(key, persist) : ai.translate(key, persist, permit);
 	}
 
 	/** Cheap "does protection change anything?" test, on the client thread. */
@@ -1135,7 +1176,7 @@ public class Translator
 
 	// Sentinel: this requirement segment carries a real name that the AI is still translating, so the
 	// whole task should be retried next tick rather than rendered half-translated.
-	public static final String REQ_PENDING = " PENDING ";
+	public static final String REQ_PENDING = "\000PENDING\000";
 
 	/**
 	 * Translate one diary requirement segment ("65 Slayer", "Started Desert Treasure I", "Eagles' Peak")
