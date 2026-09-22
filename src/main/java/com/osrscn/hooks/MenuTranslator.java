@@ -6,6 +6,8 @@ import com.osrscn.translate.TranslationStore.Category;
 import com.osrscn.translate.Translator;
 import java.util.IdentityHashMap;
 import java.util.Map;
+import java.util.Objects;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.inject.Inject;
@@ -56,8 +58,8 @@ public class MenuTranslator
 	@Inject
 	private GlyphService glyph;
 
-	// Entry identity -> original English and last completed native colour. Identity avoids duplicate
-	// option/target strings sharing state and keeps click restoration exact after base -> hover -> base.
+	// Entry objects are pooled by the client. Identity locates a snapshot; the action and exact last
+	// written strings must still match before that snapshot can repaint or restore anything.
 	private final Map<MenuEntry, EntryState> entryStates = new IdentityHashMap<>();
 
 	private static final class EntryState
@@ -65,16 +67,41 @@ public class MenuTranslator
 		final String option;
 		final String target;
 		final MenuAction type;
+		final int identifier;
+		final int param0;
+		final int param1;
+		final int itemId;
+		final int worldViewId;
+		final Consumer<MenuEntry> onClick;
+		String liveOption;
+		String liveTarget;
 		int optionColor = -1;
 		int targetColor = -1;
 		boolean optionRendered;
 		boolean targetRendered;
 
-		EntryState(String option, String target, MenuAction type)
+		EntryState(MenuEntry entry)
 		{
-			this.option = option;
-			this.target = target;
-			this.type = type;
+			option = entry.getOption();
+			target = entry.getTarget();
+			type = entry.getType();
+			identifier = entry.getIdentifier();
+			param0 = entry.getParam0();
+			param1 = entry.getParam1();
+			itemId = entry.getItemId();
+			worldViewId = entry.getWorldViewId();
+			onClick = entry.onClick();
+			liveOption = option;
+			liveTarget = target;
+		}
+
+		boolean owns(MenuEntry entry)
+		{
+			return entry.getType() == type && entry.getIdentifier() == identifier
+					&& entry.getParam0() == param0 && entry.getParam1() == param1
+					&& entry.getItemId() == itemId && entry.getWorldViewId() == worldViewId
+					&& entry.onClick() == onClick && Objects.equals(entry.getOption(), liveOption)
+					&& Objects.equals(entry.getTarget(), liveTarget);
 		}
 	}
 
@@ -201,9 +228,15 @@ public class MenuTranslator
 	{
 		if (entry.getType().name().startsWith("RUNELITE"))
 		{
+			entryStates.remove(entry);
 			return; // keep custom plugin actions matchable by their English text
 		}
 		EntryState state = entryStates.get(entry);
+		if (state != null && !state.owns(entry))
+		{
+			entryStates.remove(entry);
+			state = null;
+		}
 		if (state == null)
 		{
 			String option = entry.getOption();
@@ -212,7 +245,7 @@ public class MenuTranslator
 			{
 				return;
 			}
-			state = new EntryState(option, target, entry.getType());
+			state = new EntryState(entry);
 			entryStates.put(entry, state);
 		}
 
@@ -222,6 +255,7 @@ public class MenuTranslator
 			if (opt != null)
 			{
 				entry.setOption(opt);
+				state.liveOption = opt;
 				state.optionRendered = true;
 				state.optionColor = rowColor;
 			}
@@ -233,6 +267,7 @@ public class MenuTranslator
 			if (tgt != null)
 			{
 				entry.setTarget(tgt);
+				state.liveTarget = tgt;
 				state.targetRendered = true;
 				state.targetColor = targetColor;
 			}
@@ -250,13 +285,13 @@ public class MenuTranslator
 		{
 			return;
 		}
-		EntryState state = entryStates.get(entry);
-		if (state == null)
+		EntryState state = entryStates.remove(entry);
+		if (state == null || !state.owns(entry))
 		{
 			return;
 		}
-		entry.setOption(state.option);
-		entry.setTarget(state.target);
+		if (state.optionRendered) entry.setOption(state.option);
+		if (state.targetRendered) entry.setTarget(state.target);
 	}
 
 	/**

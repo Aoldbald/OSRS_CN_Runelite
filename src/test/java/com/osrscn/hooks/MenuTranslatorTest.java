@@ -152,6 +152,88 @@ public class MenuTranslatorTest
 		assertEquals(img("Walk here", 0xffffff), entry.getOption());
 	}
 
+
+	private static MenuTranslator opened(MenuFixture f, MenuEntry entry) throws Exception
+	{
+		f.root(entry); MenuTranslator handler = f.handler(); MenuOpened event = new MenuOpened();
+		event.setMenuEntries(new MenuEntry[]{entry}); handler.handleMenuOpened(event); return handler;
+	}
+
+	@Test public void recycledNativeBankClickRetainsItsOptionForBankTags() throws Exception
+	{
+		MenuFixture f = new MenuFixture(100, 200, 160); MenuEntry entry = f.entry("Walk here", "Goblin");
+		MenuTranslator handler = opened(f, entry);
+		// The injected client reuses its entry object for a later native left-click without MenuOpened.
+		entry.setOption("View tab 4").setTarget("").setType(MenuAction.CC_OP).setIdentifier(1).setParam0(4).setParam1(12 << 16);
+		com.osrscn.OsrscnPlugin plugin = new com.osrscn.OsrscnPlugin();
+		inject(plugin, "menuTranslator", handler); inject(plugin, "toggle", new com.osrscn.ToggleService());
+		inject(plugin, "config", Proxy.newProxyInstance(getClass().getClassLoader(),
+			new Class<?>[]{com.osrscn.OsrscnConfig.class}, (p,m,a) -> m.getName().equals("translateMenus") ? true : defaultValue(m.getReturnType())));
+		net.runelite.api.events.MenuOptionClicked click = new net.runelite.api.events.MenuOptionClicked(entry);
+		plugin.onMenuOptionClicked(click);
+		// BankTags 1.12.39 uses this exact option prefix to close the active Inventory Setups filter.
+		assertEquals(true, click.getMenuOption().startsWith("View tab"));
+		assertEquals("", entry.getTarget()); assertEquals(MenuAction.CC_OP, entry.getType());
+		assertEquals(4, entry.getParam0()); assertEquals(12 << 16, entry.getParam1()); assertEquals(false, click.isConsumed());
+	}
+
+	@Test public void recycledPluginActionAndCallbackAreUntouched() throws Exception
+	{
+		MenuFixture f = new MenuFixture(100, 200, 160); MenuEntry entry = f.entry("Walk here", "Goblin");
+		MenuTranslator handler = opened(f, entry); AtomicReference<String> observed = new AtomicReference<>();
+		entry.setType(MenuAction.RUNELITE).setOption("Open setup").setTarget("Test setup").onClick(e -> observed.set(e.getOption()));
+		handler.restoreForClick(entry); entry.onClick().accept(entry);
+		assertEquals("Open setup", observed.get()); assertEquals("Test setup", entry.getTarget());
+	}
+
+	@Test public void changedActionParametersInvalidateIdenticalRenderedText() throws Exception
+	{
+		for (String setter : new String[]{"setIdentifier", "setParam0", "setParam1", "setItemId", "setWorldViewId"}) {
+			MenuFixture f = new MenuFixture(100, 200, 160); MenuEntry entry = f.entry("Walk here", "Goblin");
+			MenuTranslator handler = opened(f, entry); String option = entry.getOption(); String target = entry.getTarget();
+			MenuEntry.class.getMethod(setter, int.class).invoke(entry, 17);
+			handler.restoreForClick(entry); assertEquals(setter, option, entry.getOption()); assertEquals(target, entry.getTarget());
+		}
+	}
+
+	@Test public void foreignTextRewriteWithSameActionIsNotRestoredFromOldState() throws Exception
+	{
+		MenuFixture f = new MenuFixture(100, 200, 160); MenuEntry entry = f.entry("Walk here", "Goblin");
+		MenuTranslator handler = opened(f, entry); entry.setOption("View all items").setTarget("New target");
+		handler.restoreForClick(entry); assertEquals("View all items", entry.getOption()); assertEquals("New target", entry.getTarget());
+	}
+
+	@Test public void reusedEntryDuringOpenMenuDoesNotRepaintOldAction() throws Exception
+	{
+		MenuFixture f = new MenuFixture(100, 200, 160); MenuEntry entry = f.entry("Walk here", "Goblin");
+		MenuTranslator handler = opened(f, entry); entry.setOption("View tab 4").setTarget("");
+		f.mouse.set(new Point(120, 231)); handler.retranslateOpenMenu();
+		assertEquals("View tab 4", entry.getOption()); assertEquals("", entry.getTarget());
+	}
+
+	@Test public void changedCallbackInvalidatesCachedOwnership() throws Exception
+	{
+		MenuFixture f = new MenuFixture(100, 200, 160); MenuEntry entry = f.entry("Walk here", "Goblin");
+		MenuTranslator handler = opened(f, entry); String option = entry.getOption();
+		entry.onClick(e -> { }); handler.restoreForClick(entry); assertEquals(option, entry.getOption());
+	}
+
+	@Test public void restoringOneFieldDoesNotOverwriteAnUntranslatedTarget() throws Exception
+	{
+		MenuFixture f = new MenuFixture(100, 200, 160); MenuEntry entry = f.entry("Walk here", "Unknown target");
+		MenuTranslator handler = opened(f, entry); handler.restoreForClick(entry);
+		assertEquals("Walk here", entry.getOption()); assertEquals("Unknown target", entry.getTarget());
+		entry.setOption("View all items"); handler.restoreForClick(entry); assertEquals("View all items", entry.getOption());
+	}
+
+	@Test public void untranslatedOldEntryCannotOverwriteViewAllItems() throws Exception
+	{
+		MenuFixture f = new MenuFixture(100, 200, 160); MenuEntry entry = f.entry("Unknown option", "Unknown target");
+		MenuTranslator handler = opened(f, entry);
+		entry.setOption("View all items").setTarget("").setType(MenuAction.CC_OP);
+		handler.restoreForClick(entry); assertEquals("View all items", entry.getOption()); assertEquals("", entry.getTarget());
+	}
+
 	private static String img(String english, int color)
 	{
 		return "<img=" + english.hashCode() + "><col=" + Integer.toHexString(color) + ">";
@@ -231,6 +313,7 @@ public class MenuTranslatorTest
 		{
 			AtomicReference<String> opt = new AtomicReference<>(option);
 			AtomicReference<String> tgt = new AtomicReference<>(target);
+			java.util.Map<String, Object> fields = new java.util.HashMap<>(); fields.put("Type", MenuAction.WALK);
 			return (MenuEntry) Proxy.newProxyInstance(getClass().getClassLoader(), new Class<?>[] { MenuEntry.class },
 					(proxy, method, args) ->
 					{
@@ -240,11 +323,17 @@ public class MenuTranslatorTest
 							case "setOption": opt.set((String) args[0]); return proxy;
 							case "getTarget": return tgt.get();
 							case "setTarget": tgt.set((String) args[0]); return proxy;
-							case "getType": return MenuAction.WALK;
+							case "onClick":
+								if (args == null || args.length == 0) return fields.get("callback");
+								fields.put("callback", args[0]); return proxy;
 							case "getSubMenu": return submenu;
 							case "hashCode": return System.identityHashCode(proxy);
 							case "equals": return proxy == args[0];
-							default: return defaultValue(method.getReturnType());
+							default:
+								String name = method.getName();
+								if (name.startsWith("set")) { fields.put(name.substring(3), args[0]); return proxy; }
+								if (name.startsWith("get")) return fields.getOrDefault(name.substring(3), defaultValue(method.getReturnType()));
+								return defaultValue(method.getReturnType());
 						}
 					});
 		}
