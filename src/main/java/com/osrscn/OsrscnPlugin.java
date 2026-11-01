@@ -7,6 +7,7 @@ import com.osrscn.hooks.DialogueHandler;
 import com.osrscn.hooks.InterfaceTranslator;
 import com.osrscn.hooks.MenuTranslator;
 import com.osrscn.hooks.OverheadHandler;
+import com.osrscn.sprite.SpriteOverrides;
 import com.osrscn.translate.AiTranslator;
 import com.osrscn.translate.MissingCollector;
 import com.osrscn.translate.MissingUploader;
@@ -93,6 +94,8 @@ public class OsrscnPlugin extends Plugin
 	private ToggleOverlay toggleOverlay;
 	@Inject
 	private LoginBanner loginBanner;
+	@Inject
+	private SpriteOverrides spriteOverrides;
 	@Inject
 	private ClientToolbar clientToolbar;
 	@Inject
@@ -278,6 +281,7 @@ public class OsrscnPlugin extends Plugin
 		overlayManager.add(hoverTooltipOverlay);
 		overlayManager.add(toggleOverlay);
 		loginBanner.apply();
+		spriteOverrides.install();
 		addPanel();
 		// say so whenever collected words actually leave the machine: silence looks broken, and the
 		// person the data belongs to should be able to see it happen
@@ -299,6 +303,7 @@ public class OsrscnPlugin extends Plugin
 		overlayManager.remove(hoverTooltipOverlay);
 		overlayManager.remove(toggleOverlay);
 		loginBanner.remove();
+		spriteOverrides.uninstall();
 		if (navButton != null)
 		{
 			panel.stop();
