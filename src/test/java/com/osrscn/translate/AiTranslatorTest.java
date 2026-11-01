@@ -71,6 +71,7 @@ public class AiTranslatorTest
 		volatile boolean enabled = true;
 		volatile int pace;
 		volatile int concurrency = 4;
+		volatile String extraHeaders = "";
 		Runnable newCallHook;
 		Consumer<Pending> enqueueHook;
 		Runnable modelReadHook;
@@ -95,6 +96,7 @@ public class AiTranslatorTest
 							case "apiKey": return "fictional-not-a-key";
 							case "aiConcurrency": return concurrency;
 							case "aiPaceMs": return pace;
+							case "apiExtraHeaders": return extraHeaders;
 							case "debugMonitor": return false;
 							default: throw new AssertionError("Unexpected config read: " + m.getName());
 						}
@@ -494,5 +496,97 @@ public class AiTranslatorTest
 		assertTrue(f.file("fixture-A").exists()); assertFalse(f.file("fixture-B").exists());
 		assertEquals(TEXT + "\tstored A\n", Files.readString(f.file("fixture-A").toPath()));
 		assertNull(f.ai.cached(TEXT));
+	}
+
+	@Test public void apiBackendRequestCarriesConfiguredCustomHeaders() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.OPENAI;
+		f.extraHeaders = "x-opencode-session: OSRSCN; User-Agent: OSRSCN";
+		Pending pending = f.request(false);
+		assertEquals("OSRSCN", pending.request.header("x-opencode-session"));
+		assertEquals("OSRSCN", pending.request.header("User-Agent"));
+		assertEquals("Bearer fictional-not-a-key", pending.request.header("Authorization"));
+	}
+
+	@Test public void ollamaRequestCarriesConfiguredCustomHeaders() throws Exception
+	{
+		Fixture f = new Fixture();
+		f.extraHeaders = "x-opencode-session: OSRSCN; User-Agent: OSRSCN";
+		Pending pending = f.request(false);
+		assertEquals("OSRSCN", pending.request.header("x-opencode-session"));
+		assertEquals("OSRSCN", pending.request.header("User-Agent"));
+		assertNull(pending.request.header("Authorization"));
+	}
+
+	@Test public void blankCustomHeadersAddNothing() throws Exception
+	{
+		for (String spec : new String[] { "", "   ", null })
+		{
+			Fixture f = new Fixture(); f.extraHeaders = spec;
+			Pending pending = f.request(false);
+			assertNull(spec, pending.request.header("x-opencode-session"));
+			assertNull(spec, pending.request.header("User-Agent"));
+			assertTrue(spec, pending.request.headers().names().isEmpty());
+		}
+	}
+
+	@Test public void apiTestConnectionCarriesConfiguredCustomHeaders() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.OPENAI;
+		f.extraHeaders = "x-opencode-session: OSRSCN";
+		AtomicReference<String> result = new AtomicReference<>();
+		f.ai.testConnection((ok, msg) -> { if (ok) result.set(msg); });
+		assertEquals(1, f.calls.size());
+		Pending pending = f.calls.get(0);
+		assertTrue(pending.request.url().toString().endsWith("/models"));
+		assertEquals("OSRSCN", pending.request.header("x-opencode-session"));
+		assertEquals("Bearer fictional-not-a-key", pending.request.header("Authorization"));
+		pending.respond(200, ResponseBody.create(MediaType.parse("application/json"), "{\"data\":[]}"));
+		assertEquals("连接成功，密钥有效", result.get());
+	}
+
+	@Test public void ollamaTestConnectionCarriesConfiguredCustomHeaders() throws Exception
+	{
+		Fixture f = new Fixture();
+		f.extraHeaders = "x-opencode-session: OSRSCN";
+		AtomicReference<String> result = new AtomicReference<>();
+		f.ai.testConnection((ok, msg) -> { if (ok) result.set(msg); });
+		assertEquals(1, f.calls.size());
+		Pending pending = f.calls.get(0);
+		assertTrue(pending.request.url().toString().endsWith("/api/tags"));
+		assertEquals("OSRSCN", pending.request.header("x-opencode-session"));
+		assertNull(pending.request.header("Authorization"));
+		pending.respond(200, ResponseBody.create(MediaType.parse("application/json"), "{\"models\":[]}"));
+		assertEquals("连接成功", result.get());
+	}
+
+	@Test public void invalidHeaderEntriesAreSkippedWithoutFailingTranslation() throws Exception
+	{
+		Fixture f = new Fixture();
+		f.extraHeaders = "Bad Header: x; Authorization: y; x-opencode-session: OSRSCN";
+		Pending pending = f.request(false);
+		assertNull(pending.request.header("Bad Header"));
+		assertNull(pending.request.header("Authorization"));
+		assertEquals("OSRSCN", pending.request.header("x-opencode-session"));
+		pending.success("header-safe");
+		assertEquals("header-safe", f.ai.cached(TEXT));
+		assertEquals(0, f.failures()); assertEquals(0, f.value("backoffUntil"));
+	}
+
+	@Test public void headerConfigChangeKeepsCacheAndResetsFailures() throws Exception
+	{
+		Fixture f = new Fixture(); f.extraHeaders = "x-opencode-session: OLD";
+		f.request(false).success("cached translation");
+		f.backoff();
+		f.extraHeaders = "x-opencode-session: NEW";
+		f.event("apiExtraHeaders");
+		assertEquals(0, f.failures()); assertEquals(0, f.value("backoffUntil"));
+		// Headers are not cache identity: the existing translation still hits without a new request.
+		assertEquals("cached translation", f.ai.translate(TEXT, false));
+		assertEquals(1, f.calls.size());
+		String other = TEXT + " Another fictional gate.";
+		assertNull(f.ai.translate(other, true));
+		assertEquals(2, f.calls.size());
+		assertEquals("NEW", f.calls.get(1).request.header("x-opencode-session"));
 	}
 }

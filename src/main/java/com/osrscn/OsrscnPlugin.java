@@ -583,6 +583,12 @@ public class OsrscnPlugin extends Plugin
 			// Synchronous invalidation retains rapid model round trips before the next lookup.
 			aiTranslator.configurationChanged();
 		}
+		if ("apiExtraHeaders".equals(key))
+		{
+			// Headers are not part of the cache/model identity: keep the cache, just re-parse the
+			// snapshot and drop any backoff the old headers may have caused.
+			aiTranslator.requestHeadersChanged();
+		}
 		if ("playerChatMode".equals(key) || "groupChatMode".equals(key))
 		{
 			// ConfigChanged is synchronous on its caller's thread. Record every transition now,

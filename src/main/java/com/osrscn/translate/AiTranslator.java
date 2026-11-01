@@ -11,6 +11,8 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.Collections;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -87,6 +89,12 @@ public class AiTranslator
 	private long generation; // guarded by this; model round trips never reuse request ownership
 	private File cacheFile;
 	private volatile long lastDispatch;
+
+	// Custom request headers (apiExtraHeaders) re-parsed only when the configured text changes. The
+	// pair is written map-then-spec and replaced wholesale, so no monitor is needed (testConnection
+	// may read it from the EDT).
+	private volatile String parsedHeadersSpec;
+	private volatile Map<String, String> parsedHeaders = Collections.emptyMap();
 
 	// Back off when the backend keeps failing (Ollama down, API unreachable) instead of
 	// re-firing a request on every lookup miss.
@@ -329,6 +337,19 @@ public class AiTranslator
 		lastDispatch = 0;
 	}
 
+	/**
+	 * Re-read the custom request headers on the next request. Headers are presentation, not identity:
+	 * cached translations and in-flight requests stay valid, so only the parsed snapshot and a stale
+	 * backoff (a previous 4xx may have been caused by the old headers) are cleared.
+	 */
+	public void requestHeadersChanged()
+	{
+		parsedHeadersSpec = null;
+		parsedHeaders = Collections.emptyMap();
+		failStreak.set(0);
+		backoffUntil = 0;
+	}
+
 	private static final class RequestState
 	{
 		final long generation;
@@ -543,16 +564,42 @@ public class AiTranslator
 		return config.ollamaUrl().replaceAll("/+$", "") + "/api/chat";
 	}
 
+	/**
+	 * Parsed {@code apiExtraHeaders}, re-parsed only when the configured text changes. Never null; an
+	 * empty map means no extra headers. Names only are logged - values are user settings that may be
+	 * sensitive (the config item is deliberately not masked, so it may hold a pasted key by mistake).
+	 */
+	private Map<String, String> extraHeaders()
+	{
+		String spec = config.apiExtraHeaders();
+		if (spec == null)
+		{
+			spec = "";
+		}
+		if (!spec.equals(parsedHeadersSpec))
+		{
+			Map<String, String> parsed = ExtraHeaders.parse(spec);
+			parsedHeaders = parsed;
+			parsedHeadersSpec = spec;
+			if (!parsed.isEmpty())
+			{
+				log.info("OSRSCN AI: applied custom request headers {}", parsed.keySet());
+			}
+		}
+		return parsedHeaders;
+	}
+
 	private Request buildOllamaRequest(String url, JsonArray messages, String model)
 	{
 		JsonObject body = new JsonObject();
 		body.addProperty("model", model);
 		body.addProperty("stream", false);
 		body.add("messages", messages);
-		return new Request.Builder()
+		Request.Builder builder = new Request.Builder()
 				.url(url)
-				.post(RequestBody.create(JSON, gson.toJson(body)))
-				.build();
+				.post(RequestBody.create(JSON, gson.toJson(body)));
+		ExtraHeaders.apply(extraHeaders(), builder);
+		return builder.build();
 	}
 
 	/** Base API address (auto-filled from the provider preset) with {@code /chat/completions} appended. */
@@ -579,11 +626,11 @@ public class AiTranslator
 		body.addProperty("model", model);
 		body.addProperty("stream", false);
 		body.add("messages", messages);
-		return new Request.Builder()
+		Request.Builder builder = new Request.Builder()
 				.url(url)
-				.addHeader("Authorization", "Bearer " + key)
-				.post(RequestBody.create(JSON, gson.toJson(body)))
-				.build();
+				.post(RequestBody.create(JSON, gson.toJson(body)));
+		ExtraHeaders.apply(extraHeaders(), builder);
+		return builder.addHeader("Authorization", "Bearer " + key).build();
 	}
 
 	/**
@@ -606,7 +653,9 @@ public class AiTranslator
 				onResult.accept(false, "请先填写 API 地址和密钥");
 				return;
 			}
-			req = new Request.Builder().url(base + "/models").header("Authorization", "Bearer " + key).get().build();
+			Request.Builder builder = new Request.Builder().url(base + "/models");
+			ExtraHeaders.apply(extraHeaders(), builder);
+			req = builder.header("Authorization", "Bearer " + key).get().build();
 		}
 		else
 		{
@@ -616,7 +665,9 @@ public class AiTranslator
 				onResult.accept(false, "请先填写 Ollama 地址");
 				return;
 			}
-			req = new Request.Builder().url(base + "/api/tags").get().build();
+			Request.Builder builder = new Request.Builder().url(base + "/api/tags");
+			ExtraHeaders.apply(extraHeaders(), builder);
+			req = builder.get().build();
 		}
 		httpClient.newCall(req).enqueue(new Callback()
 		{

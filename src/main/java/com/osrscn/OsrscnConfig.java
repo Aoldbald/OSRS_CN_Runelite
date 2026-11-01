@@ -394,12 +394,28 @@ public interface OsrscnConfig extends Config
 	}
 
 	@ConfigItem(
+			keyName = "apiExtraHeaders",
+			name = "附加请求头",
+			description = "部分供应商要求每个请求带特定 header。例如 OpenCode Go 要求 x-opencode-session（固定不变的 session id），"
+					+ "并建议自定义 User-Agent。<br>session id 和 User-Agent 都可以随意填写，但只能用 ASCII、不要含分号。"
+					+ "<br>例：x-opencode-session: OSRSCN; User-Agent: OSRSCN"
+					+ "<br>留空＝不发送任何附加请求头（和以前完全一样）。"
+					+ "Host、Content-Type、Authorization 等保留头会被忽略。此栏不遮挡，请勿粘贴 API 密钥。填完点击别处才会保存。",
+			section = ai,
+			position = 13
+	)
+	default String apiExtraHeaders()
+	{
+		return "";
+	}
+
+	@ConfigItem(
 			keyName = "testConnection",
 			name = "测试连接（点一下）",
 			description = "勾一下立即测试当前「AI 后端」是否连通（在线 API 还会验密钥），不消耗 token。"
 					+ "勾后会自动弹回，结果用弹窗提示。",
 			section = ai,
-			position = 13
+			position = 14
 	)
 	default boolean testConnection()
 	{
