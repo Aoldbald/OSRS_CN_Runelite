@@ -36,8 +36,9 @@ you turn this on and configure a server. Player names are never sent.
 
 A few providers require every request to carry specific headers: OpenCode Go, for
 example, requires `x-opencode-session` (a fixed, unchanging session id) and
-recommends using your own `User-Agent`. Fill those in under **AI 翻译 → 附加请求头**
-(AI translation → extra request headers) in the plugin settings, as
+recommends using your own `User-Agent`. Fill those in under
+**AI 后端：在线 API → 附加请求头**
+(AI backend: online API → extra request headers) in the plugin settings, as
 `Name: Value; Name2: Value2` — for example
 `x-opencode-session: OSRSCN; User-Agent: OSRSCN`. Values must be ASCII and must not
 contain a semicolon. Leave the field blank to send no extra headers at all (exactly
@@ -134,7 +135,7 @@ AI 翻译**默认关闭**。开启后，本地查表缺失的游戏英文文本�
 
 少数供应商要求每个请求都带特定 header：例如 OpenCode Go 要求 `x-opencode-session`
 （固定不变的 session id），并建议自定义 `User-Agent`。在插件设置的
-**AI 翻译 → 附加请求头** 里填写，格式为 `名称: 值; 名称2: 值2`，例如
+**AI 后端：在线 API → 附加请求头** 里填写，格式为 `名称: 值; 名称2: 值2`，例如
 `x-opencode-session: OSRSCN; User-Agent: OSRSCN`。值只能用 ASCII、且不要含分号；
 留空＝不发送任何附加请求头（和以前完全一样）。这一栏**不遮挡**、以明文保存在本地
 RuneLite 配置里，请不要把 API 密钥填进去。
