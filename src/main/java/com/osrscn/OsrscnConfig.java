@@ -329,8 +329,11 @@ public interface OsrscnConfig extends Config
 	@ConfigItem(
 			keyName = "testConnection",
 			name = "测试连接（点一下）",
-			description = "勾一下立即测试当前「AI 后端」是否连通（在线 API 还会验密钥），不消耗 token。"
-					+ "勾后会自动弹回，结果用弹窗提示。",
+			description = "勾一下立即测试当前「AI 后端」是否连通（在线 API 还会验密钥），结果用弹窗提示。"
+					+ "先只查模型清单，不消耗 token；若供应商不提供 /models，会补发一个最小请求验证"
+					+ "（约 1 token；个别供应商不接受长度上限时会再试一次）。"
+					+ "<br>测试后该项会自动重置为未勾选；RuneLite 设置面板不会即时刷新这个勾选框，"
+					+ "<br>重新打开本页即可看到。侧边栏「翻译 → 测试 AI 连接」有同功能按钮，结果直接显示在侧边栏。",
 			section = aiCommon,
 			position = 7
 	)

@@ -12,6 +12,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -69,6 +70,11 @@ public class AiTranslator
 	@Inject
 	private OkHttpClient httpClient;
 	private OkHttpClient ollamaHttpClient; // shares the injected dispatcher and connection pool
+	// Lazily derived from httpClient for connectivity checks. Volatile and deliberately unlocked:
+	// testConnection runs on the EDT and must not take this monitor (ensureLoaded/persistToDisk hold it
+	// across disk IO). A racing first call may build a second client, which is benign - both share the
+	// injected dispatcher and connection pool, and the last instance written simply wins.
+	private volatile OkHttpClient testHttpClient;
 
 	@Inject
 	private OsrscnConfig config;
@@ -634,41 +640,38 @@ public class AiTranslator
 	}
 
 	/**
-	 * Check connectivity to the active backend without spending any tokens: lists models
-	 * (Ollama {@code /api/tags}, OpenAI {@code /models}) - no text is generated. The result lands on an
-	 * OkHttp thread, so the Swing caller must marshal {@code onResult} back to the EDT.
+	 * Check connectivity to the active backend. Ollama only lists tags ({@code /api/tags}). Online APIs
+	 * use two steps: list models first (no tokens), then, when the provider does not serve
+	 * {@code /models}, send one minimal completion (about one token). The result lands on an OkHttp
+	 * thread, so the Swing caller must marshal {@code onResult} back to the EDT.
 	 *
-	 * @param onResult (ok, message): ok=true on a 2xx reply, with a short human-readable message.
+	 * @param onResult (ok, message): ok=true when the backend answered and the key/model are usable,
+	 *                 with a short human-readable message.
 	 */
 	public void testConnection(java.util.function.BiConsumer<Boolean, String> onResult)
 	{
-		boolean api = config.aiBackend() == AiBackend.OPENAI;
-		Request req;
-		if (api)
+		if (config.aiBackend() == AiBackend.OPENAI)
 		{
-			String base = config.apiUrl().trim().replaceAll("/+$", "");
-			String key = config.apiKey().trim();
-			if (base.isEmpty() || key.isEmpty())
-			{
-				onResult.accept(false, "请先填写 API 地址和密钥");
-				return;
-			}
-			Request.Builder builder = new Request.Builder().url(base + "/models");
-			ExtraHeaders.apply(extraHeaders(), builder);
-			req = builder.header("Authorization", "Bearer " + key).get().build();
+			testApiConnection(onResult);
 		}
 		else
 		{
-			String base = config.ollamaUrl().trim().replaceAll("/+$", "");
-			if (base.isEmpty())
-			{
-				onResult.accept(false, "请先填写 Ollama 地址");
-				return;
-			}
-			Request.Builder builder = new Request.Builder().url(base + "/api/tags");
-			ExtraHeaders.apply(extraHeaders(), builder);
-			req = builder.get().build();
+			testOllamaConnection(onResult);
 		}
+	}
+
+	/** Local backend: unchanged single-step tag listing. */
+	private void testOllamaConnection(java.util.function.BiConsumer<Boolean, String> onResult)
+	{
+		String base = config.ollamaUrl().trim().replaceAll("/+$", "");
+		if (base.isEmpty())
+		{
+			onResult.accept(false, "请先填写 Ollama 地址");
+			return;
+		}
+		Request.Builder builder = new Request.Builder().url(base + "/api/tags");
+		ExtraHeaders.apply(extraHeaders(), builder);
+		Request req = builder.get().build();
 		httpClient.newCall(req).enqueue(new Callback()
 		{
 			@Override
@@ -684,7 +687,7 @@ public class AiTranslator
 				{
 					if (r.isSuccessful())
 					{
-						onResult.accept(true, api ? "连接成功，密钥有效" : "连接成功");
+						onResult.accept(true, "连接成功");
 					}
 					else if (r.code() == 401 || r.code() == 403)
 					{
@@ -697,6 +700,253 @@ public class AiTranslator
 				}
 			}
 		});
+	}
+
+	/**
+	 * Online backend step 1: {@code GET {apiUrl}/models}. A key/auth/rate-limit answer is definitive and
+	 * stops here; any other failure (or a 2xx that is not a model list) falls through to the one-token
+	 * completion, because some OpenAI-compatible providers do not serve {@code /models} at all.
+	 */
+	private void testApiConnection(java.util.function.BiConsumer<Boolean, String> onResult)
+	{
+		String base = config.apiUrl().trim().replaceAll("/+$", "");
+		String key = config.apiKey().trim();
+		if (base.isEmpty() || key.isEmpty())
+		{
+			onResult.accept(false, "请先填写 API 地址和密钥");
+			return;
+		}
+		Request.Builder builder = new Request.Builder().url(base + "/models");
+		ExtraHeaders.apply(extraHeaders(), builder);
+		Request req = builder.header("Authorization", "Bearer " + key).get().build();
+		testClient().newCall(req).enqueue(new Callback()
+		{
+			@Override
+			public void onFailure(Call call, IOException e)
+			{
+				onResult.accept(false, "连接失败：" + e.getMessage());
+			}
+
+			@Override
+			public void onResponse(Call call, Response response)
+			{
+				try (Response r = response)
+				{
+					if (r.isSuccessful())
+					{
+						Set<String> models = modelIds(r.body() == null ? "" : r.body().string());
+						if (models == null)
+						{
+							testApiCompletion(onResult); // not a model list: probe with a real request
+							return;
+						}
+						String message = "连接成功，密钥有效";
+						String model = config.apiModel().trim();
+						if (model.isEmpty())
+						{
+							message += "（未填写 API 模型）";
+						}
+						else if (!models.contains(model))
+						{
+							message += "（模型清单中未见 " + model + "，请确认模型名）";
+						}
+						onResult.accept(true, message);
+					}
+					else if (r.code() == 401 || r.code() == 403)
+					{
+						onResult.accept(false, "密钥无效或无权限 (HTTP " + r.code() + ")");
+					}
+					else if (r.code() == 429)
+					{
+						onResult.accept(false, "连接正常但被限流 (HTTP 429)");
+					}
+					else
+					{
+						testApiCompletion(onResult); // provider may not expose /models: verify with a request
+					}
+				}
+				catch (IOException e)
+				{
+					onResult.accept(false, "连接失败：" + e.getMessage());
+				}
+			}
+		});
+	}
+
+	/**
+	 * Online backend step 2: one minimal completion against the same URL/auth/header rules as a real
+	 * translation request. Only reached when the model list is missing or not a model list.
+	 */
+	private void testApiCompletion(java.util.function.BiConsumer<Boolean, String> onResult)
+	{
+		String url = apiEndpoint();
+		String key = config.apiKey().trim();
+		String model = config.apiModel().trim();
+		if (url.isEmpty() || key.isEmpty())
+		{
+			onResult.accept(false, "请先填写 API 地址和密钥");
+			return;
+		}
+		if (model.isEmpty())
+		{
+			onResult.accept(false, "请先填写 API 模型");
+			return;
+		}
+		sendProbe(onResult, url, key, model, true);
+	}
+
+	/**
+	 * Sends the probe completion. The first attempt caps the output at one token; a provider that
+	 * rejects that parameter (400/422: newer OpenAI models want {@code max_completion_tokens}, some
+	 * models require a minimum budget) gets exactly one retry with the cap omitted, which is legal for
+	 * every chat-completions dialect. Any other failure is definitive and is never retried.
+	 */
+	private void sendProbe(java.util.function.BiConsumer<Boolean, String> onResult,
+			String url, String key, String model, boolean capOutput)
+	{
+		JsonArray messages = new JsonArray();
+		messages.add(message("user", "hi"));
+		JsonObject body = new JsonObject();
+		body.addProperty("model", model);
+		body.add("messages", messages);
+		if (capOutput)
+		{
+			body.addProperty("max_tokens", 1);
+		}
+		body.addProperty("stream", false);
+		Request.Builder builder = new Request.Builder()
+				.url(url)
+				.post(RequestBody.create(JSON, gson.toJson(body)));
+		ExtraHeaders.apply(extraHeaders(), builder);
+		Request req = builder.addHeader("Authorization", "Bearer " + key).build();
+		testClient().newCall(req).enqueue(new Callback()
+		{
+			@Override
+			public void onFailure(Call call, IOException e)
+			{
+				onResult.accept(false, "连接失败：" + e.getMessage());
+			}
+
+			@Override
+			public void onResponse(Call call, Response response)
+			{
+				try (Response r = response)
+				{
+					if (r.code() == 200)
+					{
+						onResult.accept(true, "连接成功，模型可用");
+						return;
+					}
+					if (r.code() == 401 || r.code() == 403)
+					{
+						onResult.accept(false, "密钥无效或无权限 (HTTP " + r.code() + ")");
+						return;
+					}
+					if (r.code() == 429)
+					{
+						onResult.accept(false, "连接正常但被限流 (HTTP 429)");
+						return;
+					}
+					if (capOutput && (r.code() == 400 || r.code() == 422))
+					{
+						sendProbe(onResult, url, key, model, false); // parameter rejected: retry uncapped
+						return;
+					}
+					String detail = errorMessage(r.body() == null ? "" : r.body().string());
+					onResult.accept(false, detail == null
+							? "连接失败 (HTTP " + r.code() + ")"
+							: "连接失败：" + detail);
+				}
+				catch (IOException e)
+				{
+					onResult.accept(false, "连接失败：" + e.getMessage());
+				}
+			}
+		});
+	}
+
+	/** Lazily derived client for connectivity checks; never mutates the shared {@code httpClient}. */
+	private OkHttpClient testClient()
+	{
+		OkHttpClient client = testHttpClient;
+		if (client == null)
+		{
+			client = httpClient.newBuilder()
+					.readTimeout(30_000, TimeUnit.MILLISECONDS)
+					.build();
+			testHttpClient = client;
+		}
+		return client;
+	}
+
+	/**
+	 * @return the model ids from an OpenAI-style {@code /models} body, or null when the body is not a
+	 *         model list at all (an error page, plain text, or another provider's schema).
+	 */
+	private Set<String> modelIds(String body)
+	{
+		try
+		{
+			JsonObject root = gson.fromJson(body, JsonObject.class);
+			if (root == null || !root.has("data") || !root.get("data").isJsonArray())
+			{
+				return null;
+			}
+			JsonArray data = root.getAsJsonArray("data");
+			Set<String> ids = new HashSet<>();
+			for (int i = 0; i < data.size(); i++)
+			{
+				if (data.get(i).isJsonObject())
+				{
+					JsonObject entry = data.get(i).getAsJsonObject();
+					if (entry.has("id") && entry.get("id").isJsonPrimitive())
+					{
+						ids.add(entry.get("id").getAsString());
+					}
+				}
+			}
+			return ids;
+		}
+		catch (RuntimeException e)
+		{
+			return null; // not JSON / not a model list: the caller falls back to a completion probe
+		}
+	}
+
+	/** Cap for the server error detail shown in a dialog - providers may return whole paragraphs. */
+	private static final int ERROR_DETAIL_MAX = 200;
+
+	/**
+	 * @return the {@code error.message} detail of an OpenAI-style error body, or null when absent.
+	 *         Cleaned for a dialog: CR/LF collapse to spaces and the text is capped at
+	 *         {@link #ERROR_DETAIL_MAX} characters with an ellipsis.
+	 */
+	private String errorMessage(String body)
+	{
+		try
+		{
+			JsonObject root = gson.fromJson(body, JsonObject.class);
+			if (root != null && root.has("error") && root.get("error").isJsonObject())
+			{
+				JsonObject error = root.getAsJsonObject("error");
+				if (error.has("message") && error.get("message").isJsonPrimitive())
+				{
+					String detail = error.get("message").getAsString().trim()
+							.replaceAll("[\\r\\n]+", " ");
+					if (!detail.isEmpty())
+					{
+						return detail.length() > ERROR_DETAIL_MAX
+								? detail.substring(0, ERROR_DETAIL_MAX) + "…"
+								: detail;
+					}
+				}
+			}
+		}
+		catch (RuntimeException e)
+		{
+			return null;
+		}
+		return null;
 	}
 
 	/** Parse the assistant reply from either Ollama ({@code /api/chat}) or OpenAI-style responses. */

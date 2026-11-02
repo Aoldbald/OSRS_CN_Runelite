@@ -12,6 +12,7 @@ import com.osrscn.ui.OsrscnPanel;
 import java.io.File;
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -72,6 +73,9 @@ public class AiTranslatorTest
 		volatile int pace;
 		volatile int concurrency = 4;
 		volatile String extraHeaders = "";
+		final AtomicReference<Boolean> connected = new AtomicReference<>();
+		final AtomicReference<String> connectMessage = new AtomicReference<>();
+		final AtomicInteger connectResults = new AtomicInteger();
 		Runnable newCallHook;
 		Consumer<Pending> enqueueHook;
 		Runnable modelReadHook;
@@ -110,11 +114,33 @@ public class AiTranslatorTest
 						if (!m.getName().equals("execute")) throw new AssertionError(m.getName());
 						preload.add((Runnable) args[0]); return null;
 					}));
-			inject(ai, "httpClient", new OkHttpClient()
+			OkHttpClient injectedClient = transportClient(false);
+			inject(ai, "httpClient", injectedClient);
+			inject(ai, "ollamaHttpClient", injectedClient);
+			// testConnection must run through the derived test client, so it gets its own transport
+			// instance: the recorded Pending then proves which client actually issued the request.
+			inject(ai, "testHttpClient", transportClient(true));
+			inject(plugin, "aiTranslator", ai);
+			inject(plugin, "config", config);
+			// Allocate only the unrelated Swing shell, without constructing UI/config stores or timers.
+			// Its real onConfigChanged runs a no-change refresh against empty in-memory history.
+			Class<?> unsafeClass = Class.forName("sun.misc.Unsafe");
+			Field singleton = unsafeClass.getDeclaredField("theUnsafe"); singleton.setAccessible(true);
+			Object panel = unsafeClass.getMethod("allocateInstance", Class.class)
+					.invoke(singleton.get(null), OsrscnPanel.class);
+			inject(panel, "config", config); inject(panel, "history", new DialogueHistory());
+			inject(plugin, "panel", panel);
+		}
+
+		/** Socket-free transport; {@code viaTest} marks requests issued through the derived test client. */
+		private OkHttpClient transportClient(final boolean viaTest)
+		{
+			return new OkHttpClient()
 			{
 				@Override public Call newCall(Request request)
 				{
 					Pending pending = new Pending(request);
+					pending.viaTestClient = viaTest;
 					Runnable hook = newCallHook; newCallHook = null;
 					if (hook != null) hook.run();
 					pending.call = (Call) Proxy.newProxyInstance(getClass().getClassLoader(),
@@ -129,18 +155,7 @@ public class AiTranslatorTest
 							});
 					return pending.call;
 				}
-			});
-			inject(ai, "ollamaHttpClient", field(ai, "httpClient"));
-			inject(plugin, "aiTranslator", ai);
-			inject(plugin, "config", config);
-			// Allocate only the unrelated Swing shell, without constructing UI/config stores or timers.
-			// Its real onConfigChanged runs a no-change refresh against empty in-memory history.
-			Class<?> unsafeClass = Class.forName("sun.misc.Unsafe");
-			Field singleton = unsafeClass.getDeclaredField("theUnsafe"); singleton.setAccessible(true);
-			Object panel = unsafeClass.getMethod("allocateInstance", Class.class)
-					.invoke(singleton.get(null), OsrscnPanel.class);
-			inject(panel, "config", config); inject(panel, "history", new DialogueHistory());
-			inject(plugin, "panel", panel);
+			};
 		}
 
 		void event(String key)
@@ -155,6 +170,16 @@ public class AiTranslatorTest
 		{
 			model = next;
 			event(backend == AiBackend.OPENAI ? "apiModel" : "ollamaModel");
+		}
+
+		/** Runs one connection probe and counts every completion, so a double report is observable. */
+		void connect()
+		{
+			ai.testConnection((ok, msg) ->
+			{
+				connectResults.incrementAndGet();
+				connected.set(ok); connectMessage.set(msg);
+			});
 		}
 
 		Pending request(boolean persist)
@@ -180,6 +205,7 @@ public class AiTranslatorTest
 		final Request request;
 		Call call;
 		Callback callback;
+		boolean viaTestClient;
 		Pending(Request request) { this.request = request; }
 		void success(String content) throws Exception
 		{
@@ -201,10 +227,14 @@ public class AiTranslatorTest
 			callback.onResponse(call, new Response.Builder().request(request).protocol(Protocol.HTTP_1_1)
 					.code(status).message("fixture").body(body).build());
 		}
-		String model() throws Exception
+		JsonObject json() throws Exception
 		{
 			Buffer buffer = new Buffer(); request.body().writeTo(buffer);
-			return new Gson().fromJson(buffer.readUtf8(), JsonObject.class).get("model").getAsString();
+			return new Gson().fromJson(buffer.readUtf8(), JsonObject.class);
+		}
+		String model() throws Exception
+		{
+			return json().get("model").getAsString();
 		}
 	}
 
@@ -541,7 +571,8 @@ public class AiTranslatorTest
 		assertTrue(pending.request.url().toString().endsWith("/models"));
 		assertEquals("OSRSCN", pending.request.header("x-opencode-session"));
 		assertEquals("Bearer fictional-not-a-key", pending.request.header("Authorization"));
-		pending.respond(200, ResponseBody.create(MediaType.parse("application/json"), "{\"data\":[]}"));
+		pending.respond(200, ResponseBody.create(MediaType.parse("application/json"),
+				"{\"data\":[{\"id\":\"fixture-A\"}]}"));
 		assertEquals("连接成功，密钥有效", result.get());
 	}
 
@@ -558,6 +589,232 @@ public class AiTranslatorTest
 		assertNull(pending.request.header("Authorization"));
 		pending.respond(200, ResponseBody.create(MediaType.parse("application/json"), "{\"models\":[]}"));
 		assertEquals("连接成功", result.get());
+	}
+
+	@Test public void apiTestConnectionFallsBackToMinimalCompletionWhenModelsUnavailable() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.OPENAI;
+		f.extraHeaders = "x-opencode-session: OSRSCN; User-Agent: OSRSCN";
+		f.connect();
+		assertEquals(1, f.calls.size());
+		Pending models = f.calls.get(0);
+		assertEquals("GET", models.request.method());
+		assertTrue(models.request.url().toString().endsWith("/models"));
+		assertEquals("OSRSCN", models.request.header("x-opencode-session"));
+		assertEquals("Bearer fictional-not-a-key", models.request.header("Authorization"));
+		models.respond(404, ResponseBody.create(MediaType.parse("application/json"), "{\"error\":\"not found\"}"));
+		// Step 2: a real one-token completion using the same URL/auth/header rules as translation.
+		assertEquals(2, f.calls.size());
+		Pending completion = f.calls.get(1);
+		assertEquals("POST", completion.request.method());
+		assertEquals("http://127.0.0.1:1/fixture/chat/completions", completion.request.url().toString());
+		assertEquals("Bearer fictional-not-a-key", completion.request.header("Authorization"));
+		assertEquals("OSRSCN", completion.request.header("x-opencode-session"));
+		assertEquals("OSRSCN", completion.request.header("User-Agent"));
+		JsonObject body = completion.json();
+		assertEquals("fixture-A", body.get("model").getAsString());
+		assertEquals(1, body.get("max_tokens").getAsInt());
+		assertFalse(body.get("stream").getAsBoolean());
+		assertEquals("hi", body.getAsJsonArray("messages").get(0).getAsJsonObject()
+				.get("content").getAsString());
+		completion.respond(200, ResponseBody.create(MediaType.parse("application/json"), "{\"choices\":[]}"));
+		assertEquals(Boolean.TRUE, f.connected.get());
+		assertEquals("连接成功，模型可用", f.connectMessage.get());
+		assertEquals("the probe must report exactly once", 1, f.connectResults.get());
+		// Isolation: a connectivity probe must not feed translation backoff / in-flight bookkeeping.
+		assertEquals(0, f.failures());
+		assertEquals(0, f.value("backoffUntil"));
+		assertEquals(0, f.ai.inFlightCount());
+	}
+
+	@Test public void connectionProbesUseTheDerivedTestClientNotTheInjectedOne() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.OPENAI;
+		f.connect();
+		assertEquals(1, f.calls.size());
+		assertTrue("step 1 must use the derived test client", f.calls.get(0).viaTestClient);
+		f.calls.get(0).respond(404, ResponseBody.create(MediaType.parse("application/json"), "{}"));
+		assertEquals(2, f.calls.size());
+		assertTrue("step 2 must use the derived test client", f.calls.get(1).viaTestClient);
+		f.calls.get(1).respond(200, ResponseBody.create(MediaType.parse("application/json"), "{}"));
+		// Ordinary translation keeps the injected client, so the probe's isolation stays pinned.
+		Pending translation = f.request(false);
+		assertFalse("translation must keep the injected client", translation.viaTestClient);
+	}
+
+	@Test public void apiTestConnectionInvalidKeyStopsBeforeCompletionProbe() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.OPENAI;
+		f.connect();
+		f.calls.get(0).respond(401, ResponseBody.create(MediaType.parse("application/json"),
+				"{\"error\":{\"message\":\"invalid key\"}}"));
+		assertEquals(1, f.calls.size());
+		assertEquals(Boolean.FALSE, f.connected.get());
+		assertEquals("密钥无效或无权限 (HTTP 401)", f.connectMessage.get());
+	}
+
+	@Test public void apiTestConnectionNetworkFailureStopsBeforeCompletionProbe() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.OPENAI;
+		f.connect();
+		f.calls.get(0).failure();
+		assertEquals(1, f.calls.size());
+		assertEquals(Boolean.FALSE, f.connected.get());
+		assertTrue(f.connectMessage.get().contains("fictional offline failure"));
+	}
+
+	@Test public void apiTestConnectionRateLimitStopsBeforeCompletionProbe() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.OPENAI;
+		f.connect();
+		f.calls.get(0).respond(429, ResponseBody.create(MediaType.parse("application/json"),
+				"fixture rate limit"));
+		assertEquals(1, f.calls.size());
+		assertEquals(Boolean.FALSE, f.connected.get());
+		assertEquals("连接正常但被限流 (HTTP 429)", f.connectMessage.get());
+	}
+
+	@Test public void apiTestConnectionCompletionErrorDetailIsReported() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.OPENAI;
+		f.connect();
+		f.calls.get(0).respond(404, ResponseBody.create(MediaType.parse("application/json"),
+				"{\"error\":\"not found\"}"));
+		assertEquals(2, f.calls.size());
+		f.calls.get(1).respond(500, ResponseBody.create(MediaType.parse("application/json"),
+				"{\"error\":{\"message\":\"fixture detail\"}}"));
+		assertEquals("server errors are not retried", 2, f.calls.size());
+		assertEquals(Boolean.FALSE, f.connected.get());
+		assertTrue(f.connectMessage.get().contains("fixture detail"));
+	}
+
+	@Test public void apiTestConnectionWarnsWhenConfiguredModelIsNotListed() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.OPENAI;
+		f.connect();
+		f.calls.get(0).respond(200, ResponseBody.create(MediaType.parse("application/json"),
+				"{\"data\":[{\"id\":\"some-other-model\"}]}"));
+		assertEquals(1, f.calls.size());
+		assertEquals(Boolean.TRUE, f.connected.get());
+		assertEquals("连接成功，密钥有效（模型清单中未见 fixture-A，请确认模型名）", f.connectMessage.get());
+	}
+
+	@Test public void apiTestConnectionFallsBackWhenModelsReturnsNonListBody() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.OPENAI;
+		f.connect();
+		assertEquals(1, f.calls.size());
+		f.calls.get(0).malformed(); // 200, but the body is not a model list ("{")
+		assertEquals(2, f.calls.size());
+		assertEquals("POST", f.calls.get(1).request.method());
+		assertTrue(f.calls.get(1).request.url().toString().endsWith("/chat/completions"));
+		f.calls.get(1).respond(200, ResponseBody.create(MediaType.parse("application/json"),
+				"{\"choices\":[]}"));
+		assertEquals(Boolean.TRUE, f.connected.get());
+		assertEquals("连接成功，模型可用", f.connectMessage.get());
+	}
+
+	@Test public void apiTestConnectionCompletionRateLimitIsReported() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.OPENAI;
+		f.connect();
+		f.calls.get(0).respond(404, ResponseBody.create(MediaType.parse("application/json"),
+				"{\"error\":\"not found\"}"));
+		assertEquals(2, f.calls.size());
+		f.calls.get(1).httpFailure(); // 429
+		assertEquals(Boolean.FALSE, f.connected.get());
+		assertEquals("连接正常但被限流 (HTTP 429)", f.connectMessage.get());
+	}
+
+	@Test public void apiTestConnectionCompletionErrorDetailIsCleanedAndCapped() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.OPENAI;
+		f.connect();
+		f.calls.get(0).respond(404, ResponseBody.create(MediaType.parse("application/json"),
+				"{\"error\":\"not found\"}"));
+		assertEquals(2, f.calls.size());
+		StringBuilder detail = new StringBuilder("first line\\nsecond line\\n");
+		while (detail.length() < 260)
+		{
+			detail.append('x');
+		}
+		f.calls.get(1).respond(500, ResponseBody.create(MediaType.parse("application/json"),
+				"{\"error\":{\"message\":\"" + detail + "\"}}"));
+		assertEquals("server errors are not retried", 2, f.calls.size());
+		String message = f.connectMessage.get();
+		assertEquals(Boolean.FALSE, f.connected.get());
+		assertFalse(message.contains("\n"));
+		assertFalse(message.contains("\r"));
+		assertTrue(message.endsWith("…"));
+		assertTrue(message.length() <= "连接失败：".length() + 200 + 1);
+	}
+
+	@Test public void apiTestCompletionRetriesWithoutTokenCapWhenProviderRejectsTheLimit() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.OPENAI;
+		f.connect();
+		f.calls.get(0).respond(404, ResponseBody.create(MediaType.parse("application/json"), "{}"));
+		assertEquals(2, f.calls.size());
+		assertEquals(1, f.calls.get(1).json().get("max_tokens").getAsInt());
+		f.calls.get(1).respond(400, ResponseBody.create(MediaType.parse("application/json"),
+				"{\"error\":{\"message\":\"Unsupported parameter: max_tokens\"}}"));
+		assertEquals("a rejected output cap is retried exactly once", 3, f.calls.size());
+		JsonObject retry = f.calls.get(2).json();
+		assertFalse("the retry must omit the output cap", retry.has("max_tokens"));
+		assertEquals("fixture-A", retry.get("model").getAsString());
+		assertEquals("hi", retry.getAsJsonArray("messages").get(0).getAsJsonObject()
+				.get("content").getAsString());
+		f.calls.get(2).respond(200, ResponseBody.create(MediaType.parse("application/json"), "{}"));
+		assertEquals(Boolean.TRUE, f.connected.get());
+		assertEquals("连接成功，模型可用", f.connectMessage.get());
+		assertEquals(1, f.connectResults.get());
+	}
+
+	@Test public void apiTestCompletionDoesNotRetryOnAuthFailure() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.OPENAI;
+		f.connect();
+		f.calls.get(0).respond(404, ResponseBody.create(MediaType.parse("application/json"), "{}"));
+		f.calls.get(1).respond(401, ResponseBody.create(MediaType.parse("application/json"), "{}"));
+		assertEquals("auth failures are definitive and never retried", 2, f.calls.size());
+		assertEquals(Boolean.FALSE, f.connected.get());
+		assertEquals("密钥无效或无权限 (HTTP 401)", f.connectMessage.get());
+	}
+
+	@Test public void apiTestCompletionRetriesOnlyOnceWhenTheUncappedProbeAlsoFails() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.OPENAI;
+		f.connect();
+		f.calls.get(0).respond(404, ResponseBody.create(MediaType.parse("application/json"), "{}"));
+		f.calls.get(1).respond(400, ResponseBody.create(MediaType.parse("application/json"),
+				"{\"error\":{\"message\":\"first attempt\"}}"));
+		assertEquals(3, f.calls.size());
+		f.calls.get(2).respond(400, ResponseBody.create(MediaType.parse("application/json"),
+				"{\"error\":{\"message\":\"second attempt\"}}"));
+		assertEquals("at most two probe attempts", 3, f.calls.size());
+		assertEquals(Boolean.FALSE, f.connected.get());
+		assertTrue(f.connectMessage.get().contains("second attempt"));
+	}
+
+	@Test public void apiTestConnectionSucceedsWithEmptyModelHint() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.OPENAI; f.model = "";
+		f.connect();
+		f.calls.get(0).respond(200, ResponseBody.create(MediaType.parse("application/json"),
+				"{\"data\":[{\"id\":\"some-other-model\"}]}"));
+		assertEquals(Boolean.TRUE, f.connected.get());
+		assertEquals("连接成功，密钥有效（未填写 API 模型）", f.connectMessage.get());
+	}
+
+	@Test public void testClientDerivesThirtySecondReadTimeoutWithoutTouchingHttpClient() throws Exception
+	{
+		Fixture f = new Fixture();
+		inject(f.ai, "testHttpClient", null);
+		Method method = AiTranslator.class.getDeclaredMethod("testClient");
+		method.setAccessible(true);
+		OkHttpClient client = (OkHttpClient) method.invoke(f.ai);
+		assertEquals(30_000, client.readTimeoutMillis());
+		assertNotSame(field(f.ai, "httpClient"), client); // a derived copy, not the shared client
 	}
 
 	@Test public void invalidHeaderEntriesAreSkippedWithoutFailingTranslation() throws Exception

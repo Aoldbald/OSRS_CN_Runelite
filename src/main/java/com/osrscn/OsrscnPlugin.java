@@ -607,7 +607,7 @@ public class OsrscnPlugin extends Plugin
 		{
 			configManager.setConfiguration(OsrscnConfig.GROUP, "apiUrl", config.aiProvider().getUrl());
 		}
-		// "测试连接" is a checkbox acting as a button: tick -> reset to off, run the no-token test, pop the result.
+		// "测试连接" is a checkbox acting as a button: tick -> reset to off, run the connection test, pop the result.
 		if ("testConnection".equals(key) && config.testConnection())
 		{
 			configManager.setConfiguration(OsrscnConfig.GROUP, "testConnection", false);
