@@ -186,6 +186,8 @@ public class AiTranslatorPrivacyTest
 			});
 			Field transport = AiTranslator.class.getDeclaredField("httpClient");
 			transport.setAccessible(true); inject(ai, "ollamaHttpClient", transport.get(ai));
+			// The API branch now returns its own derived client; pin it to the same recording transport.
+			inject(ai, "apiInferenceClient", transport.get(ai));
 			inject(collector, "dir", dir); inject(collector, "config", config); inject(collector, "executor", executor);
 			inject(translator, "ai", ai); inject(translator, "missing", collector);
 			inject(translator, "store", new TranslationStore()); // Empty maps; never load real data.

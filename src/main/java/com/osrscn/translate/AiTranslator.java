@@ -24,6 +24,7 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.RuneLite;
 import okhttp3.Call;
 import okhttp3.Callback;
+import okhttp3.Dispatcher;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -69,7 +70,15 @@ public class AiTranslator
 
 	@Inject
 	private OkHttpClient httpClient;
-	private OkHttpClient ollamaHttpClient; // shares the injected dispatcher and connection pool
+	private OkHttpClient ollamaHttpClient; // shares the private AI dispatcher and the injected connection pool
+	// AI inference gets a dispatcher of its own: the injected client's per-host limit (5) belongs to
+	// RuneLite and is shared with every other plugin, so translating through it caps this plugin at 5
+	// concurrent requests no matter what aiConcurrency says. The private dispatcher reuses the injected
+	// client's executor service, so it creates no threads of its own and needs no shutdown. Both fields
+	// are lazily built under this monitor, like ollamaHttpClient.
+	private static final int AI_MAX_REQUESTS_PER_HOST = 64;
+	private OkHttpClient apiInferenceClient;
+	private Dispatcher inferenceDispatcher;
 	// Lazily derived from httpClient for connectivity checks. Volatile and deliberately unlocked:
 	// testConnection runs on the EDT and must not take this monitor (ensureLoaded/persistToDisk hold it
 	// across disk IO). A racing first call may build a second client, which is benign - both share the
@@ -441,13 +450,39 @@ public class AiTranslator
 		}
 	}
 
+	/**
+	 * Private dispatcher for AI inference. Reuses the injected client's executor service so no extra
+	 * pool is created and nothing needs shutting down; only the per-host gate is raised, and only for
+	 * this plugin. Called under this monitor.
+	 */
+	private Dispatcher inferenceDispatcher()
+	{
+		if (inferenceDispatcher == null)
+		{
+			inferenceDispatcher = new Dispatcher(httpClient.dispatcher().executorService());
+			inferenceDispatcher.setMaxRequests(AI_MAX_REQUESTS_PER_HOST);
+			inferenceDispatcher.setMaxRequestsPerHost(AI_MAX_REQUESTS_PER_HOST);
+		}
+		return inferenceDispatcher;
+	}
+
 	/** Called under this monitor; only local inference gets the cold-load budget. */
 	private OkHttpClient inferenceClient(boolean api)
 	{
-		if (api) return httpClient;
+		if (api)
+		{
+			if (apiInferenceClient == null)
+			{
+				apiInferenceClient = httpClient.newBuilder()
+						.dispatcher(inferenceDispatcher())
+						.build();
+			}
+			return apiInferenceClient;
+		}
 		if (ollamaHttpClient == null)
 		{
 			ollamaHttpClient = httpClient.newBuilder()
+					.dispatcher(inferenceDispatcher())
 					.readTimeout(OLLAMA_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
 					.callTimeout(OLLAMA_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
 					.build();

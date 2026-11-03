@@ -301,12 +301,12 @@ public interface OsrscnConfig extends Config
 			keyName = "aiConcurrency",
 			name = "翻译并发数",
 			description = "同时进行的 AI 翻译请求数。对本地 Ollama 和在线 API 都生效；"
-					+ "在线 API 的实际有效上限约 5（受 HTTP 客户端每主机并发限制）。"
+					+ "上限 64；实际吞吐仍受 AI 服务商限流与本机性能影响。"
 					+ "<br>越大填充越快，但更吃 GPU、可能掉帧（Ollama 需开并行）",
 			section = aiCommon,
 			position = 5
 	)
-	@Range(min = 1, max = 6)
+	@Range(min = 1, max = 64)
 	default int aiConcurrency()
 	{
 		return 1;

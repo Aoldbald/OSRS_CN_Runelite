@@ -117,6 +117,9 @@ public class AiTranslatorTest
 			OkHttpClient injectedClient = transportClient(false);
 			inject(ai, "httpClient", injectedClient);
 			inject(ai, "ollamaHttpClient", injectedClient);
+			// The API branch now returns its own derived client; pin it to the same socket-free
+			// transport so the recorded Pending still proves which client issued a request.
+			inject(ai, "apiInferenceClient", injectedClient);
 			// testConnection must run through the derived test client, so it gets its own transport
 			// instance: the recorded Pending then proves which client actually issued the request.
 			inject(ai, "testHttpClient", transportClient(true));
@@ -845,5 +848,41 @@ public class AiTranslatorTest
 		assertNull(f.ai.translate(other, true));
 		assertEquals(2, f.calls.size());
 		assertEquals("NEW", f.calls.get(1).request.header("x-opencode-session"));
+	}
+
+	@Test public void aiInferenceUsesAPrivateDispatcherWithoutTouchingTheSharedClient() throws Exception
+	{
+		AiTranslator ai = new AiTranslator();
+		// A real client, so the assertions see OkHttp's actual defaults (dispatcher 64 total / 5 per host).
+		// One interceptor keeps the "chain preserved" assertion below meaningful (0 == 0 would be vacuous).
+		OkHttpClient injected = new OkHttpClient.Builder()
+				.addInterceptor(chain -> chain.proceed(chain.request()))
+				.build();
+		inject(ai, "httpClient", injected);
+		Method inferenceClient = AiTranslator.class.getDeclaredMethod("inferenceClient", boolean.class);
+		inferenceClient.setAccessible(true);
+		OkHttpClient api = (OkHttpClient) inferenceClient.invoke(ai, true);
+		OkHttpClient ollama = (OkHttpClient) inferenceClient.invoke(ai, false);
+		// AI inference no longer rides RuneLite's dispatcher, so its 5-per-host cap cannot throttle it.
+		assertNotSame(injected.dispatcher(), api.dispatcher());
+		assertEquals(64, api.dispatcher().getMaxRequests());
+		assertEquals(64, api.dispatcher().getMaxRequestsPerHost());
+		// Both AI backends share that one private dispatcher, and it is cached rather than rebuilt.
+		assertSame(api.dispatcher(), ollama.dispatcher());
+		assertSame(api, inferenceClient.invoke(ai, true));
+		// The injected client belongs to RuneLite: its dispatcher must come out untouched.
+		assertEquals(5, injected.dispatcher().getMaxRequestsPerHost());
+		assertEquals(64, injected.dispatcher().getMaxRequests());
+		// Only the dispatcher differs: pool, executor and interceptor chain are still the injected ones.
+		assertSame(injected.connectionPool(), api.connectionPool());
+		assertSame(injected.connectionPool(), ollama.connectionPool());
+		assertSame(injected.dispatcher().executorService(), api.dispatcher().executorService());
+		assertSame(injected.dispatcher().executorService(), ollama.dispatcher().executorService());
+		assertTrue(injected.interceptors().size() > 0);
+		assertEquals(injected.interceptors().size(), api.interceptors().size());
+		assertEquals(injected.interceptors().size(), ollama.interceptors().size());
+		// Local inference keeps its cold-load budget while using the same private dispatcher.
+		assertEquals(AiTranslator.OLLAMA_REQUEST_TIMEOUT_MS, ollama.readTimeoutMillis());
+		assertEquals(AiTranslator.OLLAMA_REQUEST_TIMEOUT_MS, ollama.callTimeoutMillis());
 	}
 }
