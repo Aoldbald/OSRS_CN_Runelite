@@ -506,7 +506,15 @@ public class Translator
 				}
 				if (lzh == null && aiFallback)
 				{
-					lzh = aiLine(Tags.stripCol(line), persist, allowRequests, permit);
+					// Same scheme as plainColored: opening <col=..> tags become <colNum0>, ... before
+					// the AI sees the line, and the reply only gets the existing count guard (a reply
+					// that dropped or reordered placeholders is stripped to a single colour).
+					lzh = aiLine(Tags.placeholdColors(line), persist, allowRequests, permit);
+					if (lzh != null && !lineColors.isEmpty()
+							&& Tags.placeholderCount(lzh) != lineColors.size())
+					{
+						lzh = Tags.stripColorPlaceholders(lzh);
+					}
 				}
 				if (lzh != null)
 				{

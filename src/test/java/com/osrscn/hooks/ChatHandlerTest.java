@@ -982,6 +982,37 @@ public class ChatHandlerTest
 	}
 
 	@Test
+	public void colouredPlayerChatKeepsItsPlaceholdersThroughTheAiRoundTrip() throws Exception
+	{
+		ColourPlaceholderFixture f = new ColourPlaceholderFixture();
+		f.chat.values[0].set(ColourPlaceholderFixture.ENGLISH);
+		f.fire(ChatMessageType.PUBLICCHAT);
+
+		// The AI now sees the same <colNumN> key the plainColored path sends, not colour-stripped English.
+		assertEquals(ColourPlaceholderFixture.REQUEST, f.ai.requested);
+		// The reply kept both placeholders, so restoreColors paints each segment: two distinct colours,
+		// one per original <col=..> tag, instead of the single colour the old stripped path could draw.
+		assertEquals(ColourPlaceholderFixture.REPLY_RESTORED, f.glyph.lastText);
+		assertEquals(ColourPlaceholderFixture.RENDERED, f.chat.values[0].get());
+	}
+
+	@Test
+	public void colouredInsertModeChatAlsoKeepsItsPlaceholdersThroughTheAiRoundTrip() throws Exception
+	{
+		ColourPlaceholderFixture f = new ColourPlaceholderFixture();
+		f.chat.mode = PlayerChatMode.INSERT;
+		f.chat.values[0].set(ColourPlaceholderFixture.ENGLISH);
+		f.fire(ChatMessageType.PUBLICCHAT);
+
+		// queueInsert must hand the coloured English to the translator unchanged, so the extra Chinese
+		// line keeps both segments' colours too (the English line itself stays as the game drew it).
+		assertEquals(ColourPlaceholderFixture.ENGLISH, f.chat.values[0].get());
+		assertEquals(ColourPlaceholderFixture.REQUEST, f.ai.requested);
+		assertEquals(ColourPlaceholderFixture.REPLY_RESTORED, f.glyph.lastText);
+		assertEquals("OSRS_CN: " + ColourPlaceholderFixture.RENDERED, f.chat.insertText.get());
+	}
+
+	@Test
 	public void unavailableIdentityDoesNotTrackOrRequest() throws Exception
 	{
 		PartialFixture f = new PartialFixture();
@@ -2193,6 +2224,115 @@ public class ChatHandlerTest
 				return null;
 			}
 			return img(color) + text;
+		}
+	}
+
+	/**
+	 * Real ChatHandler -> Translator round trip for a coloured player line: the fake AI records the
+	 * request key and answers with a translation that keeps the {@code <colNumN>} placeholders, and the
+	 * fake glyph reproduces the real renderer's per-segment colouring (one image tag per
+	 * {@code <col=..>} segment) so the test can tell two colours apart from one.
+	 */
+	private static final class ColourPlaceholderFixture
+	{
+		static final String ENGLISH = "<col=ff0000>Scarlet</col> and <col=0000ff>Azure</col>";
+		static final String REQUEST = "<colNum0>Scarlet</col> and <colNum1>Azure</col>";
+		static final String REPLY_RESTORED = "<col=ff0000>绯红</col> 与 <col=0000ff>蔚蓝</col>";
+		static final String RENDERED = "<img=ff0000>绯红 与 <img=0000ff>蔚蓝";
+		final ChatFixture chat = new ChatFixture();
+		final ColourAi ai = new ColourAi();
+		final SegmentGlyph glyph = new SegmentGlyph();
+
+		ColourPlaceholderFixture() throws Exception
+		{
+			Client client = (Client) Proxy.newProxyInstance(getClass().getClassLoader(),
+					new Class<?>[] { Client.class }, (p, method, args) -> defaultValue(method.getReturnType()));
+			Translator translator = new Translator();
+			inject(translator, "client", client);
+			inject(translator, "store", new TranslationStore());
+			inject(translator, "ai", ai);
+			inject(translator, "glyph", glyph);
+			inject(translator, "missing", new MissingCollector());
+			inject(chat.handler, "translator", translator);
+			inject(chat.handler, "glyph", glyph);
+		}
+
+		void fire(ChatMessageType type)
+		{
+			chat.types[0].set(type);
+			ChatMessage event = new ChatMessage();
+			event.setMessageNode(chat.nodes[0]);
+			event.setType(type);
+			chat.handler.handle(event);
+		}
+	}
+
+	/** Fake AI: records the exact key it was asked for and returns a placeholder-preserving reply. */
+	private static final class ColourAi extends AiTranslator
+	{
+		String requested;
+
+		@Override
+		public String cached(String english)
+		{
+			return null; // never loads or dispatches; the fake reply is synchronous
+		}
+
+		@Override
+		public String translate(String english, boolean persist, AiTranslator.RequestPermit permit)
+		{
+			requested = english;
+			return "<colNum0>绯红</col> 与 <colNum1>蔚蓝</col>";
+		}
+
+		@Override
+		public String translate(String english, boolean persist)
+		{
+			return translate(english, persist, null);
+		}
+	}
+
+	/** Fake glyph service that keeps the colour boundaries visible in its output. */
+	private static final class SegmentGlyph extends GlyphService
+	{
+		String lastText;
+
+		@Override
+		public int uiSize()
+		{
+			return 14;
+		}
+
+		@Override
+		public int wrapChars(int widthPx, int size)
+		{
+			return 200;
+		}
+
+		@Override
+		public String toImgTags(String text, int colorRgb, int maxChars, int size)
+		{
+			lastText = text;
+			StringBuilder out = new StringBuilder();
+			int i = 0;
+			while (i < text.length())
+			{
+				int end = text.charAt(i) == '<' ? text.indexOf('>', i) : -1;
+				if (end > 0 && text.startsWith("<col=", i))
+				{
+					out.append("<img=").append(text, i + 5, end).append('>');
+					i = end + 1;
+				}
+				else if (end > 0 && text.startsWith("</col>", i))
+				{
+					i = end + 1;
+				}
+				else
+				{
+					out.append(text.charAt(i++));
+				}
+			}
+			return out.toString();
 		}
 	}
 

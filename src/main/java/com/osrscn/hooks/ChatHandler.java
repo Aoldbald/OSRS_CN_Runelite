@@ -596,7 +596,7 @@ public class ChatHandler
 		{
 			case INLINE:
 				// player chat: memory-only (slang rarely recurs, don't bloat the disk cache)
-				Tracked t = translateNode(node, Tags.stripCol(value), color, false, false);
+				Tracked t = translateNode(node, value, color, false, false);
 				if (t != null && current(t.generation) && !isTranslated(node))
 				{
 					recolour(t.generation, value, color); // keep native-colour English until translation is ready
@@ -630,7 +630,7 @@ public class ChatHandler
 		String name = node.getName();
 		Generation generation = new Generation(node);
 		if (!current(generation)) return;
-		inserts.put(node, new Insert(generation, name == null ? "" : name, Tags.stripCol(value), color,
+		inserts.put(node, new Insert(generation, name == null ? "" : name, value, color,
 				clock.getAsLong() + pendingTimeoutMs()));
 		tryInsert(node); // table hits land immediately; AI misses retry next tick
 	}
