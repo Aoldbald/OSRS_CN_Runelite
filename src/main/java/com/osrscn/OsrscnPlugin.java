@@ -623,9 +623,13 @@ public class OsrscnPlugin extends Plugin
 			javax.swing.SwingUtilities.invokeLater(() ->
 			{
 				int choice = javax.swing.JOptionPane.showConfirmDialog(null,
-						"开启后，插件会定期把缺词文件里的内容自动发送给汉化组，\n"
-								+ "用于补全翻译。发送的只有：游戏英文原文 + 匿名安装 ID。\n"
-								+ "不含聊天记录、不含账号信息。随时可以关闭此开关。\n\n"
+						"开启后，插件会定期把缺词文件里通过本地检查的记录自动发送给汉化组，\n"
+								+ "存入汉化组的私有数据仓库，用于补全翻译。\n"
+								+ "每条记录包含：游戏英文原文、文本类别、来源标记（如对话 NPC 名、界面类型），\n"
+								+ "另附匿名安装 ID；和所有联网请求一样，接收方能看到你的 IP 地址。\n"
+								+ "不含玩家聊天、不含账号信息；你和附近玩家的名字会替换成 [player name]，\n"
+								+ "带其他玩家名字的已知句式（如排名、交易对象）只留在本机。\n"
+								+ "随时可以关闭此开关。\n\n"
 								+ "确定开启吗？（会同时开启「帮忙补全汉化」收集开关）",
 						"自动上传缺词", javax.swing.JOptionPane.OK_CANCEL_OPTION);
 				if (choice == javax.swing.JOptionPane.OK_OPTION)

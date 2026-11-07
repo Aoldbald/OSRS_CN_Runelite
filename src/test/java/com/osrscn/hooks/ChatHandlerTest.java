@@ -2021,6 +2021,47 @@ public class ChatHandlerTest
 		}
 	}
 
+	@Test public void gameIdentityFrameSurvivesHandlingRetryAndEnglishRestore() throws Exception
+	{
+		PartialFixture f = new PartialFixture();
+		String text = "<col=ff0000>Trading with:</col><br>Logs";
+		Field aiField = Translator.class.getDeclaredField("ai"); aiField.setAccessible(true);
+		aiField.set(f.translator, new AiTranslator() {
+			@Override public String cached(String key) { throw new AssertionError("Identity cache read"); }
+			@Override public String translate(String key, boolean persist) { throw new AssertionError("Identity AI request"); }
+		});
+		f.chat.values[0].set(text); f.fire(ChatMessageType.GAMEMESSAGE);
+		assertEquals(text, f.chat.values[0].get());
+		f.clock.set(1); f.chat.handler.tick(); assertEquals(text, f.chat.values[0].get());
+		f.chat.handler.goEnglish(); assertEquals(text, f.chat.values[0].get()); assertEquals(0, f.collected);
+	}
+
+	@Test public void authorizedPlayerIdentityTextKeepsCacheRepaintAndModeRevocation() throws Exception
+	{
+		PartialFixture f = new PartialFixture(); AtomicInteger reads = new AtomicInteger(); AtomicInteger requests = new AtomicInteger();
+		Field aiField = Translator.class.getDeclaredField("ai"); aiField.setAccessible(true);
+		aiField.set(f.translator, new AiTranslator() {
+			@Override public String cached(String key) { reads.incrementAndGet(); return "玩家译文"; }
+			@Override public String translate(String key, boolean persist) { throw new AssertionError("Missing player permit"); }
+			@Override public String translate(String key, boolean persist, RequestPermit permit)
+			{ assertTrue(permit != null); assertFalse(persist); requests.incrementAndGet(); return "玩家译文"; }
+		});
+		String text = "Trading with:<br>Logs";
+		f.chat.mode = PlayerChatMode.INLINE; f.chat.values[0].set(text); f.fire(ChatMessageType.PUBLICCHAT);
+		assertTrue(f.chat.values[0].get().contains("玩家译文")); assertEquals(2, requests.get());
+		f.clock.set(40_000); int before = reads.get();
+		Field trackedField = ChatHandler.class.getDeclaredField("tracked"); trackedField.setAccessible(true);
+		Object tracked = ((Map<?, ?>) trackedField.get(f.chat.handler)).get(f.chat.nodes[0]);
+		Method repaint = ChatHandler.class.getDeclaredMethod("renderTracked", MessageNode.class, tracked.getClass(), int.class);
+		repaint.setAccessible(true); assertEquals(true, repaint.invoke(f.chat.handler, f.chat.nodes[0], tracked, 0x7f7f7f));
+		assertTrue(f.chat.values[0].get().contains("玩家译文")); assertTrue(reads.get() > before);
+		assertEquals(2, requests.get()); assertEquals(0, f.collected);
+		f.chat.mode = PlayerChatMode.OFF; f.chat.handler.playerChatModeChanged(); f.chat.handler.discardRevokedPlayerMessages();
+		assertEquals(text, f.chat.values[0].get()); before = reads.get();
+		f.chat.handler.tick(); assertEquals(false, repaint.invoke(f.chat.handler, f.chat.nodes[0], tracked, 0));
+		assertEquals(before, reads.get()); assertEquals(2, requests.get());
+	}
+
 	private static final class PartialFixture
 	{
 		// local_data/zh/transcript_zh_interface.tsv, row 7226 at 45b82d5.
@@ -2181,6 +2222,14 @@ public class ChatHandlerTest
 		{
 			calls++;
 			last = super.renderChatCached(text, color, maxChars, size);
+			return last;
+		}
+
+		@Override
+		public Rendered renderPlayerChatCached(String text, int color, int maxChars, int size)
+		{
+			calls++;
+			last = super.renderPlayerChatCached(text, color, maxChars, size);
 			return last;
 		}
 	}

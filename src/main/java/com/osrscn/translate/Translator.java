@@ -156,6 +156,17 @@ public class Translator
 
 	private String plainCore(String english, String category, String subCategory, String source, boolean collect)
 	{
+		return plainCore(english, category, subCategory, source, collect, hasIdentityContext(english));
+	}
+
+	/** Preserve a known identity frame before callers strip tags or split its text. */
+	public static boolean hasIdentityContext(String text)
+	{
+		return MissingPrivacy.identityContext(text);
+	}
+
+	private String plainCore(String english, String category, String subCategory, String source, boolean collect, boolean identity)
+	{
 		if (english == null || english.trim().isEmpty())
 		{
 			return null;
@@ -174,10 +185,10 @@ public class Translator
 		{
 			return keepEnglish(zh) ? null : zh;
 		}
+		if (identity) return null;
 		if (collect)
 		{
-			String name = playerName();
-			missing.record(name != null ? english.replace(name, PLAYER_NAME) : english, category, subCategory, source);
+			missing.record(collectKey(english), category, collectKey(subCategory), collectKey(source));
 		}
 		return aiTranslate(english, true);
 	}
@@ -213,6 +224,17 @@ public class Translator
 	 */
 	public String plainColored(String text, String category, String subCategory, String source)
 	{
+		return plainColored(text, category, subCategory, source, true);
+	}
+
+	/** Recolour an existing dialogue without collecting again or losing its original identity frame. */
+	public String plainColoredNoCollect(String text)
+	{
+		return plainColored(text, null, null, null, false);
+	}
+
+	private String plainColored(String text, String category, String subCategory, String source, boolean collect)
+	{
 		if (text == null || text.trim().isEmpty())
 		{
 			return null;
@@ -220,7 +242,7 @@ public class Translator
 		List<String> colors = Tags.colorTags(text);
 		if (colors.isEmpty())
 		{
-			return plainCollect(Tags.stripTags(text), category, subCategory, source);
+			return plainCore(Tags.stripTags(text), category, subCategory, source, collect, hasIdentityContext(text));
 		}
 		// The tables often hold only the plain form of a coloured line, so a <colNumN> miss retries with
 		// colours stripped before anything is recorded or sent to the AI; the placeholder-count check
@@ -240,7 +262,7 @@ public class Translator
 		}
 		else
 		{
-			zh = plainCore(templated, category, subCategory, source, true);
+			zh = plainCore(templated, category, subCategory, source, collect, hasIdentityContext(text));
 			if (zh == null)
 			{
 				return null;
@@ -402,24 +424,30 @@ public class Translator
 
 	public Rendered renderChat(String text, int colorRgb, int maxChars, int size, boolean aiFallback, boolean persist)
 	{
-		return renderChat(text, colorRgb, maxChars, size, aiFallback, persist, true, null);
+		return renderChat(text, colorRgb, maxChars, size, aiFallback, persist, true, null, false);
 	}
 
 	/** Repaint chat from tables and AI cache without requests, persistence or missing collection. */
 	public Rendered renderChatCached(String text, int colorRgb, int maxChars, int size)
 	{
-		return renderChat(text, colorRgb, maxChars, size, true, false, false, null);
+		return renderChat(text, colorRgb, maxChars, size, true, false, false, null, false);
+	}
+
+	/** Cached repaint for an independently authorized player message; never dispatches or persists. */
+	public Rendered renderPlayerChatCached(String text, int colorRgb, int maxChars, int size)
+	{
+		return renderChat(text, colorRgb, maxChars, size, true, false, false, null, true);
 	}
 
 	/** Player-mode permit reaches each AI admission; table and cached rendering stay unchanged. */
 	public Rendered renderChat(String text, int colorRgb, int maxChars, int size, boolean aiFallback,
 			boolean persist, AiTranslator.RequestPermit permit)
 	{
-		return renderChat(text, colorRgb, maxChars, size, aiFallback, persist, true, permit);
+		return renderChat(text, colorRgb, maxChars, size, aiFallback, persist, true, permit, true);
 	}
 
 	private Rendered renderChat(String text, int colorRgb, int maxChars, int size, boolean aiFallback,
-			boolean persist, boolean allowRequests, AiTranslator.RequestPermit permit)
+			boolean persist, boolean allowRequests, AiTranslator.RequestPermit permit, boolean playerChat)
 	{
 		// Game messages pass persist=true and are safe to collect; player chat passes persist=false
 		// and must never be written to missing.tsv.
@@ -427,10 +455,10 @@ public class Translator
 		if (link != null && link.matches())
 		{
 			Rendered r = renderWithOrder(link.group(2), colorRgb, maxChars, size, aiFallback, persist,
-					CHAT_ORDER, persist ? "gameText" : null, allowRequests, permit);
+					CHAT_ORDER, persist ? "gameText" : null, allowRequests, permit, playerChat);
 			return r == null ? null : new Rendered(link.group(1) + r.text, r.complete);
 		}
-		return renderWithOrder(text, colorRgb, maxChars, size, aiFallback, persist, CHAT_ORDER, persist ? "gameText" : null, allowRequests, permit);
+		return renderWithOrder(text, colorRgb, maxChars, size, aiFallback, persist, CHAT_ORDER, persist ? "gameText" : null, allowRequests, permit, playerChat);
 	}
 
 	/**
@@ -446,16 +474,19 @@ public class Translator
 	private Rendered renderWithOrder(String text, int colorRgb, int maxChars, int size, boolean aiFallback, boolean persist,
 			TranslationStore.Category[] order, String collectSource)
 	{
-		return renderWithOrder(text, colorRgb, maxChars, size, aiFallback, persist, order, collectSource, true, null);
+		return renderWithOrder(text, colorRgb, maxChars, size, aiFallback, persist, order, collectSource, true, null, false);
 	}
 
 	private Rendered renderWithOrder(String text, int colorRgb, int maxChars, int size, boolean aiFallback, boolean persist,
-			TranslationStore.Category[] order, String collectSource, boolean allowRequests, AiTranslator.RequestPermit permit)
+			TranslationStore.Category[] order, String collectSource, boolean allowRequests, AiTranslator.RequestPermit permit, boolean playerChat)
 	{
 		if (text == null || text.trim().isEmpty())
 		{
 			return null;
 		}
+		// Preserve the identity frame before per-line collection can detach its sensitive tail.
+		boolean identity = hasIdentityContext(text);
+		if (identity) collectSource = null;
 		// Colours are looked up as <colNumN> placeholders (the data stores them that way) and restored to
 		// real <col=..> tags afterwards, so the colour-aware glyph renderer can colour each segment.
 		// First try the whole widget as one entry (multi-line info boxes like prayer/spell are combined).
@@ -468,6 +499,8 @@ public class Translator
 			String img = render(Tags.restoreColors(whole, wholeColors), colorRgb, maxChars, size);
 			return img == null ? null : new Rendered(img, true);
 		}
+		// A detached name may also match an ordinary table word. Keep the complete frame on a miss.
+		if (identity && !playerChat) return null;
 		if (text.contains("<br>") || text.contains("<u") || text.contains("<str") || aiFallback)
 		{
 			// per-line: some widgets pack independent labels (e.g. chat tab "Game<br>On"); also lets the
@@ -509,7 +542,7 @@ public class Translator
 					// Same scheme as plainColored: opening <col=..> tags become <colNum0>, ... before
 					// the AI sees the line, and the reply only gets the existing count guard (a reply
 					// that dropped or reordered placeholders is stripped to a single colour).
-					lzh = aiLine(Tags.placeholdColors(line), persist, allowRequests, permit);
+					lzh = aiLine(Tags.placeholdColors(line), persist, allowRequests, permit, playerChat);
 					if (lzh != null && !lineColors.isEmpty()
 							&& Tags.placeholderCount(lzh) != lineColors.size())
 					{
@@ -558,6 +591,7 @@ public class Translator
 	 */
 	private String collectKey(String s)
 	{
+		if (s == null || s.isEmpty()) return "";
 		String k = Tags.placeholdColors(Tags.stripStyle(s)).trim();
 		String name = playerName();
 		if (name != null && !name.isEmpty())
@@ -617,17 +651,17 @@ public class Translator
 	/** AI-translate one line, but only if it is real prose (skip numbers/symbols like "0/1"). */
 	private String aiLine(String line, boolean persist)
 	{
-		return aiLine(line, persist, true, null);
+		return aiLine(line, persist, true, null, false);
 	}
 
-	private String aiLine(String line, boolean persist, boolean allowRequests, AiTranslator.RequestPermit permit)
+	private String aiLine(String line, boolean persist, boolean allowRequests, AiTranslator.RequestPermit permit, boolean playerChat)
 	{
 		String t = line.trim();
 		if (!WORDY.matcher(t).find())
 		{
 			return null;
 		}
-		return aiTranslate(t, true, persist, allowRequests, permit);
+		return aiTranslate(t, true, persist, allowRequests, permit, playerChat);
 	}
 
 	private String aiTranslate(String query, boolean protectPlayerNames)
@@ -637,11 +671,13 @@ public class Translator
 
 	private String aiTranslate(String query, boolean protectPlayerNames, boolean persist)
 	{
-		return aiTranslate(query, protectPlayerNames, persist, true, null);
+		return aiTranslate(query, protectPlayerNames, persist, true, null, false);
 	}
 
-	private String aiTranslate(String query, boolean protectPlayerNames, boolean persist, boolean allowRequests, AiTranslator.RequestPermit permit)
+	private String aiTranslate(String query, boolean protectPlayerNames, boolean persist, boolean allowRequests, AiTranslator.RequestPermit permit, boolean playerChat)
 	{
+		// Old raw/protected AI cache entries are not evidence that an identity-bearing input is safe.
+		if (!playerChat && hasIdentityContext(query)) return null;
 		// Every AI dispatch funnels through here, so this is the one place that can keep non-language text
 		// off the backend and out of the disk cache. Checked before any key work or dispatch.
 		if (!hasTranslatableText(query))
@@ -1242,6 +1278,11 @@ public class Translator
 		if (core.isEmpty())
 		{
 			return seg;
+		}
+		if (hasIdentityContext(seg))
+		{
+			String whole = lookupPeriodTolerant(Tags.placeholdColors(core), UI_ORDER);
+			return whole == null ? seg : seg.substring(0, a) + Tags.restoreColors(whole, Tags.colorTags(core)) + seg.substring(b);
 		}
 		String zh = translateReqCore(core, aiFallback);
 		//noinspection StringEquality

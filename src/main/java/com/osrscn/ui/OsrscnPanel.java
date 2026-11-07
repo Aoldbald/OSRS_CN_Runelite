@@ -282,34 +282,26 @@ public class OsrscnPanel extends PluginPanel
 	 */
 	private void missingSubmitDialog()
 	{
-		missing.flushPending();
 		File f = missing.missingFile();
-		String content = "";
-		int rows = 0;
+		final com.osrscn.translate.MissingUploader.Submission submission;
 		try
 		{
-			if (f.exists())
-			{
-				content = new String(Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8);
-				for (String line : content.split("\n"))
-				{
-					if (!line.trim().isEmpty())
-					{
-						rows++;
-					}
-				}
-				rows = Math.max(0, rows - 1); // header row
-			}
+			submission = uploader.manualSubmission();
 		}
 		catch (Exception ex)
 		{
-			content = "";
+			JOptionPane.showMessageDialog(this, message("暂时无法检查缺词记录，未复制或提交任何内容。\n原始记录仍保留在本地。"),
+					"提交缺词", JOptionPane.INFORMATION_MESSAGE);
+			return;
 		}
+		String content = submission.content;
+		int rows = submission.rows;
 		if (rows <= 0 || content.isEmpty())
 		{
 			Object[] opts = {"复制文件夹路径", "关闭"};
 			String text = config.collectMissing()
-					? "还没有收集到缺词。\n带着插件玩一阵，游戏里查不到的文本会自动记到本地：\n" + f.getName()
+					? (submission.held > 0 ? "当前记录未通过本地提交检查，仍保留在本机。\n请勿直接发送原始文件。"
+							: "还没有可提交的缺词。\n游戏里查不到的文本会记到本地：\n" + f.getName())
 					: "「帮忙补全汉化」还没开启。\n在插件设置的「联系作者 / 反馈」里打开它，游戏里查不到的\n文本会记录到本地文件，之后可以在这里一键提交。";
 			int c = JOptionPane.showOptionDialog(this, message(text), "提交缺词",
 					JOptionPane.DEFAULT_OPTION, JOptionPane.INFORMATION_MESSAGE, null, opts, opts[1]);
@@ -326,20 +318,21 @@ public class OsrscnPanel extends PluginPanel
 		String text = (auto
 						? (pending > 0
 								? "有 " + pending + " 条还没上传。\n每半小时自动发送一次，点「立即上传」可以马上发。\n\n"
-								: "全部已上传，没有新的内容要发。\n以后收集到新的会自动发送，已传过的不会重复发。\n\n")
+								: (pending < 0 ? "上传记录暂时无法核对，自动提交已暂停。\n原始记录保留在本地。\n\n"
+										: "没有通过检查的新增内容等待自动上传。\n未放行的记录仍保留在本地。\n\n"))
 						: "点「复制并去 GitHub 提交」会：\n"
-								+ "1. 把文件内容复制到剪贴板；\n"
+								+ "1. 只把检查通过的内容复制到剪贴板；\n"
 								+ "2. 打开 GitHub 新建 issue 页面（需要 GitHub 账号）；\n"
 								+ "3. 你在页面里粘贴、确认后才算提交——插件自己不会上传任何东西。\n\n")
-				+ "累计收集 " + rows + " 条（" + f.getName() + "）。\n"
-				+ "内容只有游戏英文原文和来源分类，不含聊天和账号信息。\n"
-				+ (auto ? "" : "没有 GitHub 账号的话，把文件发到 QQ 群也可以。");
+				+ "检查通过 " + rows + " 条，保留待查 " + submission.held + " 条。\n"
+				+ "提交内容为检查通过的游戏文本及来源分类。\n"
+				+ "请只提交筛选后的内容，原始文件留在本机用于检查。";
 		Object[] opts = auto
 				? (pending > 0
 						? new Object[]{"立即上传 " + pending + " 条", "复制文件夹路径", "取消"}
 						: new Object[]{"复制文件夹路径", "取消"})
 				: new Object[]{"复制并去 GitHub 提交", "复制文件夹路径", "取消"};
-		if (auto && pending == 0)
+		if (auto && pending <= 0)
 		{
 			int c = JOptionPane.showOptionDialog(this, message(text), "提交缺词",
 					JOptionPane.DEFAULT_OPTION, JOptionPane.INFORMATION_MESSAGE, null, opts, opts[0]);

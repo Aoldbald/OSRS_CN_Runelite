@@ -817,7 +817,9 @@ public class ChatHandler
 		// translations without dispatching AI or collecting missing text; never renew the deadline.
 		Translator.Rendered r = retryActive
 				? renderChat(t.generation, t.english, color, chatMaxChars(), t.persist)
-				: translator.renderChatCached(t.english, color, chatMaxChars(), glyph.uiSize());
+				: t.generation.playerMode == null
+						? translator.renderChatCached(t.english, color, chatMaxChars(), glyph.uiSize())
+						: translator.renderPlayerChatCached(t.english, color, chatMaxChars(), glyph.uiSize());
 		if (epoch != writeEpoch || !authorized(t.generation)) return false;
 		if (r == null)
 		{

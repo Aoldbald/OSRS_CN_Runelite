@@ -407,7 +407,9 @@ public class InterfaceTranslator
 		}
 		// Full interface render: splits <br> (item name + "Requires:" line), looks each line up, and keeps
 		// the <col> requirement colour - item / quest names sit in the tables like any other UI text.
-		Translator.Rendered r = translator.renderUi(t, w.getTextColor(), maxChars, size, cfgAiInterface);
+		Translator.Rendered r = registry.forGroup(w.getId() >>> 16).noCollect
+				? translator.renderUiNoCollect(t, w.getTextColor(), maxChars, size, cfgAiInterface)
+				: translator.renderUi(t, w.getTextColor(), maxChars, size, cfgAiInterface);
 		if (r == null)
 		{
 			return;
@@ -1010,7 +1012,7 @@ public class InterfaceTranslator
 			}
 			int bodyColor = dominantColor(words, a.getTextColor());
 			String english = JournalReconstructor.strip(raw.toString()).trim();
-			String zh = english.isEmpty() ? null : plainZh(english, ai);
+			String zh = english.isEmpty() ? null : plainZh(raw.toString(), ai);
 			if (zh == null)
 			{
 				// Tiny glue fragments between two adjacent links ("or a", "on the") miss the tables and the
@@ -1420,6 +1422,11 @@ public class InterfaceTranslator
 	/** Translate a stripped English fragment to plain Chinese (tags removed), or null if pending. */
 	private String plainZh(String english, boolean ai)
 	{
+		if (Translator.hasIdentityContext(english))
+		{
+			String whole = translator.translateJournalSentence(english, false, SKILLGUIDE_TAG, false);
+			return whole == null ? null : JournalReconstructor.strip(whole);
+		}
 		String raw = JournalReconstructor.strip(english == null ? "" : english).trim();
 		if (raw.isEmpty())
 		{
@@ -1879,11 +1886,14 @@ public class InterfaceTranslator
 			// read from the widget every render, never baked into a flat translation. The sentence part still
 			// goes table-first inside translateJournalSentence, so promoted whole tasks stay instant.
 			String raw = rawJoin(slots, unit.start, unit.count);
-			int reqStart = findRequirementStart(raw);
+			// Never separate identity-bearing prose from its names or queue stripped derivatives.
+			boolean identity = Translator.hasIdentityContext(raw);
+			int reqStart = identity ? -1 : findRequirementStart(raw);
 			String sentenceRaw = reqStart >= 0 ? raw.substring(0, reqStart) : raw;
 			String reqRaw = reqStart >= 0 ? raw.substring(reqStart) : "";
 			String sentenceZh = translator.translateJournalSentence(
-					JournalReconstructor.strip(sentenceRaw).trim(), aiFallback, journalTag, collect);
+					identity ? sentenceRaw : JournalReconstructor.strip(sentenceRaw).trim(),
+					aiFallback && !identity, journalTag, collect && !identity);
 			if (sentenceZh == null)
 			{
 				continue; // prose not translatable yet (AI off/pending): leave the task in English
@@ -2000,7 +2010,8 @@ public class InterfaceTranslator
 		{
 			slotChars = 0; // short labels: don't force-wrap them
 		}
-		String r = translator.lookupRenderUi(plain, headerColor(text, w.getTextColor()), slotChars, size, aiFallback);
+		String r = translator.lookupRenderUi(Translator.hasIdentityContext(text) ? text : plain,
+				headerColor(text, w.getTextColor()), slotChars, size, aiFallback);
 		if (r == null)
 		{
 			return; // unknown label (and AI off/pending): leave it in English
@@ -2133,6 +2144,7 @@ public class InterfaceTranslator
 	 */
 	private String translateReqInline(String reqRaw, boolean aiFallback)
 	{
+		if (Translator.hasIdentityContext(reqRaw)) return translator.translateReqSegment(reqRaw, false);
 		StringBuilder out = new StringBuilder(reqRaw.length() + 8);
 		StringBuilder run = new StringBuilder();
 		int i = 0;

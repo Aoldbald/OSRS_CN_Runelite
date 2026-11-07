@@ -140,7 +140,7 @@ public class DialogueHandler
 			String orig = original.get(key);
 			if (orig != null)
 			{
-				String zh = translator.plain(Tags.stripTags(orig));
+				String zh = translator.plainColoredNoCollect(orig);
 				if (zh != null)
 				{
 					applyGlyphs(w, key, zh, null); // recolour only: keep original + history intact
