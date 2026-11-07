@@ -155,10 +155,12 @@ public class MissingCollector
 			// fragment, live value label, join noise, per-item template instance, player CJK, mid-fill salad
 			return;
 		}
+		String row = t + "\t\t" + field(category) + "\t" + field(subCategory) + "\t" + field(source);
+		if (MissingPrivacy.rejection(row) != null) return;
 		ensureLoaded();
 		if (seen.add(dedupKey(t)))
 		{
-			pending.add(t + "\t\t" + clean(category) + "\t" + clean(subCategory) + "\t" + clean(source));
+			pending.add(row);
 			ensureFlusher();
 		}
 	}
@@ -248,9 +250,9 @@ public class MissingCollector
 		return false;
 	}
 
-	private static String clean(String s)
+	private static String field(String s)
 	{
-		return s == null ? "" : s.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ').trim();
+		return s == null ? "" : s; // The policy rejects controls instead of concealing them.
 	}
 
 	/**
@@ -331,6 +333,15 @@ public class MissingCollector
 		flush();
 	}
 
+	/** A coherent upload snapshot: never expose a half-written policy marker/row pair. */
+	synchronized java.util.List<String> uploadSnapshot() throws java.io.IOException
+	{
+		flush();
+		if (!pending.isEmpty()) throw new java.io.IOException("Missing rows could not be flushed");
+		File f = missingFile();
+		return f.exists() ? Files.readAllLines(f.toPath(), StandardCharsets.UTF_8) : java.util.Collections.emptyList();
+	}
+
 	private void ensureLoaded()
 	{
 		if (!loaded.compareAndSet(false, true))
@@ -405,7 +416,7 @@ public class MissingCollector
 		File f = missingFile();
 		//noinspection ResultOfMethodCallIgnored
 		f.getParentFile().mkdirs();
-		boolean newFile = !f.exists();
+		boolean newFile = !f.exists() || f.length() == 0;
 		try (FileWriter w = new FileWriter(f, StandardCharsets.UTF_8, true))
 		{
 			if (newFile)
@@ -420,9 +431,12 @@ public class MissingCollector
 						.format(new java.util.Date()) + "\n");
 			}
 			String line;
-			while ((line = pending.poll()) != null)
+			while ((line = pending.peek()) != null)
 			{
-				w.write(line + "\n");
+				// A leading separator isolates any partial write left by a previous failed flush.
+				w.write("\n" + MissingPrivacy.marker(line) + "\n" + line + "\n");
+				w.flush();
+				pending.poll(); // Retain the row on any write/flush failure.
 			}
 		}
 		catch (Exception e)

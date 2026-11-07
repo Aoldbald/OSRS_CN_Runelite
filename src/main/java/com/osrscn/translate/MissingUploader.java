@@ -6,6 +6,11 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.nio.channels.FileChannel;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -33,7 +38,7 @@ import okhttp3.Response;
  * to the maintainer's relay, which files them into the private data repo's inbox.
  *
  * <p>A watermark file ({@code .upload_state}: {@code <missing file name>\t<lines sent>}) makes
- * uploads incremental and idempotent; on any failure it simply retries next period.
+ * uploads incremental; a failed local progress commit can retry an already received batch.
  */
 @Slf4j
 @Singleton
@@ -81,7 +86,7 @@ public class MissingUploader
 		uploadListener = listener;
 	}
 
-	/** Rows past the upload watermark (display only - the batch builder re-reads on upload). */
+	/** Approved pending data rows; -1 means the source/progress could not be checked. */
 	public int pendingRows()
 	{
 		try
@@ -91,15 +96,26 @@ public class MissingUploader
 			{
 				return 0;
 			}
-			int lines = Files.readAllLines(f.toPath(), StandardCharsets.UTF_8).size();
-			int sent = readWatermark(f.getName());
+			List<String> snapshot = collector.uploadSnapshot();
+			int lines = snapshot.size();
+			String state = stateText();
+			int sent = readWatermark(f.getName(), snapshot, state);
 			// No watermark yet: the first tick starts it at the current size (the backlog is never
 			// sent), so nothing is actually pending.
-			return sent == 0 ? 0 : Math.max(0, lines - sent);
+			if (sent == 0 && (state.trim().isEmpty() || state.trim().split("\t", -1).length == 2)) return 0;
+			int pending = 0;
+			for (int i = sent; i < lines; i++)
+			{
+				String row = snapshot.get(i);
+				if (i > 0 && MissingPrivacy.rejection(row) == null
+						&& MissingPrivacy.attested(snapshot.get(i - 1), row)) pending++;
+			}
+			return pending;
 		}
 		catch (Exception e)
 		{
-			return 0;
+			log.debug("OSRSCN: missing upload status unavailable (state_or_io)");
+			return -1;
 		}
 	}
 
@@ -136,7 +152,7 @@ public class MissingUploader
 		}
 		catch (Exception e)
 		{
-			log.debug("OSRSCN: missing upload failed", e);
+			log.debug("OSRSCN: missing upload failed");
 		}
 		finally
 		{
@@ -150,19 +166,19 @@ public class MissingUploader
 	/** @return true if an async call was enqueued (the callback releases {@link #inFlight}) */
 	private boolean uploadNextBatch() throws IOException
 	{
-		collector.flushPending();
+		List<String> lines = collector.uploadSnapshot();
 		File f = collector.missingFile();
 		if (!f.exists())
 		{
 			return false;
 		}
-		List<String> lines = Files.readAllLines(f.toPath(), StandardCharsets.UTF_8);
-		int sent = readWatermark(f.getName()); // line 0 is the header, never sent
-		if (sent == 0)
+		String priorState = stateText();
+		int sent = readWatermark(f.getName(), lines, priorState); // line 0 is the header, never sent
+		if (sent == 0 && (priorState.trim().isEmpty() || priorState.trim().split("\t", -1).length == 2))
 		{
 			// First upload for this file: start the watermark at the current size. The backlog was
 			// collected before the client-side quality gates existed and must never be replayed.
-			writeWatermark(f.getName(), Math.max(1, lines.size()));
+			commitWatermark(f, lines, lines.size(), priorState);
 			return false;
 		}
 		if (lines.size() <= sent)
@@ -170,18 +186,10 @@ public class MissingUploader
 			return false;
 		}
 		int end = Math.min(lines.size(), sent + MAX_ROWS_PER_POST);
-		List<String> batch = new ArrayList<>();
-		for (int i = sent; i < end; i++)
-		{
-			String l = lines.get(i);
-			if (!l.trim().isEmpty() && !l.startsWith("#"))
-			{
-				batch.add(l); // '#' session markers stay local
-			}
-		}
+		List<String> batch = approvedRows(f, lines, sent, end);
 		if (batch.isEmpty())
 		{
-			writeWatermark(f.getName(), end);
+			commitWatermark(f, lines, end, priorState);
 			return false;
 		}
 		Map<String, Object> body = new HashMap<>();
@@ -194,13 +202,12 @@ public class MissingUploader
 				.build();
 		final int newWatermark = end;
 		final int rowsSent = batch.size(); // '#' markers advance the watermark but are never sent
-		final String fileName = f.getName();
 		httpClient.newCall(req).enqueue(new Callback()
 		{
 			@Override
 			public void onFailure(Call call, IOException e)
 			{
-				log.debug("OSRSCN: missing upload failed", e);
+				log.debug("OSRSCN: missing upload failed");
 				inFlight.set(false);
 			}
 
@@ -211,7 +218,7 @@ public class MissingUploader
 				{
 					if (r.isSuccessful())
 					{
-						writeWatermark(fileName, newWatermark);
+						commitWatermark(f, lines, newWatermark, priorState);
 						log.debug("OSRSCN: uploaded missing rows up to line {}", newWatermark);
 						java.util.function.IntConsumer l = uploadListener;
 						if (l != null)
@@ -219,6 +226,11 @@ public class MissingUploader
 							l.accept(rowsSent);
 						}
 					}
+				}
+				catch (IOException e)
+				{
+					// HTTP may have succeeded; retain the old cursor rather than lose pending rows.
+					log.debug("OSRSCN: missing upload progress not committed");
 				}
 				finally
 				{
@@ -234,38 +246,123 @@ public class MissingUploader
 		return new File(collector.missingFile().getParentFile(), ".upload_state");
 	}
 
-	/** Lines already sent for this missing file; 0 when none / the file name changed (new id). */
-	private int readWatermark(String fileName)
+	/** Filtered manual submission, sharing exactly the automatic upload boundary. */
+	public static final class Submission
 	{
-		try
+		public final String content;
+		public final int rows;
+		public final int held;
+		private Submission(List<String> safe, int held)
 		{
-			File s = stateFile();
-			if (!s.exists())
-			{
-				return 0;
-			}
-			String[] c = new String(Files.readAllBytes(s.toPath()), StandardCharsets.UTF_8).trim().split("\t");
-			if (c.length == 2 && c[0].equals(fileName))
-			{
-				return Integer.parseInt(c[1]);
-			}
+			this.rows = safe.size(); this.held = held;
+			this.content = safe.isEmpty() ? "" : "english\ttranslation\tcategory\tsub_category\tsource\n"
+					+ String.join("\n", safe) + "\n";
 		}
-		catch (Exception e)
-		{
-			log.debug("OSRSCN: failed to read .upload_state", e);
-		}
-		return 0;
 	}
 
-	private synchronized void writeWatermark(String fileName, int lines)
+	public Submission manualSubmission() throws IOException
 	{
-		try
+		List<String> lines = collector.uploadSnapshot();
+		int start = Math.min(1, lines.size());
+		List<String> safe = approvedRows(collector.missingFile(), lines, start, lines.size());
+		int total = 0;
+		for (int i = start; i < lines.size(); i++)
+			if (!lines.get(i).trim().isEmpty() && !lines.get(i).startsWith("#")) total++;
+		return new Submission(safe, total - safe.size());
+	}
+
+	private List<String> approvedRows(File f, List<String> lines, int sent, int end) throws IOException
+	{
+		List<String> batch = new ArrayList<>();
+		StringBuilder held = new StringBuilder();
+		for (int i = sent; i < end; i++)
 		{
-			Files.write(stateFile().toPath(), (fileName + "\t" + lines).getBytes(StandardCharsets.UTF_8));
+			String l = lines.get(i);
+			if (l.trim().isEmpty() || l.startsWith("#")) continue;
+			if (i == 0 && l.equals("english\ttranslation\tcategory\tsub_category\tsource")) continue;
+			String reason = MissingPrivacy.rejection(l);
+			if (reason == null && (i == 0 || !MissingPrivacy.attested(lines.get(i - 1), l)))
+				reason = "unattested";
+			if (reason == null) batch.add(l);
+			else held.append(i + 1).append('\t').append(MissingPrivacy.hash(l))
+					.append('\t').append(reason).append('\n');
 		}
-		catch (Exception e)
+		// Save decisions before either HTTP or a watermark can acknowledge the scanned interval.
+		if (held.length() > 0) recordHolds(f, lines, sent, end, held.toString());
+		return batch;
+	}
+
+	private String stateText() throws IOException
+	{
+		return stateFile().exists() ? Files.readString(stateFile().toPath(), StandardCharsets.UTF_8) : "";
+	}
+
+	/** Accept the legacy cursor, but bind every new cursor to the inspected file prefix. */
+	private int readWatermark(String fileName, List<String> lines, String rawState) throws IOException
+	{
+		String state = rawState.trim();
+		if (state.isEmpty()) return 0;
+		String[] c = state.split("\t", -1);
+		if ((c.length != 2 && c.length != 3) || !c[0].equals(fileName))
+			throw new IOException("Missing upload state identity mismatch");
+		final int sent;
+		try { sent = Integer.parseInt(c[1]); }
+		catch (NumberFormatException e) { throw new IOException("Invalid missing upload cursor"); }
+		if (sent < 0 || sent > lines.size()) throw new IOException("Missing upload file was truncated");
+		if (c.length == 3 && !c[2].equals(prefixHash(lines, sent)))
+			throw new IOException("Missing upload prefix changed");
+		return sent;
+	}
+
+	private static String prefixHash(List<String> lines, int end)
+	{
+		return MissingPrivacy.hash(String.join("\n", lines.subList(0, end)) + "\n");
+	}
+
+	private void recordHolds(File f, List<String> lines, int start, int end, String held) throws IOException
+	{
+		String receipt = MissingPrivacy.VERSION + "\t" + MissingPrivacy.hash(f.getName()) + "\t"
+				+ start + "\t" + end + "\t" + prefixHash(lines, end) + "\n" + held;
+		Path directory = f.toPath().getParent().resolve(".missing_privacy_holds");
+		Files.createDirectories(directory);
+		Path target = directory.resolve(MissingPrivacy.hash(receipt) + ".tsv");
+		if (Files.exists(target))
 		{
-			log.debug("OSRSCN: failed to write .upload_state", e);
+			if (!receipt.equals(Files.readString(target, StandardCharsets.UTF_8)))
+				throw new IOException("Missing hold receipt changed");
+			return;
 		}
+		writeAtomic(target, receipt);
+	}
+
+	private void commitWatermark(File f, List<String> snapshot, int end, String priorState) throws IOException
+	{
+		synchronized (collector)
+		{
+			if (!f.equals(collector.missingFile()) || !priorState.equals(stateText()))
+				throw new IOException("Missing upload state changed during request");
+			List<String> current = collector.uploadSnapshot();
+			if (current.size() < end || !prefixHash(current, end).equals(prefixHash(snapshot, end)))
+				throw new IOException("Missing upload file changed during request");
+			writeWatermark(f.getName(), end, snapshot);
+		}
+	}
+
+	private void writeWatermark(String fileName, int end, List<String> lines) throws IOException
+	{
+		writeAtomic(stateFile().toPath(), fileName + "\t" + end + "\t" + prefixHash(lines, end));
+	}
+
+	/** Failure leaves the previous state and any temporary evidence intact. */
+	private static void writeAtomic(Path target, String value) throws IOException
+	{
+		Path temporary = Files.createTempFile(target.getParent(), ".missing-write-", ".tmp");
+		try (FileChannel channel = FileChannel.open(temporary, StandardOpenOption.WRITE))
+		{
+			ByteBuffer bytes = StandardCharsets.UTF_8.encode(value);
+			while (bytes.hasRemaining()) channel.write(bytes);
+			channel.force(true);
+		}
+		Files.move(temporary, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
 	}
 }

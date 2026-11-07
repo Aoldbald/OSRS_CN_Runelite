@@ -18,6 +18,48 @@ import static org.junit.Assert.*;
 
 public class InterfaceTranslatorLifecycleTest
 {
+    @Test public void tradeSurfacesKeepBareNamesOutOfEveryChildCollectionPath() throws Exception
+    {
+        for (int group : new int[]{334, 335, 336})
+        {
+            GroupingFixture f = new GroupingFixture(true);
+            TextWidget parent = new TextWidget(group << 16, -1, "Logs");
+            TextWidget child = new TextWidget(group << 16, 0, "Needle");
+            parent.children = new Widget[]{child.widget}; parent.dynamic = new Widget[]{child.widget};
+            parent.nested = new Widget[]{child.widget};
+            List<String> collected = new ArrayList<>(), localOnly = new ArrayList<>();
+            inject(f.handler, "translator", routeRecorder(collected, localOnly));
+            java.lang.reflect.Method walk = InterfaceTranslator.class.getDeclaredMethod("walk", Widget.class, boolean.class);
+            walk.setAccessible(true); walk.invoke(f.handler, parent.widget, false);
+            assertTrue(collected.isEmpty()); assertTrue(localOnly.contains("Logs")); assertTrue(localOnly.contains("Needle"));
+        }
+    }
+
+    @Test public void reconstructedLabelsHonorTheirOwnNoCollectSurface() throws Exception
+    {
+        GroupingFixture f = new GroupingFixture(true);
+        List<String> collected = new ArrayList<>(), localOnly = new ArrayList<>();
+        inject(f.handler, "translator", routeRecorder(collected, localOnly));
+        java.lang.reflect.Method label = InterfaceTranslator.class.getDeclaredMethod("translateLabel", Widget.class);
+        label.setAccessible(true);
+        label.invoke(f.handler, new TextWidget(335 << 16, -1, "Logs").widget);
+        label.invoke(f.handler, new TextWidget(860 << 16, -1, "Needle").widget);
+        assertEquals(java.util.Arrays.asList("Logs"), localOnly);
+        assertEquals(java.util.Arrays.asList("Needle"), collected);
+    }
+
+    private static Translator routeRecorder(List<String> collected, List<String> localOnly)
+    {
+        return new Translator() {
+            @Override public Rendered renderUi(String text, int color, int width, int size, boolean ai) {
+                collected.add(text); return null;
+            }
+            @Override public Rendered renderUiNoCollect(String text, int color, int width, int size, boolean ai) {
+                localOnly.add(text); return null;
+            }
+        };
+    }
+
     @Test public void groupingNamesNeverReachTranslationAcrossGenericEntrypoints() throws Exception
     {
         for (boolean aiEnabled : new boolean[] {false, true})
