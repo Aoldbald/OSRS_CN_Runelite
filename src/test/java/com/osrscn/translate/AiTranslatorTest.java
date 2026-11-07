@@ -60,6 +60,20 @@ public class AiTranslatorTest
 		field.set(object, value);
 	}
 
+	/** OpenAI-style 400 body for a provider/model that rejects the optional temperature field. */
+	private static ResponseBody temperatureRejected()
+	{
+		return ResponseBody.create(MediaType.parse("application/json"),
+				"{\"error\":{\"message\":\"Unsupported value: temperature\"}}");
+	}
+
+	/** OpenAI-style success body with one translated message. */
+	private static ResponseBody apiSuccess(String content)
+	{
+		return ResponseBody.create(MediaType.parse("application/json"),
+				"{\"choices\":[{\"message\":{\"content\":\"" + content + "\"}}]}");
+	}
+
 	private final class Fixture
 	{
 		final File dir = temporary.newFolder();
@@ -549,6 +563,86 @@ public class AiTranslatorTest
 		assertEquals("OSRSCN", pending.request.header("x-opencode-session"));
 		assertEquals("OSRSCN", pending.request.header("User-Agent"));
 		assertNull(pending.request.header("Authorization"));
+	}
+
+	@Test public void apiRequestCarriesFixedLowTemperature() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.OPENAI;
+		JsonObject body = f.request(false).json();
+		assertNotNull(body.get("temperature"));
+		assertTrue(body.get("temperature").isJsonPrimitive());
+		assertTrue(body.get("temperature").getAsJsonPrimitive().isNumber());
+		assertEquals(0.3, body.get("temperature").getAsDouble(), 0.0);
+	}
+
+	@Test public void ollamaRequestHasNoTemperature() throws Exception
+	{
+		Fixture f = new Fixture();
+		assertFalse(f.request(false).json().has("temperature"));
+	}
+
+	@Test public void rejectedTemperatureIsRetriedOnceWithoutIt() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.OPENAI;
+		Pending first = f.request(false);
+		assertTrue(first.json().has("temperature"));
+		first.respond(400, temperatureRejected());
+		assertEquals("exactly one automatic retry", 2, f.calls.size());
+		Pending retry = f.calls.get(1);
+		assertFalse("the retry must omit temperature", retry.json().has("temperature"));
+		assertEquals("the retry stays in flight", 1, f.ai.inFlightCount());
+		assertEquals("a retried temperature rejection is not a failure", 0, f.failures());
+		retry.respond(200, apiSuccess("重送成功"));
+		assertEquals("重送成功", f.ai.cached(TEXT));
+		assertEquals(0, f.ai.inFlightCount());
+		assertEquals(0, f.failures());
+	}
+
+	@Test public void failedRetryKeepsTemperatureForLaterRequests() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.OPENAI;
+		f.request(false).respond(400, temperatureRejected());
+		assertEquals(2, f.calls.size());
+		f.calls.get(1).respond(400, temperatureRejected());
+		assertEquals("a rejected retry is never retried again", 2, f.calls.size());
+		assertEquals(1, f.failures());
+		assertEquals(0, f.ai.inFlightCount());
+		Pending next = f.request(false);
+		assertTrue("a rejected retry must not disable temperature", next.json().has("temperature"));
+	}
+
+	@Test public void successfulRetryRemembersUnsupportedTemperature() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.OPENAI;
+		f.request(false).respond(400, temperatureRejected());
+		assertEquals(2, f.calls.size());
+		f.calls.get(1).respond(200, apiSuccess("首次成功"));
+		int before = f.calls.size();
+		assertNull(f.ai.translate(TEXT + " later", false));
+		assertEquals(before + 1, f.calls.size());
+		assertFalse("later lines must skip the rejected field", f.calls.get(before).json().has("temperature"));
+	}
+
+	@Test public void configurationChangeRetriesTemperatureAgain() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.OPENAI;
+		f.request(false).respond(400, temperatureRejected());
+		assertEquals(2, f.calls.size());
+		f.calls.get(1).respond(200, apiSuccess("首次成功"));
+		f.switchTo("fixture-B");
+		Pending next = f.request(false);
+		assertTrue("a new model/endpoint must try temperature again", next.json().has("temperature"));
+	}
+
+	@Test public void ollamaHTTPErrorIsNotRetriedWithoutTemperature() throws Exception
+	{
+		Fixture f = new Fixture();
+		Pending pending = f.request(false);
+		assertFalse(pending.json().has("temperature"));
+		pending.respond(400, temperatureRejected());
+		assertEquals("Ollama never sends temperature, so there is nothing to retry", 1, f.calls.size());
+		assertEquals(1, f.failures());
+		assertEquals(0, f.ai.inFlightCount());
 	}
 
 	@Test public void blankCustomHeadersAddNothing() throws Exception

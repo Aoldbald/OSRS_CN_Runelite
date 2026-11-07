@@ -599,6 +599,21 @@ public class Translator
 		return null;
 	}
 
+	/**
+	 * True when the text still holds something the AI could translate: at least one Latin letter after
+	 * every {@code <...>} tag / placeholder is removed. Bare numbers and placeholder-only lines
+	 * ("{@code <colNum0>429</col>}", "4/187", "{@code <osrscn-name-0>}") are not language - and the
+	 * letters inside a placeholder name ("colNum", "osrscn-name") would otherwise satisfy {@link #WORDY},
+	 * so the guards in {@code aiTranslate} must run on the stripped text instead.
+	 *
+	 * <p>Also used by callers that must tell "nothing to translate" from "translation pending" (the side
+	 * panel's manual-translate box) instead of waiting for a request that will never be sent.
+	 */
+	public static boolean hasTranslatableText(String text)
+	{
+		return HAS_LETTER.matcher(Tags.stripTags(text)).find();
+	}
+
 	/** AI-translate one line, but only if it is real prose (skip numbers/symbols like "0/1"). */
 	private String aiLine(String line, boolean persist)
 	{
@@ -627,6 +642,12 @@ public class Translator
 
 	private String aiTranslate(String query, boolean protectPlayerNames, boolean persist, boolean allowRequests, AiTranslator.RequestPermit permit)
 	{
+		// Every AI dispatch funnels through here, so this is the one place that can keep non-language text
+		// off the backend and out of the disk cache. Checked before any key work or dispatch.
+		if (!hasTranslatableText(query))
+		{
+			return null;
+		}
 		String key = TranslationStore.normalize(query);
 		if (!protectPlayerNames)
 		{
@@ -641,6 +662,13 @@ public class Translator
 			return allowRequests ? requestAi(key, persist, permit) : ai.cached(key);
 		}
 		ProtectedText p = protectDynamicPlayerNames(query);
+		// A line that is nothing but a player name collapses to one <osrscn-name-N> placeholder here - the
+		// entry check above cannot see that (the name was Latin), and after the replacement there is no
+		// language left, so the protected form must not be dispatched either.
+		if (!hasTranslatableText(p.text))
+		{
+			return null;
+		}
 		String protectedKey = TranslationStore.normalize(p.text);
 		String zh = allowRequests ? requestAi(protectedKey, persist, permit) : ai.cached(protectedKey);
 		return zh == null ? null : p.restore(zh);

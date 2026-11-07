@@ -119,6 +119,12 @@ public class AiTranslator
 	private final java.util.concurrent.atomic.AtomicInteger failStreak = new java.util.concurrent.atomic.AtomicInteger();
 	private volatile long backoffUntil;
 
+	// Some models (o1/o3/gpt-5, strict proxies) reject the optional temperature parameter with
+	// 400/422. Once a retry without it succeeds, this configuration omits temperature from every
+	// later request instead of burning a guaranteed 400/422 round trip per line. Only
+	// configurationChanged() (model/backend/URL/key) clears it, because a new endpoint may accept it.
+	private volatile boolean apiTemperatureUnsupported;
+
 	// monitor stats
 	private final java.util.concurrent.atomic.AtomicInteger sessionCount = new java.util.concurrent.atomic.AtomicInteger();
 	private final java.util.Deque<String> recent = new java.util.concurrent.ConcurrentLinkedDeque<>();
@@ -244,6 +250,7 @@ public class AiTranslator
 		}
 		lastDispatch = System.currentTimeMillis();
 		RequestState state = new RequestState(generation, loadedModel);
+		state.withoutTemperature = apiTemperatureUnsupported;
 		try
 		{
 			request(english, persist, state);
@@ -341,6 +348,7 @@ public class AiTranslator
 		cacheFile = null;
 		cache.clear();
 		persisted.clear();
+		apiTemperatureUnsupported = false; // a new model/backend/URL/key may accept temperature again
 	}
 
 	private void invalidateRequests()
@@ -370,6 +378,8 @@ public class AiTranslator
 		final long generation;
 		final String model;
 		boolean completed;
+		boolean withoutTemperature; // this attempt omitted the optional temperature field
+		boolean retryWithoutTemperature; // the provider rejected temperature: retry once without it
 
 		RequestState(long generation, String model)
 		{
@@ -498,7 +508,9 @@ public class AiTranslator
 
 		boolean api = config.aiBackend() == AiBackend.OPENAI;
 		final String url = api ? apiEndpoint() : ollamaEndpoint();
-		Request req = api ? buildApiRequest(url, messages, state.model) : buildOllamaRequest(url, messages, state.model);
+		Request req = api
+				? buildApiRequest(url, messages, state.model, !state.withoutTemperature)
+				: buildOllamaRequest(url, messages, state.model);
 		if (req == null)
 		{
 			finish(english, state); // misconfigured: no request, and no failure/backoff increment
@@ -529,13 +541,32 @@ public class AiTranslator
 				{
 					if (!r.isSuccessful())
 					{
+						// Compatibility: providers/models that reject the optional temperature field with
+						// 400/422 get exactly one retry without it. A rejected retry is a normal failure.
+						boolean retry = api && !state.withoutTemperature
+								&& (r.code() == 400 || r.code() == 422);
 						synchronized (AiTranslator.this)
 						{
 							if (!isCurrent(state)) return;
-							recordFailure();
+							if (!retry)
+							{
+								recordFailure();
+							}
+							state.retryWithoutTemperature = retry;
 						}
-						if (persist) log.warn("OSRSCN AI HTTP {} for model '{}'", r.code(), state.model);
-						else log.warn("OSRSCN AI HTTP {} (non-persistent request)", r.code());
+						if (retry)
+						{
+							if (persist) log.warn("OSRSCN AI HTTP {} for model '{}', retrying without temperature", r.code(), state.model);
+							else log.warn("OSRSCN AI HTTP {} (non-persistent request), retrying without temperature", r.code());
+						}
+						else if (persist)
+						{
+							log.warn("OSRSCN AI HTTP {} for model '{}'", r.code(), state.model);
+						}
+						else
+						{
+							log.warn("OSRSCN AI HTTP {} (non-persistent request)", r.code());
+						}
 						return;
 					}
 					// Response IO/parse must not hold the model monitor: switching may happen mid-read.
@@ -544,6 +575,12 @@ public class AiTranslator
 					{
 						if (!isCurrent(state)) return;
 						recordSuccess();
+						if (state.withoutTemperature)
+						{
+							// The provider accepted a request without temperature: remember that this
+							// model rejects it so later lines skip the guaranteed 400/422 first attempt.
+							apiTemperatureUnsupported = true;
+						}
 						if (content != null && !content.isEmpty())
 						{
 							String zh = clean(content);
@@ -571,7 +608,34 @@ public class AiTranslator
 				}
 				finally
 				{
-					synchronized (AiTranslator.this) { finish(english, state); }
+					synchronized (AiTranslator.this)
+					{
+						if (state.retryWithoutTemperature && isCurrent(state))
+						{
+							// Retry in place: the request keeps its in-flight ownership and is not finished,
+							// so callers still see it pending and no second slot is consumed.
+							state.retryWithoutTemperature = false;
+							state.withoutTemperature = true;
+							try
+							{
+								request(english, persist, state);
+							}
+							catch (RuntimeException e)
+							{
+								if (isCurrent(state))
+								{
+									recordFailure();
+									finish(english, state);
+								}
+								if (persist) log.warn("OSRSCN AI retry dispatch failed", e);
+								else log.warn("OSRSCN AI retry dispatch failed (non-persistent request): {}", e.getClass().getSimpleName());
+							}
+						}
+						else
+						{
+							finish(english, state);
+						}
+					}
 				}
 			}
 		});
@@ -654,7 +718,7 @@ public class AiTranslator
 		return base.endsWith("/chat/completions") ? base : base + "/chat/completions";
 	}
 
-	private Request buildApiRequest(String url, JsonArray messages, String model)
+	private Request buildApiRequest(String url, JsonArray messages, String model, boolean includeTemperature)
 	{
 		String key = config.apiKey().trim();
 		model = model.trim();
@@ -666,6 +730,13 @@ public class AiTranslator
 		JsonObject body = new JsonObject();
 		body.addProperty("model", model);
 		body.addProperty("stream", false);
+		if (includeTemperature)
+		{
+			// Fixed low temperature: it only narrows run-to-run sampling variance for the same line.
+			// It does not by itself keep proper nouns in English or fix terminology drift; the prompt /
+			// glossary has to do that.
+			body.addProperty("temperature", 0.3);
+		}
 		body.add("messages", messages);
 		Request.Builder builder = new Request.Builder()
 				.url(url)
