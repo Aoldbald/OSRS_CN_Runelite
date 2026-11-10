@@ -8,7 +8,7 @@ public enum PlayerChatMode
 	/** Translate the message in place (the English line becomes Chinese). */
 	INLINE("翻译"),
 	/** Keep the English line and add a separate Chinese line below it (e.g. "OSRS_CN: Name: 你好"). */
-	INSERT("翻译并另起一行");
+	INSERT("另起一行");
 
 	private final String label;
 
