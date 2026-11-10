@@ -623,11 +623,30 @@ public class OsrscnPanel extends PluginPanel
 		{
 			return;
 		}
-		translatePending = text.trim();
+		String pending = text.trim();
+		if (!needsTranslation(pending))
+		{
+			translateOutput.setText("（无需翻译：这段文字里没有可翻译的英文内容）");
+			translatePending = null;
+			translatePoll.stop();
+			return;
+		}
+		translatePending = pending;
 		translateDeadline = System.currentTimeMillis() + TRANSLATE_TIMEOUT_MS;
 		translateOutput.setText("翻译中…");
 		pollTranslate();
 		translatePoll.start();
+	}
+
+	/**
+	 * Manual-translate pre-check: true when the box holds text the AI could actually translate (any
+	 * Latin letter outside tags/placeholders). Pure numbers / Chinese / symbols are refused by the AI
+	 * guard in {@link Translator#hasTranslatableText}, so asking would only sit in the poll until the
+	 * timeout and show the misleading "translation timed out" message.
+	 */
+	static boolean needsTranslation(String text)
+	{
+		return Translator.hasTranslatableText(text);
 	}
 
 	private void pollTranslate()

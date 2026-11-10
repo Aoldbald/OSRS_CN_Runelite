@@ -21,19 +21,19 @@ public interface OsrscnConfig extends Config
 	@ConfigSection(name = "通用", description = "", position = 1)
 	String general = "general";
 
-	@ConfigSection(name = "翻译", description = "", position = 2)
-	String translate = "translate";
-
-	@ConfigSection(name = "外观", description = "", position = 3)
-	String display = "display";
-
 	@ConfigSection(
-			name = "AI 翻译",
-			description = "开启后，本地查表缺失的游戏英文文本会发送到你设置的翻译服务器（本地 Ollama 或在线 API）翻译。玩家名永不发送。默认用本地 Ollama。",
-			position = 4)
-	String ai = "ai";
+			name = "AI 翻译（共用）",
+			description = "两种后端（本地 Ollama / 在线 API）共用的设置。开启后，本地查表缺失的游戏英文文本会发送到你设置的翻译服务器翻译，玩家名永不发送。默认用本地 Ollama；后端专属的地址与模型见下方两个分节。",
+			position = 2)
+	String aiCommon = "aiCommon";
 
-	@ConfigSection(name = "调试", description = "", position = 6, closedByDefault = true)
+	@ConfigSection(name = "AI 后端：本地 Ollama", description = "", position = 3, closedByDefault = true)
+	String aiOllama = "aiOllama";
+
+	@ConfigSection(name = "AI 后端：在线 API", description = "", position = 4, closedByDefault = true)
+	String aiApi = "aiApi";
+
+	@ConfigSection(name = "调试", description = "", position = 5, closedByDefault = true)
 	String debug = "debug";
 
 	// ===== 联系作者 / 反馈 =====
@@ -54,7 +54,8 @@ public interface OsrscnConfig extends Config
 			keyName = "loginNotice",
 			name = "登录提示",
 			description = "每次登录时，在聊天框显示一行插件版本和发布渠道。"
-					+ "本插件永久免费，只在 RuneLite 插件库发布，这一行是为了让你认出别处收费转卖的假冒版本。不想看可以关掉。",
+					+ "本插件永久免费，只在 RuneLite 插件库发布，"
+					+ "<br>这一行是为了让你认出别处收费转卖的假冒版本。不想看可以关掉。",
 			section = feedback,
 			position = 3
 	)
@@ -67,7 +68,8 @@ public interface OsrscnConfig extends Config
 			keyName = "collectMissing",
 			name = "帮忙补全汉化",
 			description = "想为汉化出份力就开它。游戏里查不到的文本会存到本地缺词文件"
-					+ "（不含聊天；单开此项不会上传），攒一阵点侧边栏「缺词」按钮即可一键提交。",
+					+ "（不含聊天；单开此项不会上传），"
+					+ "<br>攒一阵点侧边栏「缺词」按钮即可一键提交。",
 			section = feedback,
 			position = 1
 	)
@@ -81,7 +83,7 @@ public interface OsrscnConfig extends Config
 			name = "自动上传缺词",
 			description = "定期把收集到、且通过本地检查的缺词自动发送给汉化组，免去手动提交。每条包含游戏英文原文、"
 					+ "文本类别和来源标记（如对话 NPC 名），附匿名安装 ID（不含玩家聊天、不含账号信息）。"
-					+ "开启时会弹窗确认，随时可关。",
+					+ "<br>开启时会弹窗确认，随时可关。",
 			section = feedback,
 			position = 2
 	)
@@ -128,14 +130,14 @@ public interface OsrscnConfig extends Config
 		return "https://raw.githubusercontent.com/Aoldbald/OSRS_CN_Data_Runelite/main/public/zh/";
 	}
 
-	// ===== 翻译 =====
+	// ===== 通用：翻译开关 =====
 
 	@ConfigItem(
 			keyName = "translateMenus",
 			name = "菜单",
 			description = "翻译右键菜单和左上角悬停的动作文字",
-			section = translate,
-			position = 0
+			section = general,
+			position = 3
 	)
 	default boolean translateMenus()
 	{
@@ -147,9 +149,9 @@ public interface OsrscnConfig extends Config
 			name = "搜索结果物品名",
 			description = "大交易所和银行搜索时，把候选物品名显示成中文。"
 					+ "只打一两个字母时候选很多，一屏几十个名字要现画，配置较低的机器会掉帧，卡就关掉。"
-					+ "关掉只影响候选列表，搜索框的提示文字照常是中文。",
-			section = translate,
-			position = 1
+					+ "<br>关掉只影响候选列表，搜索框的提示文字照常是中文。",
+			section = general,
+			position = 4
 	)
 	default boolean translateSearchResults()
 	{
@@ -160,8 +162,8 @@ public interface OsrscnConfig extends Config
 			keyName = "translateGameMessages",
 			name = "游戏消息",
 			description = "翻译聊天框里的游戏消息（物品/NPC 查看、升级、系统提示等）。不影响玩家发言。",
-			section = translate,
-			position = 2
+			section = general,
+			position = 5
 	)
 	default boolean translateGameMessages()
 	{
@@ -172,11 +174,12 @@ public interface OsrscnConfig extends Config
 			keyName = "playerChatMode",
 			name = "公屏玩家发言",
 			description = "其他玩家公共聊天的处理方式（含管理员和自动喊话）。玩家名字任何情况都不翻译。"
-					+ "「不翻译」按原频道颜色显示英文；「翻译」直接把英文行替换成中文；"
-					+ "「翻译并另起一行」保留英文行，下面另插一条中文翻译（如 OSRS_CN: 玩家名: 你好）。"
+					+ "<br>「不翻译」按原频道颜色显示英文；「翻译」直接把英文行替换成中文；"
+					+ "「翻译并另起一行」保留英文行，"
+					+ "<br>下面另插一条中文翻译（如 OSRS_CN: 玩家名: 你好）。"
 					+ "玩家黑话翻译质量不稳，且会占用 AI 翻译队列。",
-			section = translate,
-			position = 3
+			section = general,
+			position = 6
 	)
 	default PlayerChatMode playerChatMode()
 	{
@@ -187,25 +190,26 @@ public interface OsrscnConfig extends Config
 			keyName = "groupChatMode",
 			name = "额外频道玩家发言",
 			description = "独立设置 Friends Chat、Clan、Guest、GIM 的玩家发言；不受「公屏玩家发言」影响。"
-					+ "默认不翻译；可直接翻译或保留英文另起一行。缺少译文时需开启「启用 AI 翻译」。"
-					+ "正文发送至所选 AI 后端：本机 Ollama 在本机处理，在线 API 或远程地址会发送至远端。"
-					+ "玩家名保持原样，不发送给 AI。切换后仅翻译新来信。",
-			section = translate,
-			position = 4
+					+ "<br>默认不翻译；可直接翻译或保留英文另起一行。缺少译文时需开启「启用 AI 翻译」。"
+					+ "<br>正文发送至所选 AI 后端：本机 Ollama 在本机处理，在线 API 或远程地址会发送至远端。"
+					+ "玩家名保持原样，"
+					+ "<br>不发送给 AI。切换后仅翻译新来信。",
+			section = general,
+			position = 7
 	)
 	default PlayerChatMode groupChatMode()
 	{
 		return PlayerChatMode.OFF;
 	}
 
-	// ===== 外观 =====
+	// ===== 通用：外观 =====
 
 	@ConfigItem(
 			keyName = "mainFontSize",
 			name = "对话字号",
 			description = "对话文字的中文字号。只影响对话；界面、菜单、悬停提示用固定字号以避免重叠超框。",
-			section = display,
-			position = 0
+			section = general,
+			position = 8
 	)
 	@Range(min = 8, max = 22)
 	@Units("pt")
@@ -218,22 +222,22 @@ public interface OsrscnConfig extends Config
 			keyName = "fontPath",
 			name = "自定义字体",
 			description = "中文字图用的字体文件路径（.ttf/.otf）。留空则用插件内置开源字体（思源黑体 Source Han Sans）。改后即时生效。",
-			section = display,
-			position = 1
+			section = general,
+			position = 9
 	)
 	default String fontPath()
 	{
 		return "";
 	}
 
-	// ===== AI 翻译 =====
+	// ===== AI 翻译（共用） =====
 
 	@ConfigItem(
 			keyName = "useLocalAi",
 			name = "启用 AI 翻译",
 			description = "查表没有时，用 AI 翻译缺失文本（后端见下方「AI 后端」）。"
 					+ "开启后会把缺失的游戏英文文本发送到你配置的翻译服务器。",
-			section = ai,
+			section = aiCommon,
 			position = 0
 	)
 	default boolean useLocalAi()
@@ -246,7 +250,7 @@ public interface OsrscnConfig extends Config
 			name = "AI 后端",
 			description = "AI 翻译用哪个后端。「本地 Ollama」免费私密但要 GPU；"
 					+ "「在线 API」用 DeepSeek/OpenAI 等云端服务，按量付费，会把游戏文本发到该服务商。",
-			section = ai,
+			section = aiCommon,
 			position = 1
 	)
 	default AiBackend aiBackend()
@@ -258,7 +262,7 @@ public interface OsrscnConfig extends Config
 			keyName = "aiFillInterface",
 			name = "界面缺词 AI 翻译",
 			description = "界面里查表没有的文字也用 AI 翻译（含新版技能指南正文的缺句）",
-			section = ai,
+			section = aiCommon,
 			position = 2
 	)
 	default boolean aiFillInterface()
@@ -270,8 +274,8 @@ public interface OsrscnConfig extends Config
 			keyName = "reconstructJournals",
 			name = "成就/任务日志整句翻译",
 			description = "把成就日志/任务日志里被折行拆碎的任务拼回整句再翻译，并保留完成/要求的颜色区分。"
-					+ "需配合「界面缺词 AI 翻译」效果最好；不满意可关闭。",
-			section = ai,
+					+ "<br>需配合「界面缺词 AI 翻译」效果最好；不满意可关闭。",
+			section = aiCommon,
 			position = 3
 	)
 	default boolean reconstructJournals()
@@ -283,8 +287,9 @@ public interface OsrscnConfig extends Config
 			keyName = "skillGuideOverlay",
 			name = "新版技能指南翻译",
 			description = "翻译新版技能指南（OSRS 设置 Enable new-style skill guide interface 的界面）：正文整段重排为中文，"
-					+ "图标、链接、维基横幅保持可用。游戏更新若导致排版异常，可临时关闭恢复英文。",
-			section = ai,
+					+ "图标、链接、维基横幅保持可用。"
+					+ "<br>游戏更新若导致排版异常，可临时关闭恢复英文。",
+			section = aiCommon,
 			position = 4
 	)
 	default boolean skillGuideOverlay()
@@ -295,11 +300,13 @@ public interface OsrscnConfig extends Config
 	@ConfigItem(
 			keyName = "aiConcurrency",
 			name = "翻译并发数",
-			description = "同时进行的 AI 翻译请求数。越大填充越快，但更吃 GPU、可能掉帧（Ollama 需开并行）",
-			section = ai,
+			description = "同时进行的 AI 翻译请求数。对本地 Ollama 和在线 API 都生效；"
+					+ "上限 64；实际吞吐仍受 AI 服务商限流与本机性能影响。"
+					+ "<br>越大填充越快，但更吃 GPU、可能掉帧（Ollama 需开并行）",
+			section = aiCommon,
 			position = 5
 	)
-	@Range(min = 1, max = 6)
+	@Range(min = 1, max = 64)
 	default int aiConcurrency()
 	{
 		return 1;
@@ -309,7 +316,7 @@ public interface OsrscnConfig extends Config
 			keyName = "aiPaceMs",
 			name = "翻译间隔(ms)",
 			description = "每次 AI 翻译之间的最小间隔。越小填充越快、越吃 GPU；越大越省 FPS",
-			section = ai,
+			section = aiCommon,
 			position = 6
 	)
 	@Range(min = 0, max = 1000)
@@ -320,11 +327,29 @@ public interface OsrscnConfig extends Config
 	}
 
 	@ConfigItem(
+			keyName = "testConnection",
+			name = "测试连接（点一下）",
+			description = "勾一下立即测试当前「AI 后端」是否连通（在线 API 还会验密钥），结果用弹窗提示。"
+					+ "先只查模型清单，不消耗 token；若供应商不提供 /models，会补发一个最小请求验证"
+					+ "（约 1 token；个别供应商不接受长度上限时会再试一次）。"
+					+ "<br>测试后该项会自动重置为未勾选；RuneLite 设置面板不会即时刷新这个勾选框，"
+					+ "<br>重新打开本页即可看到。侧边栏「翻译 → 测试 AI 连接」有同功能按钮，结果直接显示在侧边栏。",
+			section = aiCommon,
+			position = 7
+	)
+	default boolean testConnection()
+	{
+		return false;
+	}
+
+	// ===== AI 后端：本地 Ollama =====
+
+	@ConfigItem(
 			keyName = "ollamaUrl",
 			name = "Ollama 地址",
-			description = "本地 Ollama 服务地址（后端选「本地 Ollama」时使用）",
-			section = ai,
-			position = 7
+			description = "本地 Ollama 服务地址",
+			section = aiOllama,
+			position = 0
 	)
 	default String ollamaUrl()
 	{
@@ -334,22 +359,23 @@ public interface OsrscnConfig extends Config
 	@ConfigItem(
 			keyName = "ollamaModel",
 			name = "Ollama 模型",
-			description = "用于翻译的模型名（后端选「本地 Ollama」时使用）",
-			section = ai,
-			position = 8
+			description = "用于翻译的模型名",
+			section = aiOllama,
+			position = 1
 	)
 	default String ollamaModel()
 	{
 		return "qwen2.5";
 	}
 
+	// ===== AI 后端：在线 API =====
+
 	@ConfigItem(
 			keyName = "aiProvider",
 			name = "API 服务商",
-			description = "后端选「在线 API」时使用。选一个常用服务商会自动填好下面的「API 地址」"
-					+ "（之后仍可手改）。选「自定义」则自己填地址。",
-			section = ai,
-			position = 9
+			description = "选一个常用服务商会自动填好下面的「API 地址」（之后仍可手改）。选「自定义」则自己填地址。",
+			section = aiApi,
+			position = 0
 	)
 	default AiProvider aiProvider()
 	{
@@ -361,8 +387,8 @@ public interface OsrscnConfig extends Config
 			name = "API 地址",
 			description = "OpenAI 兼容接口的基础地址，如 https://api.deepseek.com。"
 					+ "插件会自动补 /chat/completions。一般选好「API 服务商」即可自动填。",
-			section = ai,
-			position = 10
+			section = aiApi,
+			position = 1
 	)
 	default String apiUrl()
 	{
@@ -372,9 +398,9 @@ public interface OsrscnConfig extends Config
 	@ConfigItem(
 			keyName = "apiKey",
 			name = "API 密钥",
-			description = "服务商给的 API Key（后端选「在线 API」时使用）。保存在本地 RuneLite 配置里，不要分享给别人。",
-			section = ai,
-			position = 11,
+			description = "服务商给的 API Key。保存在本地 RuneLite 配置里，不要分享给别人。",
+			section = aiApi,
+			position = 2,
 			secret = true
 	)
 	default String apiKey()
@@ -385,9 +411,9 @@ public interface OsrscnConfig extends Config
 	@ConfigItem(
 			keyName = "apiModel",
 			name = "API 模型",
-			description = "模型名（后端选「在线 API」时使用），如 deepseek-chat、gpt-4o-mini、Qwen/Qwen2.5-7B-Instruct 等。",
-			section = ai,
-			position = 12
+			description = "模型名，如 deepseek-chat、gpt-4o-mini、Qwen/Qwen2.5-7B-Instruct 等。",
+			section = aiApi,
+			position = 3
 	)
 	default String apiModel()
 	{
@@ -395,16 +421,20 @@ public interface OsrscnConfig extends Config
 	}
 
 	@ConfigItem(
-			keyName = "testConnection",
-			name = "测试连接（点一下）",
-			description = "勾一下立即测试当前「AI 后端」是否连通（在线 API 还会验密钥），不消耗 token。"
-					+ "勾后会自动弹回，结果用弹窗提示。",
-			section = ai,
-			position = 13
+			keyName = "apiExtraHeaders",
+			name = "附加请求头",
+			description = "部分供应商要求每个请求带特定 header。例如 OpenCode Go 要求 x-opencode-session（固定不变的 session id），"
+					+ "并建议自定义 User-Agent。"
+					+ "<br>session id 和 User-Agent 都可以随意填写，但只能用 ASCII、不要含分号。"
+					+ "例：x-opencode-session: OSRSCN; User-Agent: OSRSCN"
+					+ "<br>留空＝不发送任何附加请求头（和以前完全一样）。"
+					+ "Host、Content-Type、Authorization 等保留头会被忽略。此栏不遮挡，请勿粘贴 API 密钥。填完点击别处才会保存。",
+			section = aiApi,
+			position = 4
 	)
-	default boolean testConnection()
+	default String apiExtraHeaders()
 	{
-		return false;
+		return "";
 	}
 
 	// ===== 调试 =====

@@ -7,6 +7,7 @@ import com.osrscn.hooks.DialogueHandler;
 import com.osrscn.hooks.InterfaceTranslator;
 import com.osrscn.hooks.MenuTranslator;
 import com.osrscn.hooks.OverheadHandler;
+import com.osrscn.sprite.SpriteOverrides;
 import com.osrscn.translate.AiTranslator;
 import com.osrscn.translate.MissingCollector;
 import com.osrscn.translate.MissingUploader;
@@ -93,6 +94,8 @@ public class OsrscnPlugin extends Plugin
 	private ToggleOverlay toggleOverlay;
 	@Inject
 	private LoginBanner loginBanner;
+	@Inject
+	private SpriteOverrides spriteOverrides;
 	@Inject
 	private ClientToolbar clientToolbar;
 	@Inject
@@ -278,6 +281,7 @@ public class OsrscnPlugin extends Plugin
 		overlayManager.add(hoverTooltipOverlay);
 		overlayManager.add(toggleOverlay);
 		loginBanner.apply();
+		spriteOverrides.install();
 		addPanel();
 		// say so whenever collected words actually leave the machine: silence looks broken, and the
 		// person the data belongs to should be able to see it happen
@@ -299,6 +303,7 @@ public class OsrscnPlugin extends Plugin
 		overlayManager.remove(hoverTooltipOverlay);
 		overlayManager.remove(toggleOverlay);
 		loginBanner.remove();
+		spriteOverrides.uninstall();
 		if (navButton != null)
 		{
 			panel.stop();
@@ -578,6 +583,12 @@ public class OsrscnPlugin extends Plugin
 			// Synchronous invalidation retains rapid model round trips before the next lookup.
 			aiTranslator.configurationChanged();
 		}
+		if ("apiExtraHeaders".equals(key))
+		{
+			// Headers are not part of the cache/model identity: keep the cache, just re-parse the
+			// snapshot and drop any backoff the old headers may have caused.
+			aiTranslator.requestHeadersChanged();
+		}
 		if ("playerChatMode".equals(key) || "groupChatMode".equals(key))
 		{
 			// ConfigChanged is synchronous on its caller's thread. Record every transition now,
@@ -596,7 +607,7 @@ public class OsrscnPlugin extends Plugin
 		{
 			configManager.setConfiguration(OsrscnConfig.GROUP, "apiUrl", config.aiProvider().getUrl());
 		}
-		// "测试连接" is a checkbox acting as a button: tick -> reset to off, run the no-token test, pop the result.
+		// "测试连接" is a checkbox acting as a button: tick -> reset to off, run the connection test, pop the result.
 		if ("testConnection".equals(key) && config.testConnection())
 		{
 			configManager.setConfiguration(OsrscnConfig.GROUP, "testConnection", false);

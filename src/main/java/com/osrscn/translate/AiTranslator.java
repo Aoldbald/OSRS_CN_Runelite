@@ -11,6 +11,9 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -21,6 +24,7 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.RuneLite;
 import okhttp3.Call;
 import okhttp3.Callback;
+import okhttp3.Dispatcher;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -66,7 +70,20 @@ public class AiTranslator
 
 	@Inject
 	private OkHttpClient httpClient;
-	private OkHttpClient ollamaHttpClient; // shares the injected dispatcher and connection pool
+	private OkHttpClient ollamaHttpClient; // shares the private AI dispatcher and the injected connection pool
+	// AI inference gets a dispatcher of its own: the injected client's per-host limit (5) belongs to
+	// RuneLite and is shared with every other plugin, so translating through it caps this plugin at 5
+	// concurrent requests no matter what aiConcurrency says. The private dispatcher reuses the injected
+	// client's executor service, so it creates no threads of its own and needs no shutdown. Both fields
+	// are lazily built under this monitor, like ollamaHttpClient.
+	private static final int AI_MAX_REQUESTS_PER_HOST = 64;
+	private OkHttpClient apiInferenceClient;
+	private Dispatcher inferenceDispatcher;
+	// Lazily derived from httpClient for connectivity checks. Volatile and deliberately unlocked:
+	// testConnection runs on the EDT and must not take this monitor (ensureLoaded/persistToDisk hold it
+	// across disk IO). A racing first call may build a second client, which is benign - both share the
+	// injected dispatcher and connection pool, and the last instance written simply wins.
+	private volatile OkHttpClient testHttpClient;
 
 	@Inject
 	private OsrscnConfig config;
@@ -88,6 +105,12 @@ public class AiTranslator
 	private File cacheFile;
 	private volatile long lastDispatch;
 
+	// Custom request headers (apiExtraHeaders) re-parsed only when the configured text changes. The
+	// pair is written map-then-spec and replaced wholesale, so no monitor is needed (testConnection
+	// may read it from the EDT).
+	private volatile String parsedHeadersSpec;
+	private volatile Map<String, String> parsedHeaders = Collections.emptyMap();
+
 	// Back off when the backend keeps failing (Ollama down, API unreachable) instead of
 	// re-firing a request on every lookup miss.
 	private static final int BACKOFF_AFTER_FAILURES = 3;
@@ -95,6 +118,12 @@ public class AiTranslator
 	private static final long BACKOFF_MAX_MS = 300_000;
 	private final java.util.concurrent.atomic.AtomicInteger failStreak = new java.util.concurrent.atomic.AtomicInteger();
 	private volatile long backoffUntil;
+
+	// Some models (o1/o3/gpt-5, strict proxies) reject the optional temperature parameter with
+	// 400/422. Once a retry without it succeeds, this configuration omits temperature from every
+	// later request instead of burning a guaranteed 400/422 round trip per line. Only
+	// configurationChanged() (model/backend/URL/key) clears it, because a new endpoint may accept it.
+	private volatile boolean apiTemperatureUnsupported;
 
 	// monitor stats
 	private final java.util.concurrent.atomic.AtomicInteger sessionCount = new java.util.concurrent.atomic.AtomicInteger();
@@ -221,6 +250,7 @@ public class AiTranslator
 		}
 		lastDispatch = System.currentTimeMillis();
 		RequestState state = new RequestState(generation, loadedModel);
+		state.withoutTemperature = apiTemperatureUnsupported;
 		try
 		{
 			request(english, persist, state);
@@ -318,6 +348,7 @@ public class AiTranslator
 		cacheFile = null;
 		cache.clear();
 		persisted.clear();
+		apiTemperatureUnsupported = false; // a new model/backend/URL/key may accept temperature again
 	}
 
 	private void invalidateRequests()
@@ -329,11 +360,26 @@ public class AiTranslator
 		lastDispatch = 0;
 	}
 
+	/**
+	 * Re-read the custom request headers on the next request. Headers are presentation, not identity:
+	 * cached translations and in-flight requests stay valid, so only the parsed snapshot and a stale
+	 * backoff (a previous 4xx may have been caused by the old headers) are cleared.
+	 */
+	public void requestHeadersChanged()
+	{
+		parsedHeadersSpec = null;
+		parsedHeaders = Collections.emptyMap();
+		failStreak.set(0);
+		backoffUntil = 0;
+	}
+
 	private static final class RequestState
 	{
 		final long generation;
 		final String model;
 		boolean completed;
+		boolean withoutTemperature; // this attempt omitted the optional temperature field
+		boolean retryWithoutTemperature; // the provider rejected temperature: retry once without it
 
 		RequestState(long generation, String model)
 		{
@@ -414,13 +460,39 @@ public class AiTranslator
 		}
 	}
 
+	/**
+	 * Private dispatcher for AI inference. Reuses the injected client's executor service so no extra
+	 * pool is created and nothing needs shutting down; only the per-host gate is raised, and only for
+	 * this plugin. Called under this monitor.
+	 */
+	private Dispatcher inferenceDispatcher()
+	{
+		if (inferenceDispatcher == null)
+		{
+			inferenceDispatcher = new Dispatcher(httpClient.dispatcher().executorService());
+			inferenceDispatcher.setMaxRequests(AI_MAX_REQUESTS_PER_HOST);
+			inferenceDispatcher.setMaxRequestsPerHost(AI_MAX_REQUESTS_PER_HOST);
+		}
+		return inferenceDispatcher;
+	}
+
 	/** Called under this monitor; only local inference gets the cold-load budget. */
 	private OkHttpClient inferenceClient(boolean api)
 	{
-		if (api) return httpClient;
+		if (api)
+		{
+			if (apiInferenceClient == null)
+			{
+				apiInferenceClient = httpClient.newBuilder()
+						.dispatcher(inferenceDispatcher())
+						.build();
+			}
+			return apiInferenceClient;
+		}
 		if (ollamaHttpClient == null)
 		{
 			ollamaHttpClient = httpClient.newBuilder()
+					.dispatcher(inferenceDispatcher())
 					.readTimeout(OLLAMA_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
 					.callTimeout(OLLAMA_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
 					.build();
@@ -436,7 +508,9 @@ public class AiTranslator
 
 		boolean api = config.aiBackend() == AiBackend.OPENAI;
 		final String url = api ? apiEndpoint() : ollamaEndpoint();
-		Request req = api ? buildApiRequest(url, messages, state.model) : buildOllamaRequest(url, messages, state.model);
+		Request req = api
+				? buildApiRequest(url, messages, state.model, !state.withoutTemperature)
+				: buildOllamaRequest(url, messages, state.model);
 		if (req == null)
 		{
 			finish(english, state); // misconfigured: no request, and no failure/backoff increment
@@ -467,13 +541,32 @@ public class AiTranslator
 				{
 					if (!r.isSuccessful())
 					{
+						// Compatibility: providers/models that reject the optional temperature field with
+						// 400/422 get exactly one retry without it. A rejected retry is a normal failure.
+						boolean retry = api && !state.withoutTemperature
+								&& (r.code() == 400 || r.code() == 422);
 						synchronized (AiTranslator.this)
 						{
 							if (!isCurrent(state)) return;
-							recordFailure();
+							if (!retry)
+							{
+								recordFailure();
+							}
+							state.retryWithoutTemperature = retry;
 						}
-						if (persist) log.warn("OSRSCN AI HTTP {} for model '{}'", r.code(), state.model);
-						else log.warn("OSRSCN AI HTTP {} (non-persistent request)", r.code());
+						if (retry)
+						{
+							if (persist) log.warn("OSRSCN AI HTTP {} for model '{}', retrying without temperature", r.code(), state.model);
+							else log.warn("OSRSCN AI HTTP {} (non-persistent request), retrying without temperature", r.code());
+						}
+						else if (persist)
+						{
+							log.warn("OSRSCN AI HTTP {} for model '{}'", r.code(), state.model);
+						}
+						else
+						{
+							log.warn("OSRSCN AI HTTP {} (non-persistent request)", r.code());
+						}
 						return;
 					}
 					// Response IO/parse must not hold the model monitor: switching may happen mid-read.
@@ -482,6 +575,12 @@ public class AiTranslator
 					{
 						if (!isCurrent(state)) return;
 						recordSuccess();
+						if (state.withoutTemperature)
+						{
+							// The provider accepted a request without temperature: remember that this
+							// model rejects it so later lines skip the guaranteed 400/422 first attempt.
+							apiTemperatureUnsupported = true;
+						}
 						if (content != null && !content.isEmpty())
 						{
 							String zh = clean(content);
@@ -509,7 +608,34 @@ public class AiTranslator
 				}
 				finally
 				{
-					synchronized (AiTranslator.this) { finish(english, state); }
+					synchronized (AiTranslator.this)
+					{
+						if (state.retryWithoutTemperature && isCurrent(state))
+						{
+							// Retry in place: the request keeps its in-flight ownership and is not finished,
+							// so callers still see it pending and no second slot is consumed.
+							state.retryWithoutTemperature = false;
+							state.withoutTemperature = true;
+							try
+							{
+								request(english, persist, state);
+							}
+							catch (RuntimeException e)
+							{
+								if (isCurrent(state))
+								{
+									recordFailure();
+									finish(english, state);
+								}
+								if (persist) log.warn("OSRSCN AI retry dispatch failed", e);
+								else log.warn("OSRSCN AI retry dispatch failed (non-persistent request): {}", e.getClass().getSimpleName());
+							}
+						}
+						else
+						{
+							finish(english, state);
+						}
+					}
 				}
 			}
 		});
@@ -543,16 +669,42 @@ public class AiTranslator
 		return config.ollamaUrl().replaceAll("/+$", "") + "/api/chat";
 	}
 
+	/**
+	 * Parsed {@code apiExtraHeaders}, re-parsed only when the configured text changes. Never null; an
+	 * empty map means no extra headers. Names only are logged - values are user settings that may be
+	 * sensitive (the config item is deliberately not masked, so it may hold a pasted key by mistake).
+	 */
+	private Map<String, String> extraHeaders()
+	{
+		String spec = config.apiExtraHeaders();
+		if (spec == null)
+		{
+			spec = "";
+		}
+		if (!spec.equals(parsedHeadersSpec))
+		{
+			Map<String, String> parsed = ExtraHeaders.parse(spec);
+			parsedHeaders = parsed;
+			parsedHeadersSpec = spec;
+			if (!parsed.isEmpty())
+			{
+				log.info("OSRSCN AI: applied custom request headers {}", parsed.keySet());
+			}
+		}
+		return parsedHeaders;
+	}
+
 	private Request buildOllamaRequest(String url, JsonArray messages, String model)
 	{
 		JsonObject body = new JsonObject();
 		body.addProperty("model", model);
 		body.addProperty("stream", false);
 		body.add("messages", messages);
-		return new Request.Builder()
+		Request.Builder builder = new Request.Builder()
 				.url(url)
-				.post(RequestBody.create(JSON, gson.toJson(body)))
-				.build();
+				.post(RequestBody.create(JSON, gson.toJson(body)));
+		ExtraHeaders.apply(extraHeaders(), builder);
+		return builder.build();
 	}
 
 	/** Base API address (auto-filled from the provider preset) with {@code /chat/completions} appended. */
@@ -566,7 +718,7 @@ public class AiTranslator
 		return base.endsWith("/chat/completions") ? base : base + "/chat/completions";
 	}
 
-	private Request buildApiRequest(String url, JsonArray messages, String model)
+	private Request buildApiRequest(String url, JsonArray messages, String model, boolean includeTemperature)
 	{
 		String key = config.apiKey().trim();
 		model = model.trim();
@@ -578,46 +730,54 @@ public class AiTranslator
 		JsonObject body = new JsonObject();
 		body.addProperty("model", model);
 		body.addProperty("stream", false);
+		if (includeTemperature)
+		{
+			// Fixed low temperature: it only narrows run-to-run sampling variance for the same line.
+			// It does not by itself keep proper nouns in English or fix terminology drift; the prompt /
+			// glossary has to do that.
+			body.addProperty("temperature", 0.3);
+		}
 		body.add("messages", messages);
-		return new Request.Builder()
+		Request.Builder builder = new Request.Builder()
 				.url(url)
-				.addHeader("Authorization", "Bearer " + key)
-				.post(RequestBody.create(JSON, gson.toJson(body)))
-				.build();
+				.post(RequestBody.create(JSON, gson.toJson(body)));
+		ExtraHeaders.apply(extraHeaders(), builder);
+		return builder.addHeader("Authorization", "Bearer " + key).build();
 	}
 
 	/**
-	 * Check connectivity to the active backend without spending any tokens: lists models
-	 * (Ollama {@code /api/tags}, OpenAI {@code /models}) - no text is generated. The result lands on an
-	 * OkHttp thread, so the Swing caller must marshal {@code onResult} back to the EDT.
+	 * Check connectivity to the active backend. Ollama only lists tags ({@code /api/tags}). Online APIs
+	 * use two steps: list models first (no tokens), then, when the provider does not serve
+	 * {@code /models}, send one minimal completion (about one token). The result lands on an OkHttp
+	 * thread, so the Swing caller must marshal {@code onResult} back to the EDT.
 	 *
-	 * @param onResult (ok, message): ok=true on a 2xx reply, with a short human-readable message.
+	 * @param onResult (ok, message): ok=true when the backend answered and the key/model are usable,
+	 *                 with a short human-readable message.
 	 */
 	public void testConnection(java.util.function.BiConsumer<Boolean, String> onResult)
 	{
-		boolean api = config.aiBackend() == AiBackend.OPENAI;
-		Request req;
-		if (api)
+		if (config.aiBackend() == AiBackend.OPENAI)
 		{
-			String base = config.apiUrl().trim().replaceAll("/+$", "");
-			String key = config.apiKey().trim();
-			if (base.isEmpty() || key.isEmpty())
-			{
-				onResult.accept(false, "请先填写 API 地址和密钥");
-				return;
-			}
-			req = new Request.Builder().url(base + "/models").header("Authorization", "Bearer " + key).get().build();
+			testApiConnection(onResult);
 		}
 		else
 		{
-			String base = config.ollamaUrl().trim().replaceAll("/+$", "");
-			if (base.isEmpty())
-			{
-				onResult.accept(false, "请先填写 Ollama 地址");
-				return;
-			}
-			req = new Request.Builder().url(base + "/api/tags").get().build();
+			testOllamaConnection(onResult);
 		}
+	}
+
+	/** Local backend: unchanged single-step tag listing. */
+	private void testOllamaConnection(java.util.function.BiConsumer<Boolean, String> onResult)
+	{
+		String base = config.ollamaUrl().trim().replaceAll("/+$", "");
+		if (base.isEmpty())
+		{
+			onResult.accept(false, "请先填写 Ollama 地址");
+			return;
+		}
+		Request.Builder builder = new Request.Builder().url(base + "/api/tags");
+		ExtraHeaders.apply(extraHeaders(), builder);
+		Request req = builder.get().build();
 		httpClient.newCall(req).enqueue(new Callback()
 		{
 			@Override
@@ -633,7 +793,7 @@ public class AiTranslator
 				{
 					if (r.isSuccessful())
 					{
-						onResult.accept(true, api ? "连接成功，密钥有效" : "连接成功");
+						onResult.accept(true, "连接成功");
 					}
 					else if (r.code() == 401 || r.code() == 403)
 					{
@@ -646,6 +806,253 @@ public class AiTranslator
 				}
 			}
 		});
+	}
+
+	/**
+	 * Online backend step 1: {@code GET {apiUrl}/models}. A key/auth/rate-limit answer is definitive and
+	 * stops here; any other failure (or a 2xx that is not a model list) falls through to the one-token
+	 * completion, because some OpenAI-compatible providers do not serve {@code /models} at all.
+	 */
+	private void testApiConnection(java.util.function.BiConsumer<Boolean, String> onResult)
+	{
+		String base = config.apiUrl().trim().replaceAll("/+$", "");
+		String key = config.apiKey().trim();
+		if (base.isEmpty() || key.isEmpty())
+		{
+			onResult.accept(false, "请先填写 API 地址和密钥");
+			return;
+		}
+		Request.Builder builder = new Request.Builder().url(base + "/models");
+		ExtraHeaders.apply(extraHeaders(), builder);
+		Request req = builder.header("Authorization", "Bearer " + key).get().build();
+		testClient().newCall(req).enqueue(new Callback()
+		{
+			@Override
+			public void onFailure(Call call, IOException e)
+			{
+				onResult.accept(false, "连接失败：" + e.getMessage());
+			}
+
+			@Override
+			public void onResponse(Call call, Response response)
+			{
+				try (Response r = response)
+				{
+					if (r.isSuccessful())
+					{
+						Set<String> models = modelIds(r.body() == null ? "" : r.body().string());
+						if (models == null)
+						{
+							testApiCompletion(onResult); // not a model list: probe with a real request
+							return;
+						}
+						String message = "连接成功，密钥有效";
+						String model = config.apiModel().trim();
+						if (model.isEmpty())
+						{
+							message += "（未填写 API 模型）";
+						}
+						else if (!models.contains(model))
+						{
+							message += "（模型清单中未见 " + model + "，请确认模型名）";
+						}
+						onResult.accept(true, message);
+					}
+					else if (r.code() == 401 || r.code() == 403)
+					{
+						onResult.accept(false, "密钥无效或无权限 (HTTP " + r.code() + ")");
+					}
+					else if (r.code() == 429)
+					{
+						onResult.accept(false, "连接正常但被限流 (HTTP 429)");
+					}
+					else
+					{
+						testApiCompletion(onResult); // provider may not expose /models: verify with a request
+					}
+				}
+				catch (IOException e)
+				{
+					onResult.accept(false, "连接失败：" + e.getMessage());
+				}
+			}
+		});
+	}
+
+	/**
+	 * Online backend step 2: one minimal completion against the same URL/auth/header rules as a real
+	 * translation request. Only reached when the model list is missing or not a model list.
+	 */
+	private void testApiCompletion(java.util.function.BiConsumer<Boolean, String> onResult)
+	{
+		String url = apiEndpoint();
+		String key = config.apiKey().trim();
+		String model = config.apiModel().trim();
+		if (url.isEmpty() || key.isEmpty())
+		{
+			onResult.accept(false, "请先填写 API 地址和密钥");
+			return;
+		}
+		if (model.isEmpty())
+		{
+			onResult.accept(false, "请先填写 API 模型");
+			return;
+		}
+		sendProbe(onResult, url, key, model, true);
+	}
+
+	/**
+	 * Sends the probe completion. The first attempt caps the output at one token; a provider that
+	 * rejects that parameter (400/422: newer OpenAI models want {@code max_completion_tokens}, some
+	 * models require a minimum budget) gets exactly one retry with the cap omitted, which is legal for
+	 * every chat-completions dialect. Any other failure is definitive and is never retried.
+	 */
+	private void sendProbe(java.util.function.BiConsumer<Boolean, String> onResult,
+			String url, String key, String model, boolean capOutput)
+	{
+		JsonArray messages = new JsonArray();
+		messages.add(message("user", "hi"));
+		JsonObject body = new JsonObject();
+		body.addProperty("model", model);
+		body.add("messages", messages);
+		if (capOutput)
+		{
+			body.addProperty("max_tokens", 1);
+		}
+		body.addProperty("stream", false);
+		Request.Builder builder = new Request.Builder()
+				.url(url)
+				.post(RequestBody.create(JSON, gson.toJson(body)));
+		ExtraHeaders.apply(extraHeaders(), builder);
+		Request req = builder.addHeader("Authorization", "Bearer " + key).build();
+		testClient().newCall(req).enqueue(new Callback()
+		{
+			@Override
+			public void onFailure(Call call, IOException e)
+			{
+				onResult.accept(false, "连接失败：" + e.getMessage());
+			}
+
+			@Override
+			public void onResponse(Call call, Response response)
+			{
+				try (Response r = response)
+				{
+					if (r.code() == 200)
+					{
+						onResult.accept(true, "连接成功，模型可用");
+						return;
+					}
+					if (r.code() == 401 || r.code() == 403)
+					{
+						onResult.accept(false, "密钥无效或无权限 (HTTP " + r.code() + ")");
+						return;
+					}
+					if (r.code() == 429)
+					{
+						onResult.accept(false, "连接正常但被限流 (HTTP 429)");
+						return;
+					}
+					if (capOutput && (r.code() == 400 || r.code() == 422))
+					{
+						sendProbe(onResult, url, key, model, false); // parameter rejected: retry uncapped
+						return;
+					}
+					String detail = errorMessage(r.body() == null ? "" : r.body().string());
+					onResult.accept(false, detail == null
+							? "连接失败 (HTTP " + r.code() + ")"
+							: "连接失败：" + detail);
+				}
+				catch (IOException e)
+				{
+					onResult.accept(false, "连接失败：" + e.getMessage());
+				}
+			}
+		});
+	}
+
+	/** Lazily derived client for connectivity checks; never mutates the shared {@code httpClient}. */
+	private OkHttpClient testClient()
+	{
+		OkHttpClient client = testHttpClient;
+		if (client == null)
+		{
+			client = httpClient.newBuilder()
+					.readTimeout(30_000, TimeUnit.MILLISECONDS)
+					.build();
+			testHttpClient = client;
+		}
+		return client;
+	}
+
+	/**
+	 * @return the model ids from an OpenAI-style {@code /models} body, or null when the body is not a
+	 *         model list at all (an error page, plain text, or another provider's schema).
+	 */
+	private Set<String> modelIds(String body)
+	{
+		try
+		{
+			JsonObject root = gson.fromJson(body, JsonObject.class);
+			if (root == null || !root.has("data") || !root.get("data").isJsonArray())
+			{
+				return null;
+			}
+			JsonArray data = root.getAsJsonArray("data");
+			Set<String> ids = new HashSet<>();
+			for (int i = 0; i < data.size(); i++)
+			{
+				if (data.get(i).isJsonObject())
+				{
+					JsonObject entry = data.get(i).getAsJsonObject();
+					if (entry.has("id") && entry.get("id").isJsonPrimitive())
+					{
+						ids.add(entry.get("id").getAsString());
+					}
+				}
+			}
+			return ids;
+		}
+		catch (RuntimeException e)
+		{
+			return null; // not JSON / not a model list: the caller falls back to a completion probe
+		}
+	}
+
+	/** Cap for the server error detail shown in a dialog - providers may return whole paragraphs. */
+	private static final int ERROR_DETAIL_MAX = 200;
+
+	/**
+	 * @return the {@code error.message} detail of an OpenAI-style error body, or null when absent.
+	 *         Cleaned for a dialog: CR/LF collapse to spaces and the text is capped at
+	 *         {@link #ERROR_DETAIL_MAX} characters with an ellipsis.
+	 */
+	private String errorMessage(String body)
+	{
+		try
+		{
+			JsonObject root = gson.fromJson(body, JsonObject.class);
+			if (root != null && root.has("error") && root.get("error").isJsonObject())
+			{
+				JsonObject error = root.getAsJsonObject("error");
+				if (error.has("message") && error.get("message").isJsonPrimitive())
+				{
+					String detail = error.get("message").getAsString().trim()
+							.replaceAll("[\\r\\n]+", " ");
+					if (!detail.isEmpty())
+					{
+						return detail.length() > ERROR_DETAIL_MAX
+								? detail.substring(0, ERROR_DETAIL_MAX) + "…"
+								: detail;
+					}
+				}
+			}
+		}
+		catch (RuntimeException e)
+		{
+			return null;
+		}
+		return null;
 	}
 
 	/** Parse the assistant reply from either Ollama ({@code /api/chat}) or OpenAI-style responses. */

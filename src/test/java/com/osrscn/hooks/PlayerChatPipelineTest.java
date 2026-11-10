@@ -412,7 +412,12 @@ public class PlayerChatPipelineTest
         try (Fixture f = new Fixture(PlayerChatMode.INLINE, CHANNELS[0], false, false))
         {
             f.release = new CountDownLatch(1); f.fire(); await(() -> f.requests.get() == 1);
-            f.http.dispatcher().cancelAll(); f.awaitFinished();
+            // AI inference now runs on the plugin's own dispatcher, so cancelling the injected
+            // client's dispatcher no longer reaches it.
+            Object aiDispatcher = field(f.ai, "inferenceDispatcher");
+            assertNotNull("private AI dispatcher must exist once a request was admitted", aiDispatcher);
+            ((okhttp3.Dispatcher) aiDispatcher).cancelAll();
+            f.awaitFinished();
             assertNull(f.ai.cached(EN)); assertEquals(1, ((AtomicInteger) field(f.ai, "failStreak")).get());
             f.release.countDown(); f.release = null; f.chat.tick(); f.awaitResponse(); f.chat.tick();
             f.assertDelivered(); f.assertRequests(2); f.assertPrivate();
@@ -627,7 +632,14 @@ public class PlayerChatPipelineTest
         {
             Field field = AiTranslator.class.getDeclaredField("inFlight"); field.setAccessible(true);
             Set<?> active = (Set<?>) field.get(ai); await(active::isEmpty);
-            await(() -> http.dispatcher().runningCallsCount() == 0 && http.dispatcher().queuedCallsCount() == 0);
+            await(() -> drained(http.dispatcher()));
+            // AI inference runs on the plugin's private dispatcher, which the injected one cannot see.
+            Object aiDispatcher = field(ai, "inferenceDispatcher");
+            if (aiDispatcher != null) await(() -> drained((okhttp3.Dispatcher) aiDispatcher));
+        }
+        private static boolean drained(okhttp3.Dispatcher dispatcher)
+        {
+            return dispatcher.runningCallsCount() == 0 && dispatcher.queuedCallsCount() == 0;
         }
         void assertPrivate() throws Exception
         {

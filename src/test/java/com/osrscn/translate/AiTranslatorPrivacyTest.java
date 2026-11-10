@@ -133,6 +133,7 @@ public class AiTranslatorPrivacyTest
 		String model = "fictional-A";
 		AiBackend backend = AiBackend.OLLAMA;
 		boolean enabled = true;
+		String extraHeaders = "";
 		Consumer<Request> creation;
 		Consumer<Pending> enqueue;
 
@@ -151,6 +152,7 @@ public class AiTranslatorPrivacyTest
 							case "apiKey": return "fictional-placeholder";
 							case "aiPaceMs": return 0;
 							case "aiConcurrency": return 8;
+							case "apiExtraHeaders": return extraHeaders;
 							case "debugMonitor": return false;
 							default: throw new AssertionError("Unexpected config read: " + m.getName());
 						}
@@ -184,6 +186,8 @@ public class AiTranslatorPrivacyTest
 			});
 			Field transport = AiTranslator.class.getDeclaredField("httpClient");
 			transport.setAccessible(true); inject(ai, "ollamaHttpClient", transport.get(ai));
+			// The API branch now returns its own derived client; pin it to the same recording transport.
+			inject(ai, "apiInferenceClient", transport.get(ai));
 			inject(collector, "dir", dir); inject(collector, "config", config); inject(collector, "executor", executor);
 			inject(translator, "ai", ai); inject(translator, "missing", collector);
 			inject(translator, "store", new TranslationStore()); // Empty maps; never load real data.
@@ -413,5 +417,19 @@ public class AiTranslatorPrivacyTest
 		assertNotNull(f.translator.renderChat(GAME, 0, 200, 14, true, false)); f.flush();
 		assertArrayEquals(cache, Files.readAllBytes(f.file().toPath()));
 		assertArrayEquals(missing, Files.readAllBytes(f.collector.missingFile().toPath())); assertEquals(logs, logText());
+	}
+
+	@Test public void customHeaderValuesStayOutOfTheCacheFileAndLogs() throws Exception
+	{
+		Fixture f = new Fixture();
+		String value = "fictional-header-value-7f3a";
+		f.extraHeaders = "x-opencode-session: " + value;
+		f.request(GAME, true).success(GAME_ZH); f.flush();
+		assertEquals(value, f.calls.get(0).request.header("x-opencode-session"));
+		assertTrue(logText().contains("applied custom request headers"));
+		assertTrue(logText().contains("x-opencode-session"));
+		assertFalse("header value must not be logged", logText().contains(value));
+		assertTrue(Files.readString(f.file().toPath()).contains(GAME_ZH));
+		assertFalse("header value must not be persisted", Files.readString(f.file().toPath()).contains(value));
 	}
 }
