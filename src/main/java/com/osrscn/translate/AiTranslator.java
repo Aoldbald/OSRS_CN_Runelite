@@ -11,12 +11,15 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.inject.Inject;
 import javax.inject.Singleton;
@@ -61,7 +64,10 @@ public class AiTranslator
 			"You are translating Old School RuneScape (OSRS) game text to Simplified Chinese.\n"
 			+ "Rules:\n"
 			+ "1. Concise, natural game-style Chinese. This is in-game text, not literature.\n"
-			+ "2. Keep proper nouns without established translations in English.\n"
+			+ "2. Keep proper nouns without established translations in English. When a Terminology list "
+			+ "is present, treat it as reference only: use an entry when the text clearly refers to that "
+			+ "named thing, and translate ordinary words and function words by their normal meaning. "
+			+ "Never translate or repeat the list itself.\n"
 			+ "3. Preserve ALL tags exactly as-is: <br>, <colNum0>, </col>, [player name], [player 1], "
 			+ "<osrscn-name-0>, [milady/sirrah] etc. Keep every <colNumN> placeholder in place around the "
 			+ "same words it wraps in the source. Never translate placeholders and never add "
@@ -88,6 +94,11 @@ public class AiTranslator
 	@Inject
 	private OsrscnConfig config;
 
+	// Terminology source (the local NAME table). Null in unit tests that build AiTranslator directly;
+	// the prompt then carries no Terminology block, exactly as before this feature.
+	@Inject
+	private TranslationStore store;
+
 	@Inject
 	private Gson gson;
 
@@ -95,6 +106,15 @@ public class AiTranslator
 	private java.util.concurrent.ScheduledExecutorService executor;
 	private final ConcurrentHashMap<String, String> cache = new ConcurrentHashMap<>();
 	private final Set<String> inFlight = ConcurrentHashMap.newKeySet();
+	// Lines whose reply was the terminology block instead of a translation. A miss keeps arriving on
+	// every lookup, so without this the same doomed line would be re-sent for the rest of the session.
+	private final Set<String> untranslatable = ConcurrentHashMap.newKeySet();
+	// Terminology is only a hint: a model that copies the block on consecutive exhausted rounds keeps
+	// doing it, so it stops being given one for the rest of this session. Both are reset when the
+	// model/backend identity changes (configurationChanged) and by an explicit cache clear, which
+	// restores the hints without a restart.
+	private final Set<String> glossaryMutedModels = ConcurrentHashMap.newKeySet();
+	private final ConcurrentHashMap<String, Integer> glossaryEchoStreak = new ConcurrentHashMap<>();
 	// Keys known to be on disk. A cache hit re-requested with persist=true gets written on the spot:
 	// the 860 settle gate fires its first requests persist=false (frame unsettled) and replays them
 	// persist=true once stable - without this, guide translations would never survive a restart.
@@ -230,9 +250,10 @@ public class AiTranslator
 	private synchronized void dispatch(String english, boolean persist, long requestedGeneration)
 	{
 		ensureLoaded();
-		if (requestedGeneration != generation || !config.useLocalAi() || cache.containsKey(english))
+		if (requestedGeneration != generation || !config.useLocalAi() || cache.containsKey(english)
+				|| untranslatable.contains(english))
 		{
-			return; // model/config changed or another callback filled this miss while acquiring admission
+			return; // model/config changed, the miss is negative-cached, or another callback filled it
 		}
 		if (System.currentTimeMillis() < backoffUntil)
 		{
@@ -251,6 +272,23 @@ public class AiTranslator
 		lastDispatch = System.currentTimeMillis();
 		RequestState state = new RequestState(generation, loadedModel);
 		state.withoutTemperature = apiTemperatureUnsupported;
+		// Computed once per admitted request, never per lookup/tick. The index is built off-thread at
+		// store load, so this is a token lookup plus a short word-boundary scan (~50us). The hint is
+		// optional: a broken index must degrade to the plain message, not fail the request and leave
+		// the line stuck in inFlight, so its exceptions stay local and are never counted as failures.
+		// A store implementation may also answer null; that means "no hint", exactly like "".
+		try
+		{
+			String hint = store == null || glossaryMutedModels.contains(state.model)
+					? "" : store.glossaryPrompt(english);
+			state.glossaryText = hint == null ? "" : hint;
+		}
+		catch (RuntimeException e)
+		{
+			state.glossaryText = "";
+			log.debug("OSRSCN AI: terminology hint unavailable, continuing without it", e);
+		}
+		state.glossaryEchoRef = state.glossaryText;
 		try
 		{
 			request(english, persist, state);
@@ -348,6 +386,9 @@ public class AiTranslator
 		cacheFile = null;
 		cache.clear();
 		persisted.clear();
+		// Terminology bookkeeping is model identity too: a new model gets a clean echo record.
+		glossaryMutedModels.clear();
+		glossaryEchoStreak.clear();
 		apiTemperatureUnsupported = false; // a new model/backend/URL/key may accept temperature again
 	}
 
@@ -355,6 +396,7 @@ public class AiTranslator
 	{
 		generation++;
 		inFlight.clear();
+		untranslatable.clear(); // a new model/endpoint may translate the lines the old one choked on
 		failStreak.set(0);
 		backoffUntil = 0;
 		lastDispatch = 0;
@@ -380,6 +422,18 @@ public class AiTranslator
 		boolean completed;
 		boolean withoutTemperature; // this attempt omitted the optional temperature field
 		boolean retryWithoutTemperature; // the provider rejected temperature: retry once without it
+		boolean retryWithoutGlossary; // the model echoed the block: retry once without it
+		// An echo was already detected in this round. The retry itself carries no block, but its reply
+		// is still held to the translation acceptance rule, so a model that keeps repeating the source
+		// line cannot have that repeat cached as a translation on the second attempt.
+		boolean glossaryEchoed;
+		// Terminology block for the next attempt ("" = plain user message). Cleared when the model
+		// echoes it, so the retry sends the bare source line. Once cleared it stays empty: that is what
+		// makes the echo retry a single shot instead of a loop.
+		String glossaryText = "";
+		// The block as first sent in this round. Kept after glossaryText is cleared so the echo guard
+		// can still recognise and strip the reference lines the model copied; "" = no block this round.
+		String glossaryEchoRef = "";
 
 		RequestState(long generation, String model)
 		{
@@ -407,9 +461,10 @@ public class AiTranslator
 
 	/**
 	 * Gate for the on-disk reflow cache only - never the in-memory {@code cache}, which always serves live
-	 * on-screen text (cache.put is unconditional). Rejects the two categories that can never be a stable
-	 * cross-session hit and only bloat the cache / pollute reflow submissions: player-authored CJK content
-	 * (game English is never CJK), dynamic value labels, and number-templated messages that never recur.
+	 * on-screen text (every accepted translation is put regardless of this gate). Rejects the two
+	 * categories that can never be a stable cross-session hit and only bloat the cache / pollute reflow
+	 * submissions: player-authored CJK content (game English is never CJK), dynamic value labels, and
+	 * number-templated messages that never recur.
 	 * Deliberately does NOT apply MissingCollector's fragment / MAX_LEN / WORDY rules - those legitimately
 	 * get translated live (e.g. wrapped info-box lines), and dropping them from disk would make AI-off
 	 * users lose the translation next session.
@@ -453,6 +508,11 @@ public class AiTranslator
 		invalidateRequests();
 		cache.clear();
 		persisted.clear();
+		// An explicit clear is the user's "start over", so the terminology bookkeeping goes too:
+		// a model muted for echoing the block gets the hint again. configurationChanged() clears
+		// the same two because a new model identity also starts with a clean echo record.
+		glossaryMutedModels.clear();
+		glossaryEchoStreak.clear();
 		if (cacheFile != null)
 		{
 			//noinspection ResultOfMethodCallIgnored
@@ -504,7 +564,11 @@ public class AiTranslator
 	{
 		JsonArray messages = new JsonArray();
 		messages.add(message("system", SYSTEM_PROMPT));
-		messages.add(message("user", english));
+		// The terminology block is a prefix of the user message (not the system prompt) so the system
+		// prompt keeps its stable prefix for provider-side prompt caching. Empty means the user message
+		// is byte-identical to what this plugin sent before the glossary existed.
+		messages.add(message("user", state.glossaryText.isEmpty()
+				? english : state.glossaryText + "\n\n" + english));
 
 		boolean api = config.aiBackend() == AiBackend.OPENAI;
 		final String url = api ? apiEndpoint() : ollamaEndpoint();
@@ -584,6 +648,33 @@ public class AiTranslator
 						if (content != null && !content.isEmpty())
 						{
 							String zh = clean(content);
+							List<GlossaryRef> references = glossaryRefs(state.glossaryEchoRef);
+							if (isGlossaryEcho(zh, english, state.glossaryEchoRef, references))
+							{
+								state.glossaryEchoed = true;
+								zh = stripGlossaryEcho(zh, references);
+							}
+							if (state.glossaryEchoed && !isUsableTranslation(zh, english))
+							{
+								// The reply was the reference block itself, the source line repeated
+								// back, or a stripped remainder made of nothing else: never a translation.
+								// Retry once without terminology; a second failure means this line cannot
+								// be translated, and repeating the round on every tick would never end.
+								if (!state.glossaryText.isEmpty())
+								{
+									state.retryWithoutGlossary = true;
+									state.glossaryText = "";
+								}
+								else
+								{
+									untranslatable.add(english);
+									markGlossaryEcho(state.model);
+									log.debug("OSRSCN AI: reply repeated the terminology block or the source"
+											+ " line for model '{}'; line marked untranslatable", state.model);
+								}
+								return; // never cache/persist/display a reference block or the source line
+							}
+							glossaryEchoStreak.remove(state.model);
 							cache.put(english, zh);
 							if (persist && isPersistable(english) && persisted.add(english))
 							{
@@ -610,12 +701,25 @@ public class AiTranslator
 				{
 					synchronized (AiTranslator.this)
 					{
-						if (state.retryWithoutTemperature && isCurrent(state))
+						if (isCurrent(state) && (state.retryWithoutTemperature || state.retryWithoutGlossary))
 						{
 							// Retry in place: the request keeps its in-flight ownership and is not finished,
 							// so callers still see it pending and no second slot is consumed.
+							// Only one retry can be pending at a time and neither can loop: a temperature
+							// retry is armed on a rejected HTTP response and cleared here before dispatch,
+							// while a glossary retry is armed on a successful response whose block was
+							// echoed, after glossaryText was cleared - so the bare retry cannot be re-armed.
+							boolean withoutTemperature = state.retryWithoutTemperature;
 							state.retryWithoutTemperature = false;
-							state.withoutTemperature = true;
+							if (withoutTemperature)
+							{
+								state.withoutTemperature = true;
+							}
+							else
+							{
+								// glossaryText was already cleared when the echo was detected.
+								state.retryWithoutGlossary = false;
+							}
 							try
 							{
 								request(english, persist, state);
@@ -1095,6 +1199,246 @@ public class AiTranslator
 	private static String clean(String s)
 	{
 		return THINK.matcher(s).replaceAll("").trim();
+	}
+
+	/** Whitespace-normalized form, so an echoed reference line is recognised regardless of spacing. */
+	private static String flatten(String s)
+	{
+		return s.trim().replaceAll("\\s+", " ").replaceAll("\\s*=>\\s*", " => ");
+	}
+
+	/**
+	 * One {@code en => zh} pair of a terminology block, with the matcher that recognises the model
+	 * copying it back. Detection and stripping share this matcher, so a reply can never be classified
+	 * as an echo and then leave a reference line behind (or be accepted whole while one is inside).
+	 */
+	private static final class GlossaryRef
+	{
+		// The block's own "=>" plus the separators a model commonly retypes it with (Chinese output
+		// often rewrites the arrow; a fullwidth colon needs no spaces at all).
+		private static final String SEPARATOR = "=>|->|→|：|:";
+		final String en;
+		final String zh;
+		final String flattened;
+		private final Pattern line;
+
+		GlossaryRef(String en, String zh)
+		{
+			this.en = en;
+			this.zh = zh;
+			flattened = flatten(en + " => " + zh);
+			// Case-insensitive, with the word boundary in front of the English term made explicit:
+			// a name may end in "'s", so \b is not reliable. The separator itself bounds the end.
+			line = Pattern.compile("(?i)(?<![A-Za-z0-9_])" + Pattern.quote(en)
+					+ "\\s*(?:" + SEPARATOR + ")");
+		}
+
+		/** @return the end index of the first {@code en + separator} occurrence in {@code text}, or -1. */
+		int separatorEnd(String text)
+		{
+			Matcher matcher = line.matcher(text);
+			return matcher.find() ? matcher.end() : -1;
+		}
+	}
+
+	/**
+	 * The reference pairs of one terminology block. The block is generated as one pair per line after
+	 * {@link TermGlossary#HEADER}, so a line with an arrow is always a pair.
+	 */
+	private static List<GlossaryRef> glossaryRefs(String glossaryText)
+	{
+		List<GlossaryRef> references = new ArrayList<>();
+		if (glossaryText == null || glossaryText.isEmpty())
+		{
+			return references;
+		}
+		for (String line : glossaryText.split("\n"))
+		{
+			String flat = flatten(line);
+			int arrow = flat.indexOf("=>");
+			if (arrow <= 0)
+			{
+				continue;
+			}
+			String en = flat.substring(0, arrow).trim();
+			String zh = flat.substring(arrow + 2).trim();
+			if (!en.isEmpty() && !zh.isEmpty())
+			{
+				references.add(new GlossaryRef(en, zh));
+			}
+		}
+		return references;
+	}
+
+	/**
+	 * True when a reply is the reference block instead of a translation: the header constant, a
+	 * complete pair copied from the block, a retyped {@code en + separator} reference line (the model
+	 * may rewrite "=>" as "->", "→" or "："), or - weaker - an arrow in a reply to a source line that
+	 * has none (the block is the only reason the model sees "=>").
+	 */
+	private static boolean isGlossaryEcho(String zh, String english, String glossaryRef,
+			List<GlossaryRef> references)
+	{
+		if (zh.contains(TermGlossary.HEADER))
+		{
+			return true;
+		}
+		if (!references.isEmpty())
+		{
+			String flat = flatten(zh);
+			for (GlossaryRef reference : references)
+			{
+				if (flat.contains(reference.flattened))
+				{
+					return true;
+				}
+			}
+			for (String line : zh.split("\n", -1))
+			{
+				if (findReference(line, references) != null)
+				{
+					return true;
+				}
+			}
+		}
+		return glossaryRef.indexOf("=>") >= 0 && zh.indexOf("=>") >= 0 && english.indexOf("=>") < 0;
+	}
+
+	/**
+	 * Removes copied header and reference lines from a mixed reply, block-aware rather than line-exact:
+	 * the English header, any line that retypes one of the block's pairs (any accepted separator, and
+	 * a pair split as "en =>" + next line "zh" counts as one reference), and - once a reference line
+	 * was seen - the translated block header. Every other line is kept in order.
+	 *
+	 * @return the translation left behind, or "" when the reply was nothing but the block
+	 */
+	private static String stripGlossaryEcho(String zh, List<GlossaryRef> references)
+	{
+		String[] lines = zh.split("\n", -1);
+		boolean referenceSeen = false;
+		for (String line : lines)
+		{
+			if (findReference(line, references) != null)
+			{
+				referenceSeen = true;
+				break;
+			}
+		}
+		StringBuilder kept = new StringBuilder();
+		for (int i = 0; i < lines.length; i++)
+		{
+			String trimmed = lines[i].trim();
+			if (trimmed.isEmpty() || trimmed.contains(TermGlossary.HEADER))
+			{
+				continue;
+			}
+			GlossaryRef reference = findReference(trimmed, references);
+			if (reference != null)
+			{
+				// "crystal gate =>" with the Chinese on the following line: that split pair is one
+				// reference, so consume the continuation line with it.
+				if (i + 1 < lines.length && endsAtSeparator(trimmed, reference)
+						&& lines[i + 1].trim().startsWith(reference.zh))
+				{
+					i++;
+				}
+				continue;
+			}
+			if (referenceSeen && isTranslatedHeader(trimmed))
+			{
+				continue;
+			}
+			if (kept.length() > 0)
+			{
+				kept.append('\n');
+			}
+			kept.append(trimmed);
+		}
+		return kept.toString();
+	}
+
+	/**
+	 * @return the first pair that occurs in {@code line} - either retyped ({@code en + separator}) or
+	 *         copied verbatim with different spacing (the flattened pair is contained in the flattened
+	 *         line) - or null.
+	 */
+	private static GlossaryRef findReference(String line, List<GlossaryRef> references)
+	{
+		String flat = null;
+		for (GlossaryRef reference : references)
+		{
+			if (reference.separatorEnd(line) >= 0)
+			{
+				return reference;
+			}
+			if (flat == null)
+			{
+				flat = flatten(line);
+			}
+			if (flat.contains(reference.flattened))
+			{
+				return reference;
+			}
+		}
+		return null;
+	}
+
+	/** True when a reference line is only {@code en + separator}, with the Chinese on the next line. */
+	private static boolean endsAtSeparator(String line, GlossaryRef reference)
+	{
+		int end = reference.separatorEnd(line);
+		return end >= 0 && line.substring(end).trim().isEmpty();
+	}
+
+	/**
+	 * True for a translated block header: a label-only line that names the terminology and ends at its
+	 * colon ("术语参考翻译："). A line with content after the colon is a translation and is kept.
+	 */
+	private static boolean isTranslatedHeader(String line)
+	{
+		if (line.indexOf("术语") < 0 && line.indexOf("術語") < 0)
+		{
+			return false;
+		}
+		char last = line.charAt(line.length() - 1);
+		return last == '：' || last == ':';
+	}
+
+	/**
+	 * The acceptance rule for a reply that carried (or repeated) the reference block: only real
+	 * Chinese content counts as a translation, never an empty remainder, the source line itself, or a
+	 * remainder with no Chinese at all.
+	 */
+	private static boolean isUsableTranslation(String zh, String english)
+	{
+		if (zh.isEmpty() || !hasCjk(zh))
+		{
+			return false;
+		}
+		return !flatten(zh).equals(flatten(english));
+	}
+
+	private static boolean hasCjk(String text)
+	{
+		for (int i = 0; i < text.length(); i++)
+		{
+			char c = text.charAt(i);
+			if (c >= 0x3400 && c <= 0x9FFF)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** One exhausted echo round for {@code model}; two in a row stop terminology for it this session. */
+	private void markGlossaryEcho(String model)
+	{
+		int streak = glossaryEchoStreak.merge(model, 1, Integer::sum);
+		if (streak >= 2 && glossaryMutedModels.add(model))
+		{
+			log.warn("OSRSCN AI: model '{}' keeps echoing the terminology block; terminology disabled for it", model);
+		}
 	}
 
 	private JsonObject message(String role, String content)
