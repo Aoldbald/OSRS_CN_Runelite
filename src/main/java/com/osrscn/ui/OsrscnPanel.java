@@ -63,6 +63,11 @@ public class OsrscnPanel extends PluginPanel
 					+ "只在 RuneLite 插件库发布。别处收费或私发的都不是我们。";
 	private static final int SEARCH_LIMIT = 40;
 	private static final long TRANSLATE_TIMEOUT_MS = 15_000;
+	private static final String IDENTITY_BLOCK_HINT =
+			"（这段文字含其他玩家或频道的身份信息，AI 翻译会跳过；若翻译表已有整条记录会直接显示）";
+	private static final String AI_OFF_HINT =
+			"（未开启 AI 翻译：这句不在翻译表里。请到 RuneLite 设置 → OSRSCN →「AI 翻译（共用）」"
+					+ "勾选「启用 AI 翻译」后再试）";
 	private static final String K_TAB = "panelTab";
 	private static final String K_SHOW_ZH = "panelShowZh";
 	private static final String K_SHOW_EN = "panelShowEn";
@@ -634,7 +639,21 @@ public class OsrscnPanel extends PluginPanel
 		translatePending = pending;
 		translateDeadline = System.currentTimeMillis() + TRANSLATE_TIMEOUT_MS;
 		translateOutput.setText("翻译中…");
+		// Look the text up once before judging it: a baked table row (or a cached AI translation, which is
+		// still served with AI off) is the useful answer even when the request path would be refused.
 		pollTranslate();
+		if (translatePending == null)
+		{
+			return;
+		}
+		String blocked = translateBlockReason(translatePending, false, config.useLocalAi());
+		if (blocked != null)
+		{
+			translateOutput.setText(blocked);
+			translatePending = null;
+			translatePoll.stop();
+			return;
+		}
 		translatePoll.start();
 	}
 
@@ -647,6 +666,42 @@ public class OsrscnPanel extends PluginPanel
 	static boolean needsTranslation(String text)
 	{
 		return Translator.hasTranslatableText(text);
+	}
+
+	/**
+	 * Manual-translate pre-check for text the panel cannot finish on its own. Called only after the first
+	 * table/cache lookup missed, so a real translation always wins. Order matters:
+	 * <ul>
+	 *   <li>{@code translated} - a table row or cached AI translation is already displayed, so say
+	 *       nothing and never overwrite it;</li>
+	 *   <li>identity frame - {@code Translator.aiTranslate} runs its privacy guard before dispatching, so
+	 *       this is refused whether or not AI is enabled: explain that first;</li>
+	 *   <li>AI disabled - {@code AiTranslator} fast-fails on a cache miss while {@code useLocalAi} is off,
+	 *       so a miss stays null forever: point at the setting instead of waiting for the timeout.</li>
+	 * </ul>
+	 *
+	 * <p>Null/blank input has nothing to explain and never gets a reason.
+	 *
+	 * @param text       the trimmed input that already missed the translation tables
+	 * @param translated whether a translation is already displayed
+	 * @param aiEnabled  {@code OsrscnConfig#useLocalAi()}
+	 * @return a user-facing reason, or null when the poll may keep going
+	 */
+	static String translateBlockReason(String text, boolean translated, boolean aiEnabled)
+	{
+		if (translated || text == null || text.trim().isEmpty())
+		{
+			return null;
+		}
+		if (Translator.hasIdentityContext(text))
+		{
+			return IDENTITY_BLOCK_HINT;
+		}
+		if (!aiEnabled)
+		{
+			return AI_OFF_HINT;
+		}
+		return null;
 	}
 
 	private void pollTranslate()
