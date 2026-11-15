@@ -139,6 +139,14 @@ public class AiTranslator
 	private final java.util.concurrent.atomic.AtomicInteger failStreak = new java.util.concurrent.atomic.AtomicInteger();
 	private volatile long backoffUntil;
 
+	// Content-level failures: a 2xx with an unusable reply is not a transport failure, so it must not
+	// touch failStreak/backoffUntil. A short global pause stops hammering a model that keeps returning junk.
+	private static final int CONTENT_BACKOFF_AFTER_FAILURES = 10;
+	private static final long CONTENT_BACKOFF_MS = 30_000;
+	private final java.util.concurrent.atomic.AtomicInteger contentFailStreak = new java.util.concurrent.atomic.AtomicInteger();
+	private volatile long contentBackoffUntil;
+	private final java.util.Map<String, Integer> contentFailAttempts = new java.util.HashMap<>();
+
 	// Some models (o1/o3/gpt-5, strict proxies) reject the optional temperature parameter with
 	// 400/422. Once a retry without it succeeds, this configuration omits temperature from every
 	// later request instead of burning a guaranteed 400/422 round trip per line. Only
@@ -258,6 +266,10 @@ public class AiTranslator
 		if (System.currentTimeMillis() < backoffUntil)
 		{
 			return; // backend keeps failing: wait out the backoff window
+		}
+		if (System.currentTimeMillis() < contentBackoffUntil)
+		{
+			return; // content keeps failing: brief global pause
 		}
 		// rate limit so Ollama doesn't saturate the GPU and stall the game (both configurable)
 		if (inFlight.size() >= Math.max(1, config.aiConcurrency())
@@ -399,6 +411,9 @@ public class AiTranslator
 		untranslatable.clear(); // a new model/endpoint may translate the lines the old one choked on
 		failStreak.set(0);
 		backoffUntil = 0;
+		contentFailStreak.set(0);
+		contentBackoffUntil = 0;
+		contentFailAttempts.clear();
 		lastDispatch = 0;
 	}
 
@@ -413,6 +428,8 @@ public class AiTranslator
 		parsedHeaders = Collections.emptyMap();
 		failStreak.set(0);
 		backoffUntil = 0;
+		contentFailStreak.set(0);
+		contentBackoffUntil = 0;
 	}
 
 	private static final class RequestState
@@ -635,6 +652,13 @@ public class AiTranslator
 					}
 					// Response IO/parse must not hold the model monitor: switching may happen mid-read.
 					String content = r.body() == null ? null : parseContent(r.body().string());
+					if (content == null)
+					{
+						// No usable content field: parser-level failure. Keep the safe wording (no body,
+						// no exception detail) that the privacy tests depend on.
+						if (persist) log.warn("OSRSCN AI parse failed: reply carried no usable content");
+						else log.warn("OSRSCN AI parse failed (non-persistent request): no usable content");
+					}
 					synchronized (AiTranslator.this)
 					{
 						if (!isCurrent(state)) return;
@@ -645,9 +669,13 @@ public class AiTranslator
 							// model rejects it so later lines skip the guaranteed 400/422 first attempt.
 							apiTemperatureUnsupported = true;
 						}
-						if (content != null && !content.isEmpty())
+						String zh = content == null ? "" : clean(content);
+						if (zh.isEmpty())
 						{
-							String zh = clean(content);
+							contentRejected(english);
+						}
+						else
+						{
 							List<GlossaryRef> references = glossaryRefs(state.glossaryEchoRef);
 							if (isGlossaryEcho(zh, english, state.glossaryEchoRef, references))
 							{
@@ -674,6 +702,13 @@ public class AiTranslator
 								}
 								return; // never cache/persist/display a reference block or the source line
 							}
+							if (!isUsableTranslation(zh, english))
+							{
+								contentRejected(english);
+								return;
+							}
+							contentFailAttempts.remove(english);
+							contentFailStreak.set(0);
 							glossaryEchoStreak.remove(state.model);
 							cache.put(english, zh);
 							if (persist && isPersistable(english) && persisted.add(english))
@@ -743,6 +778,24 @@ public class AiTranslator
 				}
 			}
 		});
+	}
+
+	/** Called under this monitor for a 2xx whose reply is not a usable translation. */
+	private void contentRejected(String english)
+	{
+		int attempts = contentFailAttempts.merge(english, 1, Integer::sum);
+		if (attempts >= 2)
+		{
+			untranslatable.add(english);
+			contentFailAttempts.remove(english);
+		}
+		int streak = contentFailStreak.incrementAndGet();
+		if (streak >= CONTENT_BACKOFF_AFTER_FAILURES)
+		{
+			contentBackoffUntil = System.currentTimeMillis() + CONTENT_BACKOFF_MS;
+			contentFailStreak.set(0);
+			log.warn("OSRSCN AI: {} consecutive content rejections, backing off {}s", streak, CONTENT_BACKOFF_MS / 1000);
+		}
 	}
 
 	private void recordFailure()
@@ -1173,7 +1226,7 @@ public class AiTranslator
 			JsonObject msg = root.getAsJsonObject("message");
 			if (msg.has("content"))
 			{
-				return msg.get("content").getAsString();
+				return msg.get("content").isJsonPrimitive() ? msg.get("content").getAsString() : null;
 			}
 		}
 		// OpenAI-compatible /chat/completions: { "choices": [ { "message": { "content": ... } } ] }
@@ -1188,7 +1241,7 @@ public class AiTranslator
 					JsonObject msg = first.getAsJsonObject("message");
 					if (msg.has("content"))
 					{
-						return msg.get("content").getAsString();
+						return msg.get("content").isJsonPrimitive() ? msg.get("content").getAsString() : null;
 					}
 				}
 			}

@@ -265,7 +265,7 @@ public class AiTranslatorTest
 		assertNull(f.ai.cached(TEXT)); assertEquals(1, f.ai.inFlightCount());
 		assertEquals(0, f.ai.sessionCount()); assertTrue(f.ai.recent().isEmpty());
 		assertFalse(f.file("fixture-A").exists()); assertFalse(f.file("fixture-B").exists());
-		b.success("new player"); assertEquals("new player", f.ai.cached(TEXT));
+		b.success("新的玩家"); assertEquals("新的玩家", f.ai.cached(TEXT));
 		assertFalse(f.file("fixture-B").exists());
 	}
 
@@ -275,8 +275,8 @@ public class AiTranslatorTest
 		Pending b = f.request(true); a.success("old game");
 		assertNull(f.ai.cached(TEXT)); assertEquals(1, f.ai.inFlightCount());
 		assertFalse(f.file("fixture-A").exists()); assertFalse(f.file("fixture-B").exists());
-		b.success("new game");
-		assertEquals(TEXT + "\tnew game\n", Files.readString(f.file("fixture-B").toPath()));
+		b.success("新的游戏");
+		assertEquals(TEXT + "\t新的游戏\n", Files.readString(f.file("fixture-B").toPath()));
 	}
 
 	@Test public void lateOldSuccessCannotOverwriteCompletedNewSuccess() throws Exception
@@ -284,10 +284,10 @@ public class AiTranslatorTest
 		for (boolean persist : new boolean[] { false, true })
 		{
 			Fixture f = new Fixture(); Pending a = f.request(persist); f.switchTo("fixture-B");
-			f.request(persist).success("new"); a.success("old");
-			assertEquals("new", f.ai.cached(TEXT)); assertEquals(1, f.ai.sessionCount());
+			f.request(persist).success("新的"); a.success("old");
+			assertEquals("新的", f.ai.cached(TEXT)); assertEquals(1, f.ai.sessionCount());
 			assertEquals(1, f.ai.recent().size());
-			if (persist) assertEquals(TEXT + "\tnew\n", Files.readString(f.file("fixture-B").toPath()));
+			if (persist) assertEquals(TEXT + "\t新的\n", Files.readString(f.file("fixture-B").toPath()));
 		}
 	}
 
@@ -336,8 +336,8 @@ public class AiTranslatorTest
 	{
 		Fixture f = new Fixture(); Pending a = f.request(true); f.model = "fixture-B"; f.ai.cached(TEXT);
 		f.model = "fixture-A"; Pending newer = f.request(true); a.success("obsolete A");
-		assertNull(f.ai.cached(TEXT)); assertEquals(1, f.ai.inFlightCount()); newer.success("current A");
-		assertEquals("current A", f.ai.cached(TEXT));
+		assertNull(f.ai.cached(TEXT)); assertEquals(1, f.ai.inFlightCount()); newer.success("目前的 A");
+		assertEquals("目前的 A", f.ai.cached(TEXT));
 	}
 
 	@Test public void configurationAtoBtoAWithoutLookupStillInvalidatesOldA() throws Exception
@@ -368,13 +368,13 @@ public class AiTranslatorTest
 	{
 		Fixture f = new Fixture(); Pending current = f.request(false); f.event("aiPaceMs");
 		ConfigChanged ignored = new ConfigChanged(); ignored.setGroup("fictional-other"); ignored.setKey("apiModel");
-		f.plugin.onConfigChanged(ignored); current.success("current"); assertEquals("current", f.ai.cached(TEXT));
+		f.plugin.onConfigChanged(ignored); current.success("目前"); assertEquals("目前", f.ai.cached(TEXT));
 	}
 
 	@Test public void aiOffRetainsCompletedCacheButCannotDispatchMiss() throws Exception
 	{
-		Fixture f = new Fixture(); f.request(false).success("cached"); f.enabled = false; f.event("useLocalAi");
-		assertEquals("cached", f.ai.translate(TEXT, false));
+		Fixture f = new Fixture(); f.request(false).success("已缓存"); f.enabled = false; f.event("useLocalAi");
+		assertEquals("已缓存", f.ai.translate(TEXT, false));
 		assertNull(f.ai.translate("Another fictional gate.", false)); assertEquals(1, f.calls.size());
 	}
 
@@ -382,7 +382,7 @@ public class AiTranslatorTest
 	{
 		Fixture f = new Fixture(); Pending old = f.request(true); f.ai.clearCache(); Pending current = f.request(true);
 		old.success("obsolete clear"); assertNull(f.ai.cached(TEXT)); assertEquals(1, f.ai.inFlightCount());
-		current.success("current"); assertEquals("current", f.ai.cached(TEXT));
+		current.success("目前"); assertEquals("目前", f.ai.cached(TEXT));
 	}
 
 	@Test public void modelSwitchDuringBodyReadCannotCommitSuccess() throws Exception
@@ -412,7 +412,7 @@ public class AiTranslatorTest
 	@Test public void responseCloseAfterSuccessCannotClearNewSameKeyFinally() throws Exception
 	{
 		Fixture f = new Fixture(); Pending a = f.request(false);
-		BufferedSource source = new Buffer().writeUtf8("{\"message\":{\"content\":\"old\"}}");
+		BufferedSource source = new Buffer().writeUtf8("{\"message\":{\"content\":\"旧的\"}}");
 		a.respond(200, new ResponseBody()
 		{
 			@Override public MediaType contentType() { return MediaType.parse("application/json"); }
@@ -422,7 +422,7 @@ public class AiTranslatorTest
 			{
 				// ResponseBody.string closes its source before commit; Response.close occurs after it.
 				assertFalse("response close must release the model monitor", Thread.holdsLock(f.ai));
-				assertEquals("old", f.ai.cached(TEXT)); assertEquals(1, f.ai.sessionCount());
+				assertEquals("旧的", f.ai.cached(TEXT)); assertEquals(1, f.ai.sessionCount());
 				f.switchTo("fixture-B"); f.request(false); super.close();
 			}
 		});
@@ -433,10 +433,10 @@ public class AiTranslatorTest
 	{
 		Fixture f = new Fixture(); f.enqueueHook = pending ->
 		{
-			try { pending.success("inline callback"); } catch (Exception e) { throw new AssertionError(e); }
+			try { pending.success("行内回调"); } catch (Exception e) { throw new AssertionError(e); }
 		};
 		f.ai.translate(TEXT, false, new AiTranslator.RequestPermit(() -> true));
-		assertEquals("inline callback", f.ai.cached(TEXT)); assertEquals(0, f.ai.inFlightCount());
+		assertEquals("行内回调", f.ai.cached(TEXT)); assertEquals(0, f.ai.inFlightCount());
 	}
 
 	@Test public void newCallReentryCannotEnqueueAnObsoleteGeneration() throws Exception
@@ -510,10 +510,10 @@ public class AiTranslatorTest
 
 	@Test public void memoryEntryCanStillBePromotedOnlyByPersistTrue() throws Exception
 	{
-		Fixture f = new Fixture(); f.request(false).success("memory"); assertFalse(f.file("fixture-A").exists());
-		assertEquals("memory", f.ai.cached(TEXT)); assertFalse(f.file("fixture-A").exists());
-		assertEquals("memory", f.ai.translate(TEXT, true));
-		assertEquals(TEXT + "\tmemory\n", Files.readString(f.file("fixture-A").toPath()));
+		Fixture f = new Fixture(); f.request(false).success("内存"); assertFalse(f.file("fixture-A").exists());
+		assertEquals("内存", f.ai.cached(TEXT)); assertFalse(f.file("fixture-A").exists());
+		assertEquals("内存", f.ai.translate(TEXT, true));
+		assertEquals(TEXT + "\t内存\n", Files.readString(f.file("fixture-A").toPath()));
 		f.ai.translate(TEXT, true); assertEquals(1, Files.readAllLines(f.file("fixture-A").toPath()).size());
 	}
 
@@ -530,7 +530,7 @@ public class AiTranslatorTest
 
 	@Test public void clearAfterConnectionEventDeletesCurrentDiskCacheBeforeAnotherLookup() throws Exception
 	{
-		Fixture f = new Fixture(); f.request(true).success("stored A"); f.event("apiKey");
+		Fixture f = new Fixture(); f.request(true).success("已存 A"); f.event("apiKey");
 		Translator translator = new Translator(); inject(translator, "ai", f.ai);
 		translator.clearAiCache();
 		assertFalse(f.file("fixture-A").exists()); assertNull(f.ai.cached(TEXT));
@@ -538,13 +538,13 @@ public class AiTranslatorTest
 
 	@Test public void clearAfterModelEventTargetsCurrentModelWithoutDeletingPreviousModel() throws Exception
 	{
-		Fixture f = new Fixture(); f.request(true).success("stored A");
+		Fixture f = new Fixture(); f.request(true).success("已存 A");
 		Files.writeString(f.file("fixture-B").toPath(), TEXT + "\tstored B\n", StandardCharsets.UTF_8);
 		f.switchTo("fixture-B");
 		Translator translator = new Translator(); inject(translator, "ai", f.ai);
 		translator.clearAiCache();
 		assertTrue(f.file("fixture-A").exists()); assertFalse(f.file("fixture-B").exists());
-		assertEquals(TEXT + "\tstored A\n", Files.readString(f.file("fixture-A").toPath()));
+		assertEquals(TEXT + "\t已存 A\n", Files.readString(f.file("fixture-A").toPath()));
 		assertNull(f.ai.cached(TEXT));
 	}
 
@@ -925,21 +925,21 @@ public class AiTranslatorTest
 		assertNull(pending.request.header("Bad Header"));
 		assertNull(pending.request.header("Authorization"));
 		assertEquals("OSRSCN", pending.request.header("x-opencode-session"));
-		pending.success("header-safe");
-		assertEquals("header-safe", f.ai.cached(TEXT));
+		pending.success("标头安全");
+		assertEquals("标头安全", f.ai.cached(TEXT));
 		assertEquals(0, f.failures()); assertEquals(0, f.value("backoffUntil"));
 	}
 
 	@Test public void headerConfigChangeKeepsCacheAndResetsFailures() throws Exception
 	{
 		Fixture f = new Fixture(); f.extraHeaders = "x-opencode-session: OLD";
-		f.request(false).success("cached translation");
+		f.request(false).success("缓存翻译");
 		f.backoff();
 		f.extraHeaders = "x-opencode-session: NEW";
 		f.event("apiExtraHeaders");
 		assertEquals(0, f.failures()); assertEquals(0, f.value("backoffUntil"));
 		// Headers are not cache identity: the existing translation still hits without a new request.
-		assertEquals("cached translation", f.ai.translate(TEXT, false));
+		assertEquals("缓存翻译", f.ai.translate(TEXT, false));
 		assertEquals(1, f.calls.size());
 		String other = TEXT + " Another fictional gate.";
 		assertNull(f.ai.translate(other, true));
@@ -1430,6 +1430,160 @@ public class AiTranslatorTest
 		assertEquals("a null hint means no terminology block", TEXT, userContent(pending));
 		pending.success("水晶门在前方等待。");
 		assertEquals("水晶门在前方等待。", f.ai.cached(TEXT));
+		assertEquals(0, f.ai.inFlightCount());
+	}
+
+	// ---- generic reply acceptance: empty, unparsable or untranslated replies are content failures ----
+
+	private static int contentFailStreak(Fixture f) throws Exception
+	{
+		return ((AtomicInteger) field(f.ai, "contentFailStreak")).get();
+	}
+
+	/** Ten distinct lines answered with an empty reply each: opens the global content backoff window. */
+	private static void exhaustContentBackoff(Fixture f) throws Exception
+	{
+		for (int i = 0; i < 10; i++)
+		{
+			assertNull(f.ai.translate(TEXT + " " + i, false));
+			f.calls.get(i).success("");
+		}
+	}
+
+	@Test public void emptyContentIsRejectedWithoutCachingOrTransportFailure() throws Exception
+	{
+		Fixture f = new Fixture();
+		f.request(false).success("");
+		assertNull(f.ai.cached(TEXT)); assertEquals(0, f.ai.sessionCount()); assertTrue(f.ai.recent().isEmpty());
+		assertEquals(0, f.failures()); assertEquals(0, f.value("backoffUntil"));
+		assertEquals(1, contentFailStreak(f));
+		// The same line failing a second time must become untranslatable instead of retrying forever.
+		f.request(false).success("");
+		assertEquals(2, contentFailStreak(f));
+		int calls = f.calls.size();
+		assertNull(f.ai.translate(TEXT, false)); assertEquals(calls, f.calls.size());
+	}
+
+	@Test public void missingContentIsRejectedLikeAnEmptyReply() throws Exception
+	{
+		for (String body : new String[] { "{}", "{\"message\":{}}" })
+		{
+			Fixture f = new Fixture();
+			f.request(false).respond(200, ResponseBody.create(MediaType.parse("application/json"), body));
+			assertNull(body, f.ai.cached(TEXT));
+			assertEquals(body, 0, f.ai.sessionCount()); assertTrue(body, f.ai.recent().isEmpty());
+			assertEquals(body, 0, f.failures()); assertEquals(body, 1, contentFailStreak(f));
+		}
+	}
+
+	@Test public void jsonNullContentIsRejectedForBothResponseShapes() throws Exception
+	{
+		Fixture ollama = new Fixture();
+		ollama.request(false).respond(200, ResponseBody.create(MediaType.parse("application/json"),
+				"{\"message\":{\"content\":null}}"));
+		assertNull(ollama.ai.cached(TEXT)); assertEquals(1, contentFailStreak(ollama));
+		assertEquals(0, ollama.failures());
+
+		Fixture openai = new Fixture(); openai.backend = AiBackend.OPENAI;
+		openai.request(false).respond(200, ResponseBody.create(MediaType.parse("application/json"),
+				"{\"choices\":[{\"message\":{\"content\":null}}]}"));
+		assertNull(openai.ai.cached(TEXT)); assertEquals(1, contentFailStreak(openai));
+		assertEquals(0, openai.failures());
+	}
+
+	@Test public void blankOrThinkOnlyContentIsRejectedAndNeverPersisted() throws Exception
+	{
+		for (String reply : new String[] { "   ", "\n\t", "<think>内部思考</think>" })
+		{
+			Fixture f = new Fixture();
+			f.request(true).success(reply);
+			assertNull(reply, f.ai.cached(TEXT));
+			assertEquals(reply, 0, f.ai.sessionCount());
+			assertFalse(reply, f.file("fixture-A").exists());
+			assertEquals(reply, 1, contentFailStreak(f));
+		}
+	}
+
+	@Test public void untranslatedEnglishReplyIsRejectedAndNegativeCached() throws Exception
+	{
+		Fixture f = new Fixture();
+		f.request(false).success(TEXT);
+		assertNull(f.ai.cached(TEXT)); assertEquals(1, contentFailStreak(f));
+		f.request(false).success(TEXT);
+		assertEquals(2, contentFailStreak(f)); assertEquals(2, f.calls.size());
+		assertNull(f.ai.translate(TEXT, false));
+		assertEquals("a repeated source line must not reach the model again", 2, f.calls.size());
+		assertFalse(f.file("fixture-A").exists());
+	}
+
+	@Test public void contentFailureFollowedByAcceptedReplyResetsTheStreak() throws Exception
+	{
+		Fixture f = new Fixture();
+		f.request(false).success("");
+		assertEquals(1, contentFailStreak(f));
+		f.request(false).success("新的翻译");
+		assertEquals("新的翻译", f.ai.cached(TEXT));
+		assertEquals(1, f.ai.sessionCount());
+		assertEquals(0, f.ai.inFlightCount());
+		assertEquals(0, contentFailStreak(f));
+	}
+
+	@Test public void tenConsecutiveContentFailuresOpenTheGlobalContentBackoff() throws Exception
+	{
+		Fixture f = new Fixture(); f.pace = 0;
+		long before = System.currentTimeMillis();
+		exhaustContentBackoff(f);
+		long until = f.value("contentBackoffUntil");
+		assertTrue("the content backoff window must be open", until > System.currentTimeMillis());
+		assertTrue("the window must be about 30s",
+				until >= before + 29_000 && until <= System.currentTimeMillis() + 31_000);
+		assertEquals(0, contentFailStreak(f));
+		assertEquals(0, f.failures());
+		int calls = f.calls.size();
+		assertNull(f.ai.translate(TEXT, false));
+		assertEquals("a content backoff must suppress dispatch", calls, f.calls.size());
+	}
+
+	@Test public void contentFailureStateIsClearedByCacheAndModelInvalidation() throws Exception
+	{
+		Fixture cleared = new Fixture(); exhaustContentBackoff(cleared);
+		assertTrue(cleared.value("contentBackoffUntil") > System.currentTimeMillis());
+		cleared.ai.clearCache();
+		assertEquals(0, contentFailStreak(cleared)); assertEquals(0, cleared.value("contentBackoffUntil"));
+
+		Fixture switched = new Fixture(); exhaustContentBackoff(switched);
+		switched.switchTo("fixture-B");
+		assertEquals(0, contentFailStreak(switched)); assertEquals(0, switched.value("contentBackoffUntil"));
+	}
+
+	@Test public void headerChangeClearsContentBackoffButKeepsNegativeCache() throws Exception
+	{
+		Fixture f = new Fixture();
+		f.request(false).success("");
+		f.request(false).success(""); // the same line again: negative-cached, not counted as an echo
+		assertEquals(2, contentFailStreak(f));
+		for (int i = 0; i < 8; i++)
+		{
+			assertNull(f.ai.translate(TEXT + " filler " + i, false));
+			f.calls.get(f.calls.size() - 1).success("");
+		}
+		assertTrue(f.value("contentBackoffUntil") > System.currentTimeMillis());
+		f.event("apiExtraHeaders");
+		assertEquals(0, contentFailStreak(f)); assertEquals(0, f.value("contentBackoffUntil"));
+		int calls = f.calls.size();
+		assertNull(f.ai.translate(TEXT, false));
+		assertEquals("a header change must not drop the negative cache", calls, f.calls.size());
+	}
+
+	@Test public void rejectedTemperatureRetryWithEmptyContentIsAContentFailureNotATransportFailure() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.OPENAI;
+		f.request(false).respond(400, temperatureRejected());
+		assertEquals("exactly one automatic retry", 2, f.calls.size());
+		f.calls.get(1).success("");
+		assertNull(f.ai.cached(TEXT)); assertEquals(0, f.ai.sessionCount());
+		assertEquals(0, f.failures()); assertEquals(0, f.value("backoffUntil"));
+		assertEquals(1, contentFailStreak(f));
 		assertEquals(0, f.ai.inFlightCount());
 	}
 }
