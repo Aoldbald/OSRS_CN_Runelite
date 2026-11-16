@@ -18,4 +18,15 @@ public class GlyphServiceTest
 	{
 		assertEquals("！＠＃［］　中①", GlyphService.normalizeSeparators("！＠＃［］　中①"));
 	}
+
+	@Test
+	public void onlyEmittedIconsCountAsOwnGlyphs()
+	{
+		GlyphService glyph = new GlyphService();
+		glyph.noteOwnIcon(300);
+		assertEquals(false, glyph.containsOwnGlyph("Bob  (level-126)<img=41>"));
+		assertEquals(true, glyph.containsOwnGlyph("<img=41><img=300>"));
+		assertEquals(false, glyph.containsOwnGlyph("<img=x><img=300"));
+		assertEquals(false, glyph.containsOwnGlyph(null));
+	}
 }

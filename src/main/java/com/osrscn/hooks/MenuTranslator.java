@@ -241,7 +241,7 @@ public class MenuTranslator
 		{
 			String option = entry.getOption();
 			String target = entry.getTarget();
-			if (option == null || target == null || option.contains("<img=") || target.contains("<img="))
+			if (option == null || target == null || glyph.containsOwnGlyph(option) || glyph.containsOwnGlyph(target))
 			{
 				return;
 			}

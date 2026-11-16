@@ -174,6 +174,31 @@ public class MenuTranslatorTest
 		event.setMenuEntries(new MenuEntry[]{entry}); handler.handleMenuOpened(event); return handler;
 	}
 
+	@Test public void playerWithGameIconStillGetsItsOptionTranslated() throws Exception
+	{
+		String player = "<col=ffffff>Bob<col=ff00>  (level-126)<img=41>";
+		MenuFixture f = new MenuFixture(100, 200, 160); MenuEntry entry = f.entry("Walk here", player);
+		opened(f, entry);
+		assertEquals(img("Walk here", 0xffffff), entry.getOption());
+		assertEquals(player, entry.getTarget());
+	}
+
+	@Test public void entryAlreadyHoldingOwnGlyphIsLeftAlone() throws Exception
+	{
+		MenuFixture f = new MenuFixture(100, 200, 160); MenuEntry entry = f.entry("<img=999>", "Goblin");
+		f.root(entry); MenuTranslator handler = f.handler();
+		inject(handler, "glyph", new FakeGlyph()
+		{
+			@Override
+			public boolean containsOwnGlyph(String text)
+			{
+				return text != null && text.contains("<img=999>");
+			}
+		});
+		MenuOpened event = new MenuOpened(); event.setMenuEntries(new MenuEntry[]{entry}); handler.handleMenuOpened(event);
+		assertEquals("<img=999>", entry.getOption()); assertEquals("Goblin", entry.getTarget());
+	}
+
 	@Test public void walkHereOnPlayerKeepsTheNameEnglish() throws Exception
 	{
 		// Native player target shape: "<col=ffffff>Name<col=ff00>  (level-N)".
@@ -483,7 +508,7 @@ public class MenuTranslatorTest
 		field.set(target, value);
 	}
 
-	private static final class FakeGlyph extends GlyphService
+	private static class FakeGlyph extends GlyphService
 	{
 		@Override
 		public int uiSize()

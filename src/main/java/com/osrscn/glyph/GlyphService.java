@@ -10,6 +10,8 @@ import java.io.File;
 import java.io.InputStream;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import javax.inject.Inject;
 import javax.inject.Singleton;
@@ -117,6 +119,7 @@ public class GlyphService
 	private static final int[] PREWARM_COLORS = {0xFFFFFF, 0x0000FF, 0xFFFF00, 0x000000, 0xFF981F};
 
 	private final Map<Long, Integer> regId = new HashMap<>(); // (size,colour,codepoint) -> registration id / FAILED
+	private final Set<Integer> ownIcons = ConcurrentHashMap.newKeySet(); // chat icon indexes emitted as glyphs
 	private int[] prewarmCps;   // codepoints still to warm (null when idle/done)
 	private int[] prewarmSizes; // distinct sizes to warm each codepoint at
 	private int prewarmIdx;     // next codepoint index to process
@@ -233,6 +236,45 @@ public class GlyphService
 	}
 
 	/**
+	 * @return true if {@code text} holds an {@code <img=N>} tag this service emitted (game icons such as
+	 * account-type or clan-rank badges do not count)
+	 */
+	public boolean containsOwnGlyph(String text)
+	{
+		if (text == null)
+		{
+			return false;
+		}
+		int i = text.indexOf("<img=");
+		while (i >= 0)
+		{
+			int start = i + 5;
+			int end = text.indexOf('>', start);
+			if (end < 0)
+			{
+				return false;
+			}
+			try
+			{
+				if (ownIcons.contains(Integer.parseInt(text.substring(start, end))))
+				{
+					return true;
+				}
+			}
+			catch (NumberFormatException ignored)
+			{
+			}
+			i = text.indexOf("<img=", end);
+		}
+		return false;
+	}
+
+	void noteOwnIcon(int idx)
+	{
+		ownIcons.add(idx);
+	}
+
+	/**
 	 * Convert a translated string to a renderable one: CJK characters become {@code <img=N>} tags
 	 * coloured with {@code colorRgb}; tags, ASCII and whitespace pass through unchanged.
 	 *
@@ -325,6 +367,7 @@ public class GlyphService
 					int idx = chatIconManager.chatIconIndex(id);
 					if (idx >= 0)
 					{
+						ownIcons.add(idx);
 						out.append("<img=").append(idx).append('>');
 						lineChars++;
 					}
