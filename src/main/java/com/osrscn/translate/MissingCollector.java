@@ -183,7 +183,7 @@ public class MissingCollector
 	 *
 	 * @param bare the text with tags stripped
 	 */
-	private static boolean isFragment(String bare)
+	static boolean isFragment(String bare)
 	{
 		if (bare.isEmpty())
 		{

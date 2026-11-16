@@ -2062,6 +2062,354 @@ public class ChatHandlerTest
 		assertEquals(before, reads.get()); assertEquals(2, requests.get());
 	}
 
+
+	private static final String QUEST_CONGRATS = "Congratulations, you've completed a quest: ";
+
+	@SuppressWarnings("unchecked")
+	private PartialFixture questFixture(Map<String, String> rows) throws Exception
+	{
+		PartialFixture f = new PartialFixture();
+		TranslationStore store = new TranslationStore();
+		Field mapsField = TranslationStore.class.getDeclaredField("maps");
+		mapsField.setAccessible(true);
+		Map<TranslationStore.Category, Map<String, String>> maps =
+				(Map<TranslationStore.Category, Map<String, String>>) mapsField.get(store);
+		maps.get(TranslationStore.Category.INTERFACE).putAll(rows);
+		Field field = Translator.class.getDeclaredField("store");
+		field.setAccessible(true);
+		field.set(f.translator, store);
+		return f;
+	}
+
+	@Test
+	public void questMarkerGameMessagesUseTablesAndRestoreExactOriginal() throws Exception
+	{
+		// Frozen interface table rows 21169, 21199, 21260 at local_data 45b82d5.
+		// Colour wrappers and the unmarked forms are derived compatibility controls.
+		Map<String, String> rows = Map.of("Cook's Assistant", "厨师助手", "Doric's Quest", "多里克的任务",
+				"The Fremennik Trials", "费明尼克试炼");
+		for (Map.Entry<String, String> row : rows.entrySet())
+			for (String marker : new String[] { "", "@q_mes@" })
+				for (boolean colored : new boolean[] { false, true })
+				{
+					PartialFixture f = questFixture(rows);
+					String raw = QUEST_CONGRATS + marker + row.getKey();
+					if (colored) raw = "<col=123456>" + raw + "</col>";
+					f.chat.values[0].set(raw);
+					f.fire(ChatMessageType.GAMEMESSAGE);
+					assertEquals(img(colored ? 0x123456 : 0) + "恭喜，你完成了一个任务：" + row.getValue(),
+							f.chat.values[0].get());
+					assertTrue(f.translator.last.complete);
+					assertEquals(0, f.collected);
+					assertEquals(0, f.ai.calls);
+					f.chat.handler.goEnglish();
+					assertEquals(raw, f.chat.values[0].get());
+				}
+	}
+
+	@Test
+	public void questMarkerKeepsExactWholeAndComponentKeysFirst() throws Exception
+	{
+		// Deliberate dictionary collisions use real table values to distinguish precedence.
+		String marked = "@q_mes@The Fremennik Trials";
+		String raw = QUEST_CONGRATS + marked;
+		Map<String, String> rows = new HashMap<>();
+		rows.put("The Fremennik Trials", "费明尼克试炼");
+		rows.put(marked, "多里克的任务");
+		rows.put(raw, "厨师助手");
+		assertEquals(img(0) + "厨师助手", questFixture(rows).translator.renderChat(raw, 0, 200, 14, false, false).text);
+		rows.remove(raw);
+		assertEquals(img(0) + "恭喜，你完成了一个任务：多里克的任务",
+				questFixture(rows).translator.renderChat(raw, 0, 200, 14, false, false).text);
+		rows.put(marked, "The Fremennik Trials");
+		assertEquals(img(0) + "恭喜，你完成了一个任务：The Fremennik Trials",
+				questFixture(rows).translator.renderChat(raw, 0, 200, 14, false, false).text);
+		rows.put(raw, raw);
+		assertNull(questFixture(rows).translator.renderChat(raw, 0, 200, 14, false, false));
+	}
+
+	@Test
+	public void questMarkerFallbackIsLimitedToOneExactLeadingToken() throws Exception
+	{
+		PartialFixture f = questFixture(Map.of("The Fremennik Trials", "费明尼克试炼"));
+		String[] misses = { QUEST_CONGRATS + "@Q_MES@The Fremennik Trials",
+				QUEST_CONGRATS + "@other@The Fremennik Trials",
+				QUEST_CONGRATS + "The @q_mes@Fremennik Trials",
+				QUEST_CONGRATS + "@q_mes@@q_mes@The Fremennik Trials",
+				QUEST_CONGRATS + "@q_mes@", QUEST_CONGRATS + "@q_mes@Not a real quest",
+				"@q_mes@The Fremennik Trials", "Quest: @q_mes@The Fremennik Trials (Not Started)",
+				"You have completed @q_mes@The Fremennik Trials!" };
+		for (String raw : misses)
+		{
+			assertNull(raw, f.translator.renderChat(raw, 0, 200, 14, false, false));
+			assertTrue(TranslationStore.normalize(raw).contains(raw.contains("@Q_MES@") ? "@Q_MES@"
+					: raw.contains("@other@") ? "@other@" : "@q_mes@"));
+		}
+		assertEquals(0, f.collected);
+		assertEquals(0, f.ai.calls);
+	}
+
+
+	@Test
+	public void geItemNamesRetainIntrinsicPeriodAndExactKeys() throws Exception
+	{
+		// Frozen name table row 1119; punctuation variants are derived controls.
+		Map<String, String> rows = new HashMap<>();
+		rows.put("Premade blurb' sp.", "预制蓝莓特调鸡尾酒");
+		rows.put("Amulet of glory", "荣耀护符");
+		PartialFixture f = questFixture(rows);
+		String[] verbs = { "Buying", "Selling", "Bought", "Sold" };
+		String[] zh = { "购买中", "出售中", "已购买", "已售出" };
+		for (int i = 0; i < verbs.length; i++)
+			for (String suffix : new String[] { "", "." })
+				assertEquals(img(0) + zh[i] + "：预制蓝莓特调鸡尾酒",
+						f.translator.renderChat(verbs[i] + ": Premade blurb' sp." + suffix, 0, 200, 14, false, true).text);
+		assertEquals(img(0) + "大交易所：已完成购买 2 × 预制蓝莓特调鸡尾酒。",
+				f.translator.renderChat("Grand Exchange: Finished buying 2 x Premade blurb' sp..", 0, 200, 14, false, true).text);
+		assertEquals(img(0) + "已购买：荣耀护符",
+				f.translator.renderChat("Bought: Amulet of glory.", 0, 200, 14, false, true).text);
+		rows.put("Amulet of glory.", "预制蓝莓特调鸡尾酒");
+		assertEquals(img(0) + "已购买：预制蓝莓特调鸡尾酒",
+				questFixture(rows).translator.renderChat("Bought: Amulet of glory.", 0, 200, 14, false, true).text);
+		assertNull(f.translator.renderChat("Buying: Unknown item.", 0, 200, 14, false, false));
+		assertEquals(0, f.collected);
+		assertEquals(0, f.ai.calls);
+	}
+
+	@Test
+	public void geMembersSuffixPreservesMeaningAndOriginalKeyPriority() throws Exception
+	{
+		// Frozen source inbox:000072:000002:000 and name table row 942.
+		Map<String, String> rows = new HashMap<>();
+		rows.put("Amulet of glory", "荣耀护符");
+		PartialFixture f = questFixture(rows);
+		assertEquals(img(0) + "出售中：荣耀护符（会员）",
+				f.translator.renderChat("Selling: Amulet of glory (Members)", 0, 200, 14, false, true).text);
+		for (String suffix : new String[] { " (Member)", " (Other)", " (Members) (Members)" })
+			assertNull(f.translator.renderChat("Selling: Amulet of glory" + suffix, 0, 200, 14, false, false));
+		assertNull(f.translator.renderChat("Amulet of glory (Members)", 0, 200, 14, false, false));
+		rows.put("Amulet of glory (Members)", "预制蓝莓特调鸡尾酒");
+		assertEquals(img(0) + "出售中：预制蓝莓特调鸡尾酒",
+				questFixture(rows).translator.renderChat("Selling: Amulet of glory (Members)", 0, 200, 14, false, true).text);
+		assertEquals(0, f.collected);
+		assertEquals(0, f.ai.calls);
+	}
+
+	@Test
+	public void waterfallCompletionAliasIsLocalAndPreservesNamedThe() throws Exception
+	{
+		// Frozen source inbox:000375:000002:000; interface rows 21468 and 21260.
+		Map<String, String> rows = new HashMap<>();
+		rows.put("Waterfall Quest", "瀑布任务");
+		rows.put("The Fremennik Trials", "费明尼克试炼");
+		PartialFixture f = questFixture(rows);
+		for (String name : new String[] { "Waterfall Quest", "the Waterfall Quest" })
+			assertEquals(img(0) + "你已完成任务：瀑布任务！",
+					f.translator.renderChat("You have completed " + name + "!", 0, 200, 14, false, true).text);
+		assertEquals(img(0) + "你已完成任务：费明尼克试炼！",
+				f.translator.renderChat("You have completed The Fremennik Trials!", 0, 200, 14, false, true).text);
+		assertNull(f.translator.renderChat("You have completed the The Fremennik Trials!", 0, 200, 14, false, false));
+		assertNull(f.translator.renderChat("the Waterfall Quest", 0, 200, 14, false, false));
+		rows.put("the Waterfall Quest", "费明尼克试炼");
+		assertEquals(img(0) + "你已完成任务：费明尼克试炼！",
+				questFixture(rows).translator.renderChat("You have completed the Waterfall Quest!", 0, 200, 14, false, true).text);
+		assertEquals(0, f.collected);
+		assertEquals(0, f.ai.calls);
+	}
+
+	@Test
+	public void questCompletionCoversLeadingTheAndBangInTitle() throws Exception
+	{
+		// Uploaded completion lines; values from the public interface table.
+		Map<String, String> rows = new HashMap<>();
+		rows.put("Observatory Quest", "天文台任务");
+		rows.put("Heroes' Quest", "英雄任务");
+		rows.put("Legends' Quest", "传奇任务");
+		rows.put("Scrambled!", "紧急行动！");
+		rows.put("The Ides of Milk", "奶月望日");
+		PartialFixture f = questFixture(rows);
+		String[][] cases = {
+			{ "You have completed the Observatory Quest!", "你已完成任务：天文台任务！" },
+			{ "You have completed the Heroes' Quest!", "你已完成任务：英雄任务！" },
+			{ "You have completed the Legends' Quest!", "你已完成任务：传奇任务！" },
+			{ "You have completed Scrambled!", "你已完成任务：紧急行动！" },
+			{ "You have completed The Ides of Milk!", "你已完成任务：奶月望日！" } };
+		for (String[] c : cases)
+			assertEquals(c[0], img(0) + c[1], f.translator.renderChat(c[0], 0, 200, 14, false, true).text);
+		assertNull(f.translator.renderChat("You have completed the Unknown Quest!", 0, 200, 14, false, false));
+		assertNull(f.translator.renderChat("You have completed the Ides of Milk!", 0, 200, 14, false, false));
+		assertEquals(0, f.ai.calls);
+	}
+
+
+	// Native API system-message categories; per-screenshot packet receipt remains a native check.
+	private static final Object[][] CHANNEL_NOTICES = {
+		{ChatMessageType.FRIENDSCHATNOTIFICATION, "Attempting to join chat-channel...", "正在尝试加入聊天频道..."},
+		{ChatMessageType.FRIENDSCHATNOTIFICATION, "Now talking in chat-channel River 42", "已进入聊天频道 River 42"},
+		{ChatMessageType.FRIENDSCHATNOTIFICATION, "To talk, start each line of chat with the / symbol.", "要发言，请在每条消息开头输入 /。"},
+		{ChatMessageType.CLAN_GUEST_MESSAGE, "Attempting to reconnect to guest channel automatically...", "正在尝试自动重新连接访客频道..."},
+		{ChatMessageType.CLAN_MESSAGE, "To talk in your clan's channel, start each line of chat with // or /c.", "要在公会频道发言，请在每条消息开头输入 // 或 /c。"},
+		{ChatMessageType.CLAN_GUEST_MESSAGE, "You are now a guest of River 42.", "你现在是 River 42 的访客。"},
+		{ChatMessageType.CLAN_GUEST_MESSAGE, "To talk, start each line of chat with /// or /gc.", "要发言，请在每条消息开头输入 /// 或 /gc。"},
+		{ChatMessageType.CLAN_GUEST_MESSAGE,
+			"You are now a guest of River 42.<br>To talk, start each line of chat with /// or /gc.",
+			"你现在是 River 42 的访客。<br>要发言，请在每条消息开头输入 /// 或 /gc。"}
+	};
+
+	private static PartialFixture channelFixture() throws Exception
+	{
+		PartialFixture f = new PartialFixture();
+		Field aiField = Translator.class.getDeclaredField("ai"); aiField.setAccessible(true);
+		aiField.set(f.translator, new AiTranslator() {
+			@Override public String cached(String key) { throw new AssertionError("System notice cache read"); }
+			@Override public String translate(String key, boolean persist) { throw new AssertionError("System notice AI request"); }
+		});
+		return f;
+	}
+
+	@Test public void fixedChannelNoticesUseTheirSystemRoutesAndRetryGlyphs() throws Exception
+	{
+		for (Object[] notice : CHANNEL_NOTICES)
+		{
+			PartialFixture f = channelFixture();
+			f.chat.mode = PlayerChatMode.OFF; f.chat.groupChannels = false;
+			String raw = (String) notice[1]; String zh = (String) notice[2];
+			f.glyph.pendingCalls = 1; f.chat.values[0].set(raw); f.fire((ChatMessageType) notice[0]);
+			assertEquals(raw, f.chat.values[0].get());
+			f.clock.set(1); f.chat.handler.tick();
+			assertEquals(img(0) + zh, f.chat.values[0].get());
+			Field field = ChatHandler.class.getDeclaredField("tracked"); field.setAccessible(true);
+			Object tracked = ((Map<?, ?>) field.get(f.chat.handler)).get(f.chat.nodes[0]);
+			Method repaint = ChatHandler.class.getDeclaredMethod("renderTracked", MessageNode.class, tracked.getClass(), int.class);
+			repaint.setAccessible(true); f.clock.set(40_000);
+			f.glyph.pendingCalls = 1;
+			assertEquals(false, repaint.invoke(f.chat.handler, f.chat.nodes[0], tracked, 0xffffff));
+			assertEquals(img(0) + zh, f.chat.values[0].get());
+			assertEquals(true, repaint.invoke(f.chat.handler, f.chat.nodes[0], tracked, 0xffffff));
+			assertEquals(img(0xffffff) + zh, f.chat.values[0].get());
+			assertEquals(0, f.collected);
+			f.chat.handler.goEnglish(); assertEquals(raw, f.chat.values[0].get());
+		}
+	}
+
+	@Test public void fixedChannelNoticesRespectSettingsAndDoNotBecomePlayerTranslations() throws Exception
+	{
+		for (Object[] notice : CHANNEL_NOTICES)
+		{
+			PartialFixture disabled = channelFixture(); disabled.chat.translateGame = false;
+			disabled.chat.values[0].set((String) notice[1]); disabled.fire((ChatMessageType) notice[0]);
+			disabled.chat.handler.tick(); assertEquals(notice[1], disabled.chat.values[0].get());
+			for (ChatMessageType type : new ChatMessageType[]{ChatMessageType.PUBLICCHAT, ChatMessageType.FRIENDSCHAT,
+				ChatMessageType.CLAN_CHAT, ChatMessageType.CLAN_GUEST_CHAT, ChatMessageType.CLAN_GIM_CHAT})
+			{
+				PartialFixture player = channelFixture(); player.chat.mode = PlayerChatMode.OFF;
+				player.chat.values[0].set((String) notice[1]); player.fire(type); player.chat.handler.tick();
+				assertEquals(notice[1], com.osrscn.text.Tags.stripCol(player.chat.values[0].get()));
+				assertEquals(0, player.collected);
+			}
+		}
+	}
+
+	@Test public void unknownOrWrongChannelSystemFramesNeverEnterGenericTranslation() throws Exception
+	{
+		for (ChatMessageType type : new ChatMessageType[]{ChatMessageType.FRIENDSCHATNOTIFICATION,
+			ChatMessageType.CLAN_MESSAGE, ChatMessageType.CLAN_GUEST_MESSAGE})
+		{
+			for (Object[] notice : CHANNEL_NOTICES)
+			{
+				if (notice[0] == type) continue;
+				PartialFixture f = channelFixture(); f.chat.values[0].set((String) notice[1]); f.fire(type);
+				f.chat.handler.tick(); f.chat.handler.goEnglish(); f.chat.handler.goChinese();
+				assertEquals(notice[1], f.chat.values[0].get()); assertEquals(0, f.collected);
+				assertNull(f.translator.renderChat((String) notice[1], 0, 200, 14, true, true, type));
+				assertNull(f.translator.renderChatCached((String) notice[1], 0, 200, 14, type));
+			}
+			for (String raw : new String[]{"Unrecognized system notice for River 42", "Now talking in chat-channel <img=1>Magic",
+				"You are now a guest of <img=1>Magic.", "You are now a guest of Magic.<br>unrecognized tail",
+				"Now talking in chat-channel ", "You are now a guest of .", "Now talking in chat-channel Magic\uD800",
+				"You are now a guest of Magic\uDC00.", "You are now a guest of Magic\n.",
+				"You are now a guest of .<br>To talk, start each line of chat with /// or /gc.",
+				"You are now a guest of Magic.<br>To talk, start each line of chat with // or /c.",
+				"You are now a guest of Magic<br>To talk, start each line of chat with /// or /gc.",
+				"You are now a guest of Magic.<br>To talk, start each line of chat with /// or /gc.<br>Extra",
+				"You are now a guest of Magic.<br>To talk, start each line of chat with /// or /gc.<br>To talk, start each line of chat with /// or /gc.",
+				"<col=ff0000>You are now a guest of Magic.", "Now talking in chat-channel Magic</col>"})
+			{
+				PartialFixture f = channelFixture(); f.chat.values[0].set(raw); f.fire(type);
+				f.chat.handler.tick(); f.chat.handler.goEnglish(); f.chat.handler.goChinese();
+				assertEquals(raw, f.chat.values[0].get()); assertEquals(0, f.collected);
+				assertNull(f.translator.renderChat(raw, 0, 200, 14, true, true, type));
+				assertNull(f.translator.renderChatCached(raw, 0, 200, 14, type));
+			}
+		}
+	}
+
+	@Test public void channelSystemNamesAndWholeMessageColorSurviveLocalRendering() throws Exception
+	{
+		for (String name : new String[]{"Magic", "Skillcape", "River 42", "O'Brien-Smith", "R.S.V.P.", " River  42 ", "Clan \uD83C\uDF1F"})
+		{
+			for (boolean guest : new boolean[]{false, true})
+			for (boolean joined : new boolean[]{false, true})
+			{
+				if (joined && !guest) continue;
+				PartialFixture f = channelFixture();
+				String raw = "<col=ff0000>" + (guest ? "You are now a guest of " + name + "." : "Now talking in chat-channel " + name)
+					+ (joined ? "<br>To talk, start each line of chat with /// or /gc." : "") + "</col>";
+				String zh = "<col=ff0000>" + (guest ? "你现在是 " + name + " 的访客。" : "已进入聊天频道 " + name)
+					+ (joined ? "<br>要发言，请在每条消息开头输入 /// 或 /gc。" : "") + "</col>";
+				f.chat.values[0].set(raw); f.fire(guest ? ChatMessageType.CLAN_GUEST_MESSAGE : ChatMessageType.FRIENDSCHATNOTIFICATION);
+				assertEquals(img(0xff0000) + zh, f.chat.values[0].get()); assertEquals(0, f.collected);
+				f.chat.handler.goEnglish(); assertEquals(raw, f.chat.values[0].get());
+			}
+		}
+	}
+
+	@Test public void authorizedPlayerRepeatingNoticeUsesOnlyThePlayerPermit() throws Exception
+	{
+		for (Object[] notice : CHANNEL_NOTICES)
+		{
+			PartialFixture f = channelFixture(); AtomicInteger requests = new AtomicInteger();
+			Field ai = Translator.class.getDeclaredField("ai"); ai.setAccessible(true);
+			ai.set(f.translator, new AiTranslator() {
+				@Override public String cached(String text) { return null; }
+				@Override public String translate(String text, boolean persist) { throw new AssertionError("Missing player permit"); }
+				@Override public String translate(String text, boolean persist, RequestPermit permit)
+				{ assertTrue(permit != null); assertFalse(persist); requests.incrementAndGet(); return "玩家译文"; }
+			});
+			f.chat.mode = PlayerChatMode.INLINE; f.chat.values[0].set((String) notice[1]);
+			f.fire(ChatMessageType.CLAN_CHAT);
+			assertTrue(f.chat.values[0].get().contains("玩家译文")); assertTrue(requests.get() > 0);
+			assertFalse(f.chat.values[0].get().contains((String) notice[2])); assertEquals(0, f.collected);
+		}
+	}
+
+	@Test public void guestClanSpamDispatchRetriesAndRepaintsWithItsType() throws Exception
+	{
+		PartialFixture f = new PartialFixture();
+		String raw = "Requesting access to chat as guest of River 42...";
+		String zh = "正在申请以访客身份进入 River 42 的公会聊天频道...";
+		Field aiField = Translator.class.getDeclaredField("ai"); aiField.setAccessible(true);
+		aiField.set(f.translator, new AiTranslator() {
+			@Override public String cached(String key) { throw new AssertionError("Guest clan cache read"); }
+			@Override public String translate(String key, boolean persist) { throw new AssertionError("Guest clan AI request"); }
+		});
+		f.glyph.pendingCalls = 1;
+		f.chat.values[0].set(raw); f.fire(ChatMessageType.SPAM);
+		assertEquals(raw, f.chat.values[0].get());
+		f.clock.set(1); f.chat.handler.tick();
+		assertTrue(f.chat.values[0].get().contains(zh));
+		Field trackedField = ChatHandler.class.getDeclaredField("tracked"); trackedField.setAccessible(true);
+		Object tracked = ((Map<?, ?>) trackedField.get(f.chat.handler)).get(f.chat.nodes[0]);
+		Method repaint = ChatHandler.class.getDeclaredMethod("renderTracked", MessageNode.class, tracked.getClass(), int.class);
+		repaint.setAccessible(true);
+		f.clock.set(40_000);
+		assertEquals(true, repaint.invoke(f.chat.handler, f.chat.nodes[0], tracked, 0x7f7f7f));
+		assertTrue(f.chat.values[0].get().contains(zh));
+		assertEquals(0, f.collected);
+		f.chat.handler.goEnglish(); assertEquals(raw, f.chat.values[0].get());
+	}
+
+
 	private static final class PartialFixture
 	{
 		// local_data/zh/transcript_zh_interface.tsv, row 7226 at 45b82d5.
@@ -2218,10 +2566,31 @@ public class ChatHandlerTest
 		}
 
 		@Override
+		public Rendered renderChat(String text, int color, int maxChars, int size, boolean fallback,
+				boolean persist, ChatMessageType type)
+		{
+			calls++;
+			Rendered result = super.renderChat(text, color, maxChars, size, fallback, persist, type);
+			last = result;
+			Runnable action = afterRender;
+			afterRender = null;
+			if (action != null) action.run();
+			return result;
+		}
+
+		@Override
 		public Rendered renderChatCached(String text, int color, int maxChars, int size)
 		{
 			calls++;
 			last = super.renderChatCached(text, color, maxChars, size);
+			return last;
+		}
+
+		@Override
+		public Rendered renderChatCached(String text, int color, int maxChars, int size, ChatMessageType type)
+		{
+			calls++;
+			last = super.renderChatCached(text, color, maxChars, size, type);
 			return last;
 		}
 
@@ -2423,6 +2792,13 @@ public class ChatHandlerTest
 			{
 				throw new AssertionError(ex);
 			}
+		}
+
+		@Override
+		public Rendered renderChat(String text, int color, int maxChars, int size,
+				boolean aiFallback, boolean persist, ChatMessageType type)
+		{
+			return renderChat(text, color, maxChars, size, aiFallback, persist);
 		}
 	}
 

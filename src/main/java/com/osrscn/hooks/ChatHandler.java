@@ -560,6 +560,14 @@ public class ChatHandler
 					handlePlayer(node, event.getType());
 				}
 				break;
+			case FRIENDSCHATNOTIFICATION:
+			case CLAN_MESSAGE:
+			case CLAN_GUEST_MESSAGE:
+				if (config.translateGameMessages() && Translator.hasLocalChannelNotice(node.getValue(), event.getType()))
+				{
+					handleGame(node, event.getType());
+				}
+				break;
 			case GAMEMESSAGE:
 			case ENGINE:
 			case SPAM:
@@ -576,7 +584,7 @@ public class ChatHandler
 				}
 				break;
 			default:
-				break; // private chat, channel system notices, dialogue: leave alone
+				break; // private chat, unsupported channel notices, dialogue: leave alone
 		}
 	}
 
@@ -775,7 +783,7 @@ public class ChatHandler
 	{
 		if (!authorized(generation)) return null;
 		return generation.playerMode == null
-				? translator.renderChat(text, color, maxChars, glyph.uiSize(), true, persist)
+				? translator.renderChat(text, color, maxChars, glyph.uiSize(), true, persist, generation.type)
 				: translator.renderChat(text, color, maxChars, glyph.uiSize(), true, false, generation.renderPermit);
 	}
 
@@ -818,7 +826,7 @@ public class ChatHandler
 		Translator.Rendered r = retryActive
 				? renderChat(t.generation, t.english, color, chatMaxChars(), t.persist)
 				: t.generation.playerMode == null
-						? translator.renderChatCached(t.english, color, chatMaxChars(), glyph.uiSize())
+						? translator.renderChatCached(t.english, color, chatMaxChars(), glyph.uiSize(), t.generation.type)
 						: translator.renderPlayerChatCached(t.english, color, chatMaxChars(), glyph.uiSize());
 		if (epoch != writeEpoch || !authorized(t.generation)) return false;
 		if (r == null)

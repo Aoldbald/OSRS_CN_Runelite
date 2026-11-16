@@ -183,6 +183,98 @@ public class InterfaceTranslatorLifecycleTest
         }
     }
 
+    // Fairy ring travel log (group 381): each row's name is padded with leading spaces so the red code
+    // widget drawn at the same x stays clear. The pad must survive translation.
+    private static final String PAD8 = "        ";
+
+    @Test public void fairyRingLogKeepsLeadingPadBeforeGlyphs() throws Exception
+    {
+        List<Integer> widths = new ArrayList<>();
+        TextWidget padded = new TextWidget(381 << 16 | 5, 3, PAD8 + "Islands: Penguins");
+        walkWithWidthRecorder(padded, widths);
+        assertEquals(PAD8 + "<img=1><img=2>", padded.text);
+
+        TextWidget bare = new TextWidget(381 << 16 | 5, 4, "Islands: Penguins");
+        walkWithWidthRecorder(bare, widths);
+        assertEquals(2, widths.size());
+        assertTrue("pad should narrow the wrap width", widths.get(0) < widths.get(1));
+    }
+
+    @Test public void fairyRingLogPadWidthIsMeasuredWithTheWidgetFont() throws Exception
+    {
+        List<Integer> widths = new ArrayList<>();
+        TextWidget padded = new TextWidget(381 << 16 | 5, 3, PAD8 + "Islands: Penguins");
+        padded.font = (net.runelite.api.FontTypeFace) Proxy.newProxyInstance(
+                InterfaceTranslatorLifecycleTest.class.getClassLoader(),
+                new Class<?>[] {net.runelite.api.FontTypeFace.class}, (p, m, a) ->
+                        m.getName().equals("getTextWidth") ? 40 : defaultValue(m.getReturnType()));
+        walkWithWidthRecorder(padded, widths);
+        assertEquals(java.util.Arrays.asList((200 - 8 - 40) / 10), widths);
+    }
+
+    @Test public void fairyRingLogPadAcceptsNonBreakingSpaces() throws Exception
+    {
+        TextWidget padded = new TextWidget(381 << 16 | 5, 3, "   Islands: Penguins");
+        walkWithWidthRecorder(padded, new ArrayList<>());
+        assertEquals("   <img=1><img=2>", padded.text);
+    }
+
+    @Test public void leadingPadOnlyAppliesToListedGroups() throws Exception
+    {
+        TextWidget other = new TextWidget(200 << 16 | 5, 3, PAD8 + "Islands: Penguins");
+        walkWithWidthRecorder(other, new ArrayList<>());
+        assertEquals("<img=1><img=2>", other.text);
+    }
+
+    @Test public void hideoutRowWithoutPadIsUnchanged() throws Exception
+    {
+        TextWidget hideout = new TextWidget(381 << 16 | 140, -1, "Fairy Queen's hideout");
+        walkWithWidthRecorder(hideout, new ArrayList<>());
+        assertEquals("<img=1><img=2>", hideout.text);
+    }
+
+    @Test public void fairyRingLogPadIsNotDoubledWhenRenderKeepsIt() throws Exception
+    {
+        TextWidget padded = new TextWidget(381 << 16 | 5, 3, PAD8 + "Islands: Penguins");
+        walkWith(padded, new ArrayList<>(), PAD8 + "<img=1><img=2>");
+        assertEquals(PAD8 + "<img=1><img=2>", padded.text);
+    }
+
+    private static void walkWithWidthRecorder(TextWidget w, List<Integer> widths) throws Exception
+    {
+        walkWith(w, widths, "<img=1><img=2>");
+    }
+
+    private static void walkWith(TextWidget w, List<Integer> widths, String out) throws Exception
+    {
+        GroupingFixture f = new GroupingFixture(false);
+        Constructor<Translator.Rendered> rendered = Translator.Rendered.class
+                .getDeclaredConstructor(String.class, boolean.class);
+        rendered.setAccessible(true);
+        inject(f.handler, "translator", new Translator()
+        {
+            @Override public Rendered renderUi(String text, int rgb, int width, int size, boolean ai)
+            {
+                widths.add(width);
+                try { return rendered.newInstance(out, true); }
+                catch (ReflectiveOperationException ex) { throw new AssertionError(ex); }
+            }
+            @Override public Rendered renderUiNoCollect(String text, int rgb, int width, int size, boolean ai)
+            {
+                return renderUi(text, rgb, width, size, ai);
+            }
+        });
+        inject(f.handler, "glyph", new GlyphService()
+        {
+            @Override public int uiSize() { return 14; }
+            @Override public int smallSize() { return 12; }
+            @Override public int wrapChars(int width, int size) { return width / 10; }
+        });
+        java.lang.reflect.Method walk = InterfaceTranslator.class.getDeclaredMethod("walk", Widget.class, boolean.class);
+        walk.setAccessible(true);
+        walk.invoke(f.handler, w.widget, false);
+    }
+
     private static final class GroupingFixture
     {
         final InterfaceTranslator handler = new InterfaceTranslator();
@@ -255,6 +347,7 @@ public class InterfaceTranslatorLifecycleTest
         final Widget widget;
         String text;
         Widget[] children, dynamic, nested;
+        net.runelite.api.FontTypeFace font;
 
         TextWidget(int id, int index, String text)
         {
@@ -269,6 +362,7 @@ public class InterfaceTranslatorLifecycleTest
                             case "getText": return this.text;
                             case "setText": this.text = (String) a[0]; return null;
                             case "getWidth": return 200;
+                            case "getFont": return font;
                             case "getStaticChildren": return children;
                             case "getDynamicChildren": return dynamic;
                             case "getNestedChildren": return nested;

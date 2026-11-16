@@ -263,7 +263,7 @@ public class MenuTranslator
 		int targetColor = Tags.firstColor(state.target, rowColor);
 		if (!state.targetRendered || state.targetColor != targetColor)
 		{
-			String tgt = translateTarget(state.target, glyph.uiSize(), rowColor);
+			String tgt = translateTargetForAction(state.target, state.type, glyph.uiSize(), rowColor);
 			if (tgt != null)
 			{
 				entry.setTarget(tgt);
@@ -305,6 +305,10 @@ public class MenuTranslator
 
 	private String translateOption(String option, MenuAction type, int size, int color)
 	{
+		if (type != null && type.name().startsWith("RUNELITE"))
+		{
+			return null;
+		}
 		// Scene-specific "Use" must run before the table lookups, which would return the generic word.
 		String use = useZh(Tags.stripTags(option), type);
 		if (use != null)
@@ -363,6 +367,60 @@ public class MenuTranslator
 	public String translateTarget(String target, int size)
 	{
 		return translateTarget(target, size, DEFAULT_TARGET_COLOR);
+	}
+
+	/** Translate a menu target with its action so player names cannot enter the name tables. */
+	public String translateTarget(String target, MenuAction type, int size)
+	{
+		return translateTargetForAction(target, type, size, DEFAULT_TARGET_COLOR);
+	}
+
+	private String translateTargetForAction(String target, MenuAction type, int size, int rowColor)
+	{
+		if ((type != null && type.name().startsWith("RUNELITE")) || isPlayerOption(type))
+		{
+			return null;
+		}
+		if (type == MenuAction.WALK && LEVEL.matcher(Tags.stripTags(target)).find())
+		{
+			// "Walk here" carries a levelled target only when a player is under the cursor.
+			return null;
+		}
+		if (type == MenuAction.ITEM_USE_ON_PLAYER || type == MenuAction.WIDGET_TARGET_ON_PLAYER)
+		{
+			// The right side is a player name. Translate only the selected item or spell on the left.
+			int arrow = target.indexOf(" -> ");
+			if (arrow < 0)
+			{
+				return null;
+			}
+			String left = target.substring(0, arrow);
+			String translated = translateTarget(left, size, rowColor);
+			return translated == null ? null : translated + target.substring(arrow);
+		}
+		return translateTarget(target, size, rowColor);
+	}
+
+	private static boolean isPlayerOption(MenuAction type)
+	{
+		if (type == null)
+		{
+			return false;
+		}
+		switch (type)
+		{
+			case PLAYER_FIRST_OPTION:
+			case PLAYER_SECOND_OPTION:
+			case PLAYER_THIRD_OPTION:
+			case PLAYER_FOURTH_OPTION:
+			case PLAYER_FIFTH_OPTION:
+			case PLAYER_SIXTH_OPTION:
+			case PLAYER_SEVENTH_OPTION:
+			case PLAYER_EIGHTH_OPTION:
+				return true;
+			default:
+				return false;
+		}
 	}
 
 	private String translateTarget(String target, int size, int rowColor)

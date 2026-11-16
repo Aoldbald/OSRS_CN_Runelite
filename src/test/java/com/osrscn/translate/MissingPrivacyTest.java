@@ -212,6 +212,13 @@ public class MissingPrivacyTest
         assertEquals(Arrays.asList(row(SAFE)), f.data());
     }
 
+    @Test public void wrappedWholeSentenceKeepsItsLineBreakAndPassesTheFragmentFilter() throws Exception
+    {
+        String wrapped = "Complete a lap of the Draynor Village<br>rooftop course.";
+        Fixture f = new Fixture(); f.collector.record(wrapped, "gameText", "", ""); f.collector.flushPending();
+        assertEquals(Arrays.asList(row(wrapped)), f.data());
+    }
+
     @Test public void completeIdentityFamiliesAreBlockedAcrossAllColumns() throws Exception
     {
         for (String text : new String[]{RANK, "The top crab crusher was 12345!", "Trading With: Test One",
@@ -478,12 +485,79 @@ public class MissingPrivacyTest
         return ai;
     }
 
+    @Test public void guestClanSystemFrameKeepsItsDynamicNameLocal() throws Exception
+    {
+        Fixture f = new Fixture(); Translator t = translator(f); RecordingAi ai = recordingAi(t);
+        table(t, "Magic", "魔法");
+        for (String name : new String[]{"River 42", "Magic", "Blue, Red!", "R.S.V.P.",
+                "O'Brien-Smith", " River  42 "}) {
+            String raw = "Requesting access to chat as guest of " + name + "...";
+            Translator.Rendered rendered = t.renderChat(raw, 0, 200, 14, true, true,
+                net.runelite.api.ChatMessageType.SPAM);
+            assertNotNull(raw, rendered);
+            assertEquals("正在申请以访客身份进入 " + name + " 的公会聊天频道...", rendered.text);
+            assertTrue(rendered.complete);
+            assertEquals(rendered.text, t.renderChatCached(raw, 0, 200, 14,
+                net.runelite.api.ChatMessageType.SPAM).text);
+            assertNull(t.renderChat(raw, 0, 200, 14, true, true,
+                net.runelite.api.ChatMessageType.GAMEMESSAGE));
+            assertNull(t.renderChat(raw, 0, 200, 14, true, true));
+            assertNull(t.renderUi(raw, 0, 200, 14, true));
+        }
+        assertEquals(0, ai.requests); assertEquals(0, ai.reads);
+        f.collector.flushPending(); assertTrue(f.data().isEmpty());
+    }
+
+    @Test public void guestClanColorAndPendingGlyphNeverFallIntoAiOrCollection() throws Exception
+    {
+        Fixture f = new Fixture(); Translator t = translator(f); RecordingAi ai = recordingAi(t);
+        String raw = "<col=ff0000>Requesting access to chat as guest of Magic...</col>";
+        String zh = "<col=ff0000>正在申请以访客身份进入 Magic 的公会聊天频道...</col>";
+        assertEquals(zh, t.renderChat(raw, 0, 200, 14, true, true,
+            net.runelite.api.ChatMessageType.SPAM).text);
+        set(t, "glyph", new com.osrscn.glyph.GlyphService() {
+            @Override public String toImgTags(String value, int color, int maxChars, int size) { return null; }
+        });
+        assertNull(t.renderChat(raw, 0, 200, 14, true, true,
+            net.runelite.api.ChatMessageType.SPAM));
+        assertNull(t.renderChatCached(raw, 0, 200, 14, net.runelite.api.ChatMessageType.SPAM));
+        assertEquals(0, ai.requests); assertEquals(0, ai.reads);
+        f.collector.flushPending(); assertTrue(f.data().isEmpty());
+    }
+
+    @Test public void guestClanFrameRejectsMalformedAndHistoricalRawRows() throws Exception
+    {
+        String safe = "Requesting access to chat as guest of River 42...";
+        for (String raw : new String[]{safe, "<col=ff0000>" + safe + "</col>",
+                "REQUESTING ACCESS TO CHAT AS GUEST OF Magic...", safe + " Extra",
+                "Requesting access to chat as guest of <img=1>Magic..."})
+            assertEquals("identity_context", MissingPrivacy.rejection(row(raw)));
+        assertNull(MissingPrivacy.rejection(row(SAFE)));
+    }
+
+    @Test public void malformedGuestClanFramesRemainPrivateAndUntranslated() throws Exception
+    {
+        Fixture f = new Fixture(); Translator t = translator(f); RecordingAi ai = recordingAi(t);
+        for (String raw : new String[]{"Requesting access to chat as guest of ...",
+                "Requesting access to chat as guest of <img=1>Magic...",
+                "Requesting access to chat as guest of Magic... Extra",
+                "Requesting access to chat as guest of Magic... Extra...",
+                "<col=ff0000>Requesting access to chat as guest of Magic...",
+                "Requesting access to chat as guest of Magic...\u0001"})
+            assertNull(raw, t.renderChat(raw, 0, 200, 14, true, true,
+                net.runelite.api.ChatMessageType.SPAM));
+        assertEquals(0, ai.requests); assertEquals(0, ai.reads);
+        f.collector.flushPending(); assertTrue(f.data().isEmpty());
+    }
+
+
     @Test public void knownIdentityFramesNeverReachAutomaticAiOrItsCache() throws Exception
     {
         // Frozen structures; invented identities and synthetic break/color variants.
         for (String text : new String[]{RANK, RANK.replace("top three", "top<br>three"),
                 RANK.replace("were ", "were<br>"), "Trading<br/>With: Test One",
-                "<col=ff0000>Trading with:</col><br>Test One", "Test One's group is: Test Team."}) {
+                "<col=ff0000>Trading with:</col><br>Test One", "Test One's group is: Test Team.",
+                "Now talking in chat-channel Magic", "You are now a guest of Magic."}) {
             Fixture f = new Fixture(); Translator t = translator(f); RecordingAi ai = recordingAi(t);
             assertNull(t.plain(text)); assertNull(t.plainCollect(text, "dialogue", "", ""));
             assertNull(t.plainColored(text, "dialogue", "", ""));

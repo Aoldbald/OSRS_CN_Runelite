@@ -37,11 +37,11 @@ public class Translator
 	// GE transaction lines are parameterized by item: one hard row per item would never end, so the
 	// frame is composed here and the item goes through the name table (17k entries) instead.
 	private static final Pattern GE_TRADE_LINE = Pattern.compile(
-			"(?i)^Grand Exchange: Finished (buying|selling) (<Num\\d+>) x (.+?)\\.?$");
+			"(?i)^Grand Exchange: Finished (buying|selling) (<Num\\d+>) x (.+)$");
 	private static final Pattern GE_OFFER_LINE = Pattern.compile(
 			"(?i)^(Buy|Sell): (<Num\\d+>) x (.+)$");
 	// Offer labels in the exchange window: same deal, the item is the only variable part.
-	private static final Pattern GE_DONE_LINE = Pattern.compile("(?i)^(Bought|Sold|Buying|Selling):\\s*(.+?)\\.?$");
+	private static final Pattern GE_DONE_LINE = Pattern.compile("(?i)^(Bought|Sold|Buying|Selling):\\s*(.+)$");
 	// Quest list entry. Both halves are already in the tables (every quest name, and the three states),
 	// so composing it covers all ~200 quests instead of one collected row per quest per state.
 	private static final Pattern QUEST_STATE_LINE = Pattern.compile(
@@ -55,6 +55,9 @@ public class Translator
 	// Level-up chat lines arrive as "<skillId>|Check the skill guide ...": the engine reads the
 	// prefix to make "skill guide" clickable, so it must survive translation untouched.
 	private static final Pattern CHAT_LINK_PREFIX = Pattern.compile("^(\\d{1,3}\\|)(.+)$", Pattern.DOTALL);
+	private static final Pattern GUEST_CLAN_REQUEST = Pattern.compile(
+			"^(<col=[0-9a-fA-F]{1,6}>)?Requesting access to chat as guest of (.+?)\\.\\.\\.(</col>)?$");
+	private static final Pattern WHOLE_CHAT_COLOR = Pattern.compile("^<col=[0-9a-fA-F]{1,6}>");
 	// Combat-achievement "Monster: <name>" line: the prefix is fixed and the name lives in the name
 	// table (incl. bosses), so compose "怪物：" + looked-up name instead of needing a whole-line entry.
 	private static final Pattern MONSTER_LINE = Pattern.compile("(?i)^Monster:\\s*(.+)$");
@@ -194,6 +197,72 @@ public class Translator
 	}
 
 	/**
+	 * Dialogue has a small, intentionally separate numeric-template consumer. Keep its exact and
+	 * identity behaviour aligned with {@link #plainCore}; unlike UI/chat it must not inherit the
+	 * broader price, synthetic, player-list, or cross-category fallback rules from templateLookup.
+	 */
+	private String plainDialogueCore(String english, String category, String subCategory, String source,
+			boolean collect, boolean identity, boolean allowAiRequests)
+	{
+		if (english == null || english.trim().isEmpty())
+		{
+			return null;
+		}
+		String zh = tableHit(english);
+		if (zh != null)
+		{
+			return keepEnglish(zh) ? null : zh;
+		}
+		zh = store.lookupPlaceholderTolerant(english);
+		if (zh != null)
+		{
+			return keepEnglish(zh) ? null : zh;
+		}
+		if (identity)
+		{
+			return null;
+		}
+		zh = dialogueNumericTemplate(english);
+		if (zh != null)
+		{
+			return keepEnglish(zh) ? null : zh;
+		}
+		if (collect)
+		{
+			missing.record(collectKey(english), category, collectKey(subCategory), collectKey(source));
+		}
+		return aiTranslate(english, true, true, allowAiRequests, null, false);
+	}
+
+	private String dialogueNumericTemplate(String english)
+	{
+		if (!HAS_LETTER.matcher(Tags.stripColorPlaceholders(english)).find())
+		{
+			return null;
+		}
+		List<String> nums = new ArrayList<>();
+		String template = templatizeNumbers(english, nums);
+		if (nums.isEmpty())
+		{
+			return null;
+		}
+		String zh = store.lookup(TranslationStore.Category.DIALOGUE, template);
+		if (zh == null)
+		{
+			zh = store.lookup(TranslationStore.Category.DIALOGUE_EXPERIMENTAL, template);
+		}
+		if (zh == null)
+		{
+			return null;
+		}
+		for (int i = 0; i < nums.size(); i++)
+		{
+			zh = zh.replace("<Num" + i + ">", nums.get(i));
+		}
+		return zh;
+	}
+
+	/**
 	 * Name-masked table hit for {@code english}, or null on a genuine miss. A hit is final either way:
 	 * an English-only value means "checked, keep English", so it must not fall through to the collector
 	 * or the AI (which would mistranslate it). The value is returned raw - the caller applies
@@ -224,16 +293,29 @@ public class Translator
 	 */
 	public String plainColored(String text, String category, String subCategory, String source)
 	{
-		return plainColored(text, category, subCategory, source, true);
+		return plainColored(text, category, subCategory, source, true, false, true);
 	}
 
 	/** Recolour an existing dialogue without collecting again or losing its original identity frame. */
 	public String plainColoredNoCollect(String text)
 	{
-		return plainColored(text, null, null, null, false);
+		return plainColored(text, null, null, null, false, false, true);
 	}
 
-	private String plainColored(String text, String category, String subCategory, String source, boolean collect)
+	/** Colour-aware dialogue lookup with only exact and numeric-template table matching. */
+	public String plainColoredDialogue(String text, String category, String subCategory, String source)
+	{
+		return plainColored(text, category, subCategory, source, true, true, true);
+	}
+
+	/** Re-render a known dialogue translation without collection or an AI request. */
+	public String plainColoredDialogueNoCollect(String text)
+	{
+		return plainColored(text, null, null, null, false, true, false);
+	}
+
+	private String plainColored(String text, String category, String subCategory, String source, boolean collect,
+			boolean dialogueOnly, boolean allowAi)
 	{
 		if (text == null || text.trim().isEmpty())
 		{
@@ -242,7 +324,10 @@ public class Translator
 		List<String> colors = Tags.colorTags(text);
 		if (colors.isEmpty())
 		{
-			return plainCore(Tags.stripTags(text), category, subCategory, source, collect, hasIdentityContext(text));
+			String plain = Tags.stripTags(text);
+			return dialogueOnly
+					? plainDialogueCore(plain, category, subCategory, source, collect, hasIdentityContext(text), allowAi)
+					: plainCore(plain, category, subCategory, source, collect, hasIdentityContext(text));
 		}
 		// The tables often hold only the plain form of a coloured line, so a <colNumN> miss retries with
 		// colours stripped before anything is recorded or sent to the AI; the placeholder-count check
@@ -253,16 +338,25 @@ public class Translator
 		{
 			zh = tableHit(Tags.stripTags(text));
 		}
-		if (zh != null)
+		if (zh != null && keepEnglish(zh))
 		{
-			if (keepEnglish(zh))
+			return null;
+		}
+		if (zh == null && dialogueOnly && !hasIdentityContext(text))
+		{
+			// Exact coloured and plain rows above retain their existing priority. For a template miss,
+			// prefer the colour-carrying key, then the plain template as a safe single-colour fallback.
+			zh = dialogueNumericTemplate(templated);
+			if (zh == null)
 			{
-				return null;
+				zh = dialogueNumericTemplate(Tags.stripTags(text));
 			}
 		}
-		else
+		if (zh == null)
 		{
-			zh = plainCore(templated, category, subCategory, source, collect, hasIdentityContext(text));
+			zh = dialogueOnly
+					? plainDialogueCore(templated, category, subCategory, source, collect, hasIdentityContext(text), allowAi)
+					: plainCore(templated, category, subCategory, source, collect, hasIdentityContext(text));
 			if (zh == null)
 			{
 				return null;
@@ -424,33 +518,65 @@ public class Translator
 
 	public Rendered renderChat(String text, int colorRgb, int maxChars, int size, boolean aiFallback, boolean persist)
 	{
-		return renderChat(text, colorRgb, maxChars, size, aiFallback, persist, true, null, false);
+		return renderChat(text, colorRgb, maxChars, size, aiFallback, persist, true, null, false, null);
+	}
+
+	/** Game message with its type, so fixed system frames can be rendered locally. */
+	public Rendered renderChat(String text, int colorRgb, int maxChars, int size, boolean aiFallback,
+			boolean persist, net.runelite.api.ChatMessageType type)
+	{
+		return renderChat(text, colorRgb, maxChars, size, aiFallback, persist, true, null, false, type);
 	}
 
 	/** Repaint chat from tables and AI cache without requests, persistence or missing collection. */
 	public Rendered renderChatCached(String text, int colorRgb, int maxChars, int size)
 	{
-		return renderChat(text, colorRgb, maxChars, size, true, false, false, null, false);
+		return renderChat(text, colorRgb, maxChars, size, true, false, false, null, false, null);
+	}
+
+	/** Repaint a game message with its original type, without requests or collection. */
+	public Rendered renderChatCached(String text, int colorRgb, int maxChars, int size,
+			net.runelite.api.ChatMessageType type)
+	{
+		return renderChat(text, colorRgb, maxChars, size, true, false, false, null, false, type);
 	}
 
 	/** Cached repaint for an independently authorized player message; never dispatches or persists. */
 	public Rendered renderPlayerChatCached(String text, int colorRgb, int maxChars, int size)
 	{
-		return renderChat(text, colorRgb, maxChars, size, true, false, false, null, true);
+		return renderChat(text, colorRgb, maxChars, size, true, false, false, null, true, null);
 	}
 
 	/** Player-mode permit reaches each AI admission; table and cached rendering stay unchanged. */
 	public Rendered renderChat(String text, int colorRgb, int maxChars, int size, boolean aiFallback,
 			boolean persist, AiTranslator.RequestPermit permit)
 	{
-		return renderChat(text, colorRgb, maxChars, size, aiFallback, persist, true, permit, true);
+		return renderChat(text, colorRgb, maxChars, size, aiFallback, persist, true, permit, true, null);
 	}
 
 	private Rendered renderChat(String text, int colorRgb, int maxChars, int size, boolean aiFallback,
-			boolean persist, boolean allowRequests, AiTranslator.RequestPermit permit, boolean playerChat)
+			boolean persist, boolean allowRequests, AiTranslator.RequestPermit permit, boolean playerChat,
+			net.runelite.api.ChatMessageType messageType)
 	{
 		// Game messages pass persist=true and are safe to collect; player chat passes persist=false
 		// and must never be written to missing.tsv.
+		if (!playerChat && isChannelNoticeType(messageType))
+		{
+			String zh = localChannelNotice(text, messageType);
+			// These system channels are local-only, including unknown frames and pending glyphs.
+			if (zh == null) return null;
+			String img = render(zh, colorRgb, maxChars, size);
+			return img == null ? null : new Rendered(img, true);
+		}
+		if (!playerChat && messageType == net.runelite.api.ChatMessageType.SPAM && text != null)
+		{
+			String zh = guestClanRequest(text);
+			if (zh != null)
+			{
+				String img = render(zh, colorRgb, maxChars, size);
+				return img == null ? null : new Rendered(img, true);
+			}
+		}
 		Matcher link = text == null ? null : CHAT_LINK_PREFIX.matcher(text);
 		if (link != null && link.matches())
 		{
@@ -459,6 +585,100 @@ public class Translator
 			return r == null ? null : new Rendered(link.group(1) + r.text, r.complete);
 		}
 		return renderWithOrder(text, colorRgb, maxChars, size, aiFallback, persist, CHAT_ORDER, persist ? "gameText" : null, allowRequests, permit, playerChat);
+	}
+
+	private static String guestClanRequest(String text)
+	{
+		Matcher request = GUEST_CLAN_REQUEST.matcher(text);
+		if (!request.matches()) return null;
+		String name = request.group(2);
+		if (!validLocalChatName(name)) return null;
+		String open = request.group(1);
+		String close = request.group(3);
+		if ((open == null) != (close == null)) return null;
+		String zh = "正在申请以访客身份进入 " + name + " 的公会聊天频道...";
+		return open == null ? zh : open + zh + close;
+	}
+
+	private static boolean validLocalChatName(String name)
+	{
+		if (name.trim().isEmpty() || name.contains("...") || name.indexOf('<') >= 0 || name.indexOf('>') >= 0)
+			return false;
+		for (int i = 0; i < name.length(); i++)
+		{
+			char c = name.charAt(i);
+			if (Character.isISOControl(c)) return false;
+			if (Character.isHighSurrogate(c))
+			{
+				if (i + 1 >= name.length() || !Character.isLowSurrogate(name.charAt(++i))) return false;
+			}
+			else if (Character.isLowSurrogate(c)) return false;
+		}
+		return true;
+	}
+
+	private static boolean isChannelNoticeType(net.runelite.api.ChatMessageType type)
+	{
+		return type == net.runelite.api.ChatMessageType.FRIENDSCHATNOTIFICATION
+				|| type == net.runelite.api.ChatMessageType.CLAN_MESSAGE
+				|| type == net.runelite.api.ChatMessageType.CLAN_GUEST_MESSAGE;
+	}
+
+	/** Admit only known fixed system frames; never track arbitrary channel notifications. */
+	public static boolean hasLocalChannelNotice(String text, net.runelite.api.ChatMessageType type)
+	{
+		return localChannelNotice(text, type) != null;
+	}
+
+	private static String localChannelNotice(String text, net.runelite.api.ChatMessageType type)
+	{
+		if (text == null || !isChannelNoticeType(type)) return null;
+		String open = "";
+		Matcher color = WHOLE_CHAT_COLOR.matcher(text);
+		if (color.find())
+		{
+			if (!text.endsWith("</col>")) return null;
+			open = color.group();
+			text = text.substring(open.length(), text.length() - "</col>".length());
+		}
+		String zh = null;
+		switch (type)
+		{
+			case FRIENDSCHATNOTIFICATION:
+				if (text.equals("Attempting to join chat-channel...")) zh = "正在尝试加入聊天频道...";
+				else if (text.equals("To talk, start each line of chat with the / symbol."))
+					zh = "要发言，请在每条消息开头输入 /。";
+				else if (text.startsWith("Now talking in chat-channel "))
+				{
+					String name = text.substring("Now talking in chat-channel ".length());
+					if (validLocalChatName(name)) zh = "已进入聊天频道 " + name;
+				}
+				break;
+			case CLAN_MESSAGE:
+				if (text.equals("To talk in your clan's channel, start each line of chat with // or /c."))
+					zh = "要在公会频道发言，请在每条消息开头输入 // 或 /c。";
+				break;
+			case CLAN_GUEST_MESSAGE:
+				if (text.equals("Attempting to reconnect to guest channel automatically..."))
+					zh = "正在尝试自动重新连接访客频道...";
+				else if (text.equals("To talk, start each line of chat with /// or /gc."))
+					zh = "要发言，请在每条消息开头输入 /// 或 /gc。";
+				else if (text.startsWith("You are now a guest of "))
+				{
+					String help = "<br>To talk, start each line of chat with /// or /gc.";
+					boolean joined = text.endsWith(help);
+					String welcome = joined ? text.substring(0, text.length() - help.length()) : text;
+					if (welcome.endsWith("."))
+					{
+						String name = welcome.substring("You are now a guest of ".length(), welcome.length() - 1);
+						if (validLocalChatName(name)) zh = "你现在是 " + name + " 的访客。"
+								+ (joined ? "<br>要发言，请在每条消息开头输入 /// 或 /gc。" : "");
+					}
+				}
+				break;
+			default: break;
+		}
+		return zh == null || open.isEmpty() ? zh : open + zh + "</col>";
 	}
 
 	/**
@@ -567,6 +787,12 @@ public class Translator
 					}
 				}
 			}
+			// A line the collector rejects as half a sentence means the client wrapped one sentence; only
+			// the whole text is a usable key. Independent stacked lines stay per-line.
+			if (!all && collectSource != null && hasFragmentLine(lines))
+			{
+				missing.record(collectKey(text), collectSource, "", "");
+			}
 			if (!any)
 			{
 				return null;
@@ -580,6 +806,18 @@ public class Translator
 			missing.record(collectKey(text), collectSource, "", "");
 		}
 		return null;
+	}
+
+	private static boolean hasFragmentLine(String[] lines)
+	{
+		for (String line : lines)
+		{
+			if (MissingCollector.isFragment(Tags.stripTags(line)))
+			{
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/**
@@ -1068,12 +1306,28 @@ public class Translator
 		return any ? sb.toString() : null;
 	}
 
+	private String geItemLookup(String name, TranslationStore.Category[] order)
+	{
+		String zh = lookupAnyOf(name, order);
+		if (zh == null && name.endsWith("."))
+		{
+			zh = lookupAnyOf(name.substring(0, name.length() - 1), order);
+		}
+		// Preserve the qualifier when a GE item label adds the known membership suffix.
+		if (zh == null && name.endsWith(" (Members)"))
+		{
+			String base = lookupAnyOf(name.substring(0, name.length() - " (Members)".length()), order);
+			if (base != null) zh = base + "（会员）";
+		}
+		return zh;
+	}
+
 	private String syntheticLookup(String text, TranslationStore.Category[] order)
 	{
 		Matcher ge = GE_TRADE_LINE.matcher(text);
 		if (ge.matches())
 		{
-			String zhName = lookupAnyOf(Tags.stripColorPlaceholders(ge.group(3)).trim(), order);
+			String zhName = geItemLookup(Tags.stripColorPlaceholders(ge.group(3)).trim(), order);
 			return zhName == null ? null
 					: "大交易所：已完成" + ("buying".equalsIgnoreCase(ge.group(1)) ? "购买" : "出售")
 					+ " " + ge.group(2) + " × " + zhName + "。";
@@ -1090,7 +1344,7 @@ public class Translator
 		Matcher done = GE_DONE_LINE.matcher(text);
 		if (done.matches())
 		{
-			String zhName = lookupAnyOf(Tags.stripColorPlaceholders(done.group(2)).trim(), order);
+			String zhName = geItemLookup(Tags.stripColorPlaceholders(done.group(2)).trim(), order);
 			if (zhName == null)
 			{
 				return null;
@@ -1113,14 +1367,25 @@ public class Translator
 		Matcher done2 = QUEST_DONE_LINE.matcher(Tags.stripColorPlaceholders(text).trim());
 		if (done2.matches())
 		{
-			String zhName = lookupAnyOf(done2.group(1).trim(), order);
-			return zhName == null ? null : "你已完成任务：" + zhName + "！";
+			String zhName = lookupCompletedQuest(done2.group(1).trim(), order);
+			if (zhName == null)
+			{
+				return null;
+			}
+			boolean bang = zhName.endsWith("！") || zhName.endsWith("!");
+			return "你已完成任务：" + zhName + (bang ? "" : "！");
 		}
 
 		Matcher congrats = QUEST_DONE_CHAT.matcher(Tags.stripColorPlaceholders(text).trim());
 		if (congrats.matches())
 		{
-			String zhName = lookupAnyOf(congrats.group(1).trim(), order);
+			String questName = congrats.group(1).trim();
+			String zhName = lookupAnyOf(questName, order);
+			// This control token prefixes quest titles in completion chat; keep exact keys first.
+			if (zhName == null && questName.startsWith("@q_mes@"))
+			{
+				zhName = lookupAnyOf(questName.substring("@q_mes@".length()), order);
+			}
 			return zhName == null ? null : "恭喜，你完成了一个任务：" + zhName;
 		}
 
@@ -1435,6 +1700,29 @@ public class Translator
 			}
 		}
 		return false;
+	}
+
+	/**
+	 * Quest title from "You have completed X!". The game adds a lowercase article ("the Waterfall
+	 * Quest") and its closing "!" swallows a title's own one ("Scrambled!"). Exact keys win.
+	 */
+	private String lookupCompletedQuest(String questName, TranslationStore.Category[] order)
+	{
+		String zh = lookupAnyOf(questName, order);
+		if (zh == null)
+		{
+			zh = lookupAnyOf(questName + "!", order);
+		}
+		if (zh == null && questName.startsWith("the ") && !questName.regionMatches(true, 4, "the ", 0, 4))
+		{
+			String bare = questName.substring(4);
+			zh = lookupAnyOf(bare, order);
+			if (zh == null)
+			{
+				zh = lookupAnyOf(bare + "!", order);
+			}
+		}
+		return zh;
 	}
 
 	private String lookupAnyOf(String key, TranslationStore.Category[] order)

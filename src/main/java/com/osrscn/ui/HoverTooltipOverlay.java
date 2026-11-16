@@ -114,7 +114,7 @@ public class HoverTooltipOverlay extends Overlay
 		{
 			String optZh = menuTranslator.translateOption(option, type, size);
 			String tgtZh = (target == null || target.isEmpty()) ? null
-					: menuTranslator.translateTarget(target, size);
+					: menuTranslator.translateTarget(target, type, size);
 			String optPart = (optZh != null) ? optZh : option;
 			String tgtPart = (tgtZh != null) ? tgtZh : (target == null ? "" : target);
 			memoText = (optZh == null && tgtZh == null) ? null

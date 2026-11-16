@@ -16,6 +16,7 @@ import javax.inject.Inject;
 import javax.inject.Singleton;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.FontTypeFace;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.api.widgets.WidgetTextAlignment;
@@ -34,6 +35,10 @@ public class InterfaceTranslator
 {
 	private static final int WRAP_PAD = 8;
 	private static final int MIN_WRAP = 6; // don't auto-wrap widgets narrower than this many glyphs
+	// Groups whose rows reserve room with leading spaces for another widget drawn at the same x
+	// (fairy ring travel log: the red ring code). The pad is kept in front of the glyphs.
+	private static final Set<Integer> LEAD_PAD_GROUPS = Set.of(381);
+	private static final int PAD_SPACE_PX = 4;
 	// chat-tab labels render a touch smaller than normal UI text: the name pins to the top and the
 	// On/Off filter (smaller still) tucks against the bottom, so the two glyph lines stay well apart.
 	private static final int CHAT_TAB_NAME_SIZE = 10;
@@ -2675,6 +2680,29 @@ public class InterfaceTranslator
 		}
 	}
 
+	/** The run of spaces / non-breaking spaces at the start of {@code text}, or "" when there is none. */
+	static String leadingPad(String text)
+	{
+		int i = 0;
+		while (i < text.length() && (text.charAt(i) == ' ' || text.charAt(i) == ' '))
+		{
+			i++;
+		}
+		return text.substring(0, i);
+	}
+
+	/** Pixel width of a leading pad in the widget's own font; PAD_SPACE_PX per space when unmeasurable. */
+	private static int padWidth(Widget w, String pad)
+	{
+		if (pad.isEmpty())
+		{
+			return 0;
+		}
+		FontTypeFace font = w.getFont();
+		int px = font == null ? 0 : font.getTextWidth(pad.replace(' ', ' '));
+		return px > 0 ? px : pad.length() * PAD_SPACE_PX;
+	}
+
 	private void translateWidget(Widget w, boolean perFrame, SurfaceRegistry.Surface s)
 	{
 		// Policy comes from the widget's own group (info boxes can be nested under another group's root),
@@ -2737,7 +2765,8 @@ public class InterfaceTranslator
 			return;
 		}
 
-		int maxChars = glyph.wrapChars(w.getWidth() - WRAP_PAD, size);
+		String pad = LEAD_PAD_GROUPS.contains(w.getId() >>> 16) ? leadingPad(text) : "";
+		int maxChars = glyph.wrapChars(w.getWidth() - WRAP_PAD - padWidth(w, pad), size);
 		// narrow widgets (buttons like emote/chat tabs) shouldn't auto-wrap short labels into a mess
 		if (maxChars < MIN_WRAP)
 		{
@@ -2766,15 +2795,16 @@ public class InterfaceTranslator
 		}
 		lastMiss.remove(key);
 		original.put(key, text); // remember the English we are replacing, for instant restore
-		w.setText(r.text);
+		String out = pad.isEmpty() || r.text.startsWith(pad) ? r.text : pad + r.text;
+		w.setText(out);
 		// native text shadow draws the glyph twice at a 1px offset, which on char-images looks
 		// like doubled/overlapping characters (e.g. the chat tab buttons) - turn it off.
 		w.setTextShadowed(false);
-		if (r.text.contains("<br>"))
+		if (out.contains("<br>"))
 		{
 			w.setLineHeight(glyph.glyphHeight(size));
 		}
-		lastSet.put(key, r.text);
+		lastSet.put(key, out);
 		lastColor.put(key, w.getTextColor());
 		// keep retrying partial boxes (AI lines pending) until every translatable line is done
 		if (r.complete)
