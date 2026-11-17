@@ -183,8 +183,8 @@ public class InterfaceTranslatorLifecycleTest
         }
     }
 
-    // Fairy ring travel log (group 381): each row's name is padded with leading spaces so the red code
-    // widget drawn at the same x stays clear. The pad must survive translation.
+    // Fairy ring travel log (group 381): the red code widget is drawn at the same x as the row's name, so
+    // whatever leads the name (spaces here, a line break further down) must survive translation.
     private static final String PAD8 = "        ";
 
     @Test public void fairyRingLogKeepsLeadingPadBeforeGlyphs() throws Exception
@@ -238,6 +238,109 @@ public class InterfaceTranslatorLifecycleTest
         TextWidget padded = new TextWidget(381 << 16 | 5, 3, PAD8 + "Islands: Penguins");
         walkWith(padded, new ArrayList<>(), PAD8 + "<img=1><img=2>");
         assertEquals(PAD8 + "<img=1><img=2>", padded.text);
+    }
+
+    // What the game really sends (db table fairyring, column desc): "<br>" + name, so the name sits on
+    // the line below the red code drawn at the same x. The line break must survive translation.
+    @Test public void fairyRingLogKeepsLeadingLineBreak() throws Exception
+    {
+        List<Integer> widths = new ArrayList<>();
+        TextWidget row = new TextWidget(381 << 16 | 5, -1, "<br>Islands: Penguins");
+        walkWithWidthRecorder(row, widths);
+        assertEquals("<br><img=1><img=2>", row.text);
+
+        TextWidget bare = new TextWidget(381 << 16 | 6, -1, "Islands: Penguins");
+        walkWithWidthRecorder(bare, widths);
+        assertEquals("a line break reserves no width", widths.get(1), widths.get(0));
+    }
+
+    @Test public void fairyRingLogPadWidthCountsOnlySpacesAfterTheLineBreak() throws Exception
+    {
+        List<Integer> widths = new ArrayList<>();
+        List<String> measured = new ArrayList<>();
+        TextWidget row = new TextWidget(381 << 16 | 5, -1, "<br>" + PAD8 + "Islands: Penguins");
+        row.font = (net.runelite.api.FontTypeFace) Proxy.newProxyInstance(
+                InterfaceTranslatorLifecycleTest.class.getClassLoader(),
+                new Class<?>[] {net.runelite.api.FontTypeFace.class}, (p, m, a) -> {
+                    if (!m.getName().equals("getTextWidth"))
+                    {
+                        return defaultValue(m.getReturnType());
+                    }
+                    measured.add((String) a[0]);
+                    return 40;
+                });
+        walkWithWidthRecorder(row, widths);
+        assertEquals("<br>" + PAD8 + "<img=1><img=2>", row.text);
+        assertEquals(java.util.Arrays.asList(PAD8), measured);
+        assertEquals(java.util.Arrays.asList((200 - 8 - 40) / 10), widths);
+    }
+
+    @Test public void fairyRingLogLineBreakIsNotDoubledWhenRenderKeepsIt() throws Exception
+    {
+        TextWidget row = new TextWidget(381 << 16 | 5, -1, "<br>Islands: Penguins");
+        walkWith(row, new ArrayList<>(), "<br><img=1><img=2>");
+        assertEquals("<br><img=1><img=2>", row.text);
+    }
+
+    @Test public void leadingLineBreakOnlyKeptInListedGroups() throws Exception
+    {
+        TextWidget other = new TextWidget(200 << 16 | 5, -1, "<br>Islands: Penguins");
+        walkWithWidthRecorder(other, new ArrayList<>());
+        assertEquals("<img=1><img=2>", other.text);
+    }
+
+    // End to end through the real lookup: table keys carry no <br> (normalize folds it into a space), so
+    // the hit comes back without the break and the widget has to get it back.
+    @Test public void fairyRingLogRealLookupKeepsLineBreak() throws Exception
+    {
+        TextWidget row = new TextWidget(381 << 16 | 5, -1, "<br>Islands: Penguins");
+        walkWithRealLookup(row, "Islands: Penguins", "岛屿：企鹅");
+        assertEquals("<br>岛屿：企鹅", row.text);
+
+        // some rows also end with a space
+        TextWidget trailing = new TextWidget(381 << 16 | 6, -1, "<br>Asgarnia: Mudskipper Point ");
+        walkWithRealLookup(trailing, "Asgarnia: Mudskipper Point", "阿斯加尼亚：弹涂鱼角");
+        assertEquals("<br>阿斯加尼亚：弹涂鱼角", trailing.text);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void walkWithRealLookup(TextWidget w, String key, String zh) throws Exception
+    {
+        GroupingFixture f = new GroupingFixture(false);
+        com.osrscn.translate.TranslationStore store = new com.osrscn.translate.TranslationStore();
+        Field maps = com.osrscn.translate.TranslationStore.class.getDeclaredField("maps");
+        maps.setAccessible(true);
+        ((Map<com.osrscn.translate.TranslationStore.Category, Map<String, String>>) maps.get(store))
+                .get(com.osrscn.translate.TranslationStore.Category.INTERFACE)
+                .put(com.osrscn.translate.TranslationStore.normalize(key), zh);
+        Translator real = new Translator();
+        inject(real, "client", Proxy.newProxyInstance(InterfaceTranslatorLifecycleTest.class.getClassLoader(),
+                new Class<?>[] {Client.class}, (p, m, a) -> m.getName().equals("getPlayers")
+                        ? java.util.Collections.emptyList() : defaultValue(m.getReturnType())));
+        inject(real, "store", store);
+        inject(real, "missing", new com.osrscn.translate.MissingCollector()
+        {
+            @Override public void record(String english, String category, String subCategory, String source) { }
+        });
+        inject(real, "ai", new com.osrscn.translate.AiTranslator()
+        {
+            @Override public synchronized String cached(String text) { return null; }
+            @Override public String translate(String text, boolean persist) { return null; }
+        });
+        inject(real, "glyph", new GlyphService()
+        {
+            @Override public String toImgTags(String text, int color, int maxChars, int size) { return text; }
+        });
+        inject(f.handler, "translator", real);
+        inject(f.handler, "glyph", new GlyphService()
+        {
+            @Override public int uiSize() { return 14; }
+            @Override public int smallSize() { return 12; }
+            @Override public int wrapChars(int width, int size) { return width / 10; }
+        });
+        java.lang.reflect.Method walk = InterfaceTranslator.class.getDeclaredMethod("walk", Widget.class, boolean.class);
+        walk.setAccessible(true);
+        walk.invoke(f.handler, w.widget, false);
     }
 
     private static void walkWithWidthRecorder(TextWidget w, List<Integer> widths) throws Exception

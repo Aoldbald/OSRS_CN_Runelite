@@ -35,8 +35,8 @@ public class InterfaceTranslator
 {
 	private static final int WRAP_PAD = 8;
 	private static final int MIN_WRAP = 6; // don't auto-wrap widgets narrower than this many glyphs
-	// Groups whose rows reserve room with leading spaces for another widget drawn at the same x
-	// (fairy ring travel log: the red ring code). The pad is kept in front of the glyphs.
+	// Groups whose rows start with a line break or spaces to stay clear of another widget drawn at the
+	// same x (fairy ring travel log: "<br>" + name, under the red ring code). Kept in front of the glyphs.
 	private static final Set<Integer> LEAD_PAD_GROUPS = Set.of(381);
 	private static final int PAD_SPACE_PX = 4;
 	// chat-tab labels render a touch smaller than normal UI text: the name pins to the top and the
@@ -2680,27 +2680,44 @@ public class InterfaceTranslator
 		}
 	}
 
-	/** The run of spaces / non-breaking spaces at the start of {@code text}, or "" when there is none. */
+	/** The run of line breaks / spaces / non-breaking spaces at the start of {@code text}, or "". */
 	static String leadingPad(String text)
 	{
 		int i = 0;
-		while (i < text.length() && (text.charAt(i) == ' ' || text.charAt(i) == ' '))
+		while (i < text.length())
 		{
-			i++;
+			char c = text.charAt(i);
+			if (c == ' ' || c == '\u00A0')
+			{
+				i++;
+			}
+			else if (text.startsWith("<br>", i))
+			{
+				i += 4;
+			}
+			else
+			{
+				break;
+			}
 		}
 		return text.substring(0, i);
 	}
 
-	/** Pixel width of a leading pad in the widget's own font; PAD_SPACE_PX per space when unmeasurable. */
+	/**
+	 * Pixel width the pad takes on the line the text starts on (its spaces after the last line break),
+	 * in the widget's own font; PAD_SPACE_PX per space when unmeasurable.
+	 */
 	private static int padWidth(Widget w, String pad)
 	{
-		if (pad.isEmpty())
+		int br = pad.lastIndexOf("<br>");
+		String spaces = br < 0 ? pad : pad.substring(br + 4);
+		if (spaces.isEmpty())
 		{
 			return 0;
 		}
 		FontTypeFace font = w.getFont();
-		int px = font == null ? 0 : font.getTextWidth(pad.replace(' ', ' '));
-		return px > 0 ? px : pad.length() * PAD_SPACE_PX;
+		int px = font == null ? 0 : font.getTextWidth(spaces.replace('\u00A0', ' '));
+		return px > 0 ? px : spaces.length() * PAD_SPACE_PX;
 	}
 
 	private void translateWidget(Widget w, boolean perFrame, SurfaceRegistry.Surface s)
