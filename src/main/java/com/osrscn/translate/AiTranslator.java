@@ -47,6 +47,11 @@ public class AiTranslator
 {
 	// Includes local model loading and inference; never an unlimited read or whole-call wait.
 	public static final long OLLAMA_REQUEST_TIMEOUT_MS = 60_000;
+	// Online providers answer only after generation completes, so the whole wait sits in a single
+	// socket read and the inherited 10s default aborts a slow-but-successful reply. 15s covers that
+	// tail while staying far below the Ollama budget. No callTimeout is set: this bounds one read,
+	// not the whole call (connect and a retry are separate budgets).
+	public static final long API_REQUEST_TIMEOUT_MS = 15_000;
 	private static final MediaType JSON = MediaType.parse("application/json");
 	private static final Pattern THINK = Pattern.compile("(?s)<think>.*?</think>");
 	// Value labels (bank/GE totals "(3.6B)", "(500)") change with every gp move, so they never form a
@@ -553,7 +558,11 @@ public class AiTranslator
 		return inferenceDispatcher;
 	}
 
-	/** Called under this monitor; only local inference gets the cold-load budget. */
+	/**
+	 * Called under this monitor. Each backend gets the budget its own call shape needs: local inference
+	 * a cold-load-and-generate read/call budget, the online API a read budget sized for a provider that
+	 * stays silent until the whole answer is generated.
+	 */
 	private OkHttpClient inferenceClient(boolean api)
 	{
 		if (api)
@@ -562,6 +571,7 @@ public class AiTranslator
 			{
 				apiInferenceClient = httpClient.newBuilder()
 						.dispatcher(inferenceDispatcher())
+						.readTimeout(API_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
 						.build();
 			}
 			return apiInferenceClient;

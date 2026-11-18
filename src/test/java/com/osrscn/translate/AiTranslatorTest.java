@@ -970,7 +970,8 @@ public class AiTranslatorTest
 		// The injected client belongs to RuneLite: its dispatcher must come out untouched.
 		assertEquals(5, injected.dispatcher().getMaxRequestsPerHost());
 		assertEquals(64, injected.dispatcher().getMaxRequests());
-		// Only the dispatcher differs: pool, executor and interceptor chain are still the injected ones.
+		// Only the dispatcher and the AI timeout budgets differ: pool, executor and interceptor chain
+		// are still the injected ones.
 		assertSame(injected.connectionPool(), api.connectionPool());
 		assertSame(injected.connectionPool(), ollama.connectionPool());
 		assertSame(injected.dispatcher().executorService(), api.dispatcher().executorService());
@@ -981,6 +982,12 @@ public class AiTranslatorTest
 		// Local inference keeps its cold-load budget while using the same private dispatcher.
 		assertEquals(AiTranslator.OLLAMA_REQUEST_TIMEOUT_MS, ollama.readTimeoutMillis());
 		assertEquals(AiTranslator.OLLAMA_REQUEST_TIMEOUT_MS, ollama.callTimeoutMillis());
+		// The online API bounds one silent read, not the whole call; the injected client keeps
+		// RuneLite's inherited 10s read default and has no whole-call cap either.
+		assertEquals(AiTranslator.API_REQUEST_TIMEOUT_MS, api.readTimeoutMillis());
+		assertEquals(0, api.callTimeoutMillis());
+		assertEquals(10_000, injected.readTimeoutMillis());
+		assertEquals(0, injected.callTimeoutMillis());
 	}
 
 	// ---- terminology hint (NAME-table glossary prefix on the user message) ----
