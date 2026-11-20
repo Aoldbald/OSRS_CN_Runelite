@@ -11,15 +11,20 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.inject.Inject;
 import javax.inject.Singleton;
+import javax.swing.JOptionPane;
+import javax.swing.SwingUtilities;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.RuneLite;
 import okhttp3.Call;
@@ -32,8 +37,10 @@ import okhttp3.RequestBody;
 import okhttp3.Response;
 
 /**
- * Asynchronous AI fallback for text not found in the lookup table. Two backends (see {@code aiBackend}):
- * local Ollama ({@code /api/chat}) and any OpenAI-compatible online API ({@code /chat/completions}).
+ * Asynchronous AI fallback for text not found in the lookup table. Three backends (see
+ * {@code aiBackend}): local Ollama ({@code /api/chat}), any OpenAI-compatible online API
+ * ({@code /chat/completions}), and the keyless free machine translation endpoint
+ * ({@link FreeMtClient}, Bing/Edge).
  *
  * <p>{@link #translate} never blocks: on a miss it returns {@code null} and fires a background
  * request; the result lands in the cache and is picked up by a later call.
@@ -44,6 +51,11 @@ public class AiTranslator
 {
 	// Includes local model loading and inference; never an unlimited read or whole-call wait.
 	public static final long OLLAMA_REQUEST_TIMEOUT_MS = 60_000;
+	// Online providers answer only after generation completes, so the whole wait sits in a single
+	// socket read and the inherited 10s default aborts a slow-but-successful reply. 15s covers that
+	// tail while staying far below the Ollama budget. No callTimeout is set: this bounds one read,
+	// not the whole call (connect and a retry are separate budgets).
+	public static final long API_REQUEST_TIMEOUT_MS = 15_000;
 	private static final MediaType JSON = MediaType.parse("application/json");
 	private static final Pattern THINK = Pattern.compile("(?s)<think>.*?</think>");
 	// Value labels (bank/GE totals "(3.6B)", "(500)") change with every gp move, so they never form a
@@ -61,7 +73,10 @@ public class AiTranslator
 			"You are translating Old School RuneScape (OSRS) game text to Simplified Chinese.\n"
 			+ "Rules:\n"
 			+ "1. Concise, natural game-style Chinese. This is in-game text, not literature.\n"
-			+ "2. Keep proper nouns without established translations in English.\n"
+			+ "2. Keep proper nouns without established translations in English. When a Terminology list "
+			+ "is present, treat it as reference only: use an entry when the text clearly refers to that "
+			+ "named thing, and translate ordinary words and function words by their normal meaning. "
+			+ "Never translate or repeat the list itself.\n"
 			+ "3. Preserve ALL tags exactly as-is: <br>, <colNum0>, </col>, [player name], [player 1], "
 			+ "<osrscn-name-0>, [milady/sirrah] etc. Keep every <colNumN> placeholder in place around the "
 			+ "same words it wraps in the source. Never translate placeholders and never add "
@@ -88,6 +103,11 @@ public class AiTranslator
 	@Inject
 	private OsrscnConfig config;
 
+	// Terminology source (the local NAME table). Null in unit tests that build AiTranslator directly;
+	// the prompt then carries no Terminology block, exactly as before this feature.
+	@Inject
+	private TranslationStore store;
+
 	@Inject
 	private Gson gson;
 
@@ -95,6 +115,15 @@ public class AiTranslator
 	private java.util.concurrent.ScheduledExecutorService executor;
 	private final ConcurrentHashMap<String, String> cache = new ConcurrentHashMap<>();
 	private final Set<String> inFlight = ConcurrentHashMap.newKeySet();
+	// Lines whose reply was the terminology block instead of a translation. A miss keeps arriving on
+	// every lookup, so without this the same doomed line would be re-sent for the rest of the session.
+	private final Set<String> untranslatable = ConcurrentHashMap.newKeySet();
+	// Terminology is only a hint: a model that copies the block on consecutive exhausted rounds keeps
+	// doing it, so it stops being given one for the rest of this session. Both are reset when the
+	// model/backend identity changes (configurationChanged) and by an explicit cache clear, which
+	// restores the hints without a restart.
+	private final Set<String> glossaryMutedModels = ConcurrentHashMap.newKeySet();
+	private final ConcurrentHashMap<String, Integer> glossaryEchoStreak = new ConcurrentHashMap<>();
 	// Keys known to be on disk. A cache hit re-requested with persist=true gets written on the spot:
 	// the 860 settle gate fires its first requests persist=false (frame unsettled) and replays them
 	// persist=true once stable - without this, guide translations would never survive a restart.
@@ -116,8 +145,40 @@ public class AiTranslator
 	private static final int BACKOFF_AFTER_FAILURES = 3;
 	private static final long BACKOFF_BASE_MS = 5_000;
 	private static final long BACKOFF_MAX_MS = 300_000;
+	// Free MT answers 429 for its own rate limiting, far above the 5 s step that recordFailure()
+	// assigns on the third consecutive failure. The window is raised on the shared backoffUntil (so
+	// the usual check sees it) AND stored in freeMtRateLimitUntil, which no other response can lower;
+	// see that field for why the two copies are needed.
+	private static final long FREE_MT_429_BACKOFF_MS = 60_000L;
+	// Ten unusable LINES (not attempts) mean the free endpoint is probably unusable, not one odd line.
+	private static final int FREE_MT_UNUSABLE_LINE_LIMIT = 10;
+	// A normal free-MT answer is a few hundred bytes; anything above 1 MB is treated as a P3 content
+	// failure instead of being parsed.
+	private static final int FREE_MT_MAX_BODY_CHARS = 1_048_576;
 	private final java.util.concurrent.atomic.AtomicInteger failStreak = new java.util.concurrent.atomic.AtomicInteger();
 	private volatile long backoffUntil;
+	// The FREE_MT 429 rate-limit window. recordSuccess() clears backoffUntil (a 2xx proves the
+	// endpoint answers) and recordFailure() assigns its own 5 s step, but with aiConcurrency > 1 those
+	// responses may belong to requests dispatched BEFORE the 429: neither may shorten the rate-limit
+	// pause, so the 60 s window is kept here as well. This copy only expires with time (and with the
+	// other backoff state on configurationChanged()/clearCache()); it gates the FREE_MT backend only.
+	private volatile long freeMtRateLimitUntil;
+
+	// Content-level failures: a 2xx with an unusable reply is not a transport failure, so it must not
+	// touch failStreak/backoffUntil. A short global pause stops hammering a model that keeps returning junk.
+	private static final int CONTENT_BACKOFF_AFTER_FAILURES = 10;
+	private static final long CONTENT_BACKOFF_MS = 30_000;
+	private final java.util.concurrent.atomic.AtomicInteger contentFailStreak = new java.util.concurrent.atomic.AtomicInteger();
+	private volatile long contentBackoffUntil;
+	private final java.util.Map<String, Integer> contentFailAttempts = new java.util.HashMap<>();
+
+	// Free MT (Bing) state. The two flags below are read from the EDT by freeMtDebugLine(), which must
+	// not take this monitor (the panel refresh runs every second); the line streak is only touched
+	// under the monitor. freeMtUnavailableNotifier is a test hook: null means show the Swing dialog.
+	private volatile boolean freeMtUnavailableNotified; // dialog already shown in this RuneLite run
+	private volatile boolean freeMtDegraded; // currently degraded (debug; cleared by a success)
+	private volatile Runnable freeMtUnavailableNotifier;
+	private int freeMtUnusableLineStreak; // consecutive untranslatable lines (under monitor)
 
 	// Some models (o1/o3/gpt-5, strict proxies) reject the optional temperature parameter with
 	// 400/422. Once a retry without it succeeds, this configuration omits temperature from every
@@ -230,13 +291,25 @@ public class AiTranslator
 	private synchronized void dispatch(String english, boolean persist, long requestedGeneration)
 	{
 		ensureLoaded();
-		if (requestedGeneration != generation || !config.useLocalAi() || cache.containsKey(english))
+		if (requestedGeneration != generation || !config.useLocalAi() || cache.containsKey(english)
+				|| untranslatable.contains(english))
 		{
-			return; // model/config changed or another callback filled this miss while acquiring admission
+			return; // model/config changed, the miss is negative-cached, or another callback filled it
 		}
-		if (System.currentTimeMillis() < backoffUntil)
+		final long now = System.currentTimeMillis();
+		if (now < backoffUntil)
 		{
 			return; // backend keeps failing: wait out the backoff window
+		}
+		if (now < freeMtRateLimitUntil && config.aiBackend() == AiBackend.FREE_MT)
+		{
+			// Bing rate-limited us. A success/failure that arrives later may belong to a request
+			// dispatched before the 429, so it must not reopen the endpoint early (see the field).
+			return;
+		}
+		if (System.currentTimeMillis() < contentBackoffUntil)
+		{
+			return; // content keeps failing: brief global pause
 		}
 		// rate limit so Ollama doesn't saturate the GPU and stall the game (both configurable)
 		if (inFlight.size() >= Math.max(1, config.aiConcurrency())
@@ -251,6 +324,35 @@ public class AiTranslator
 		lastDispatch = System.currentTimeMillis();
 		RequestState state = new RequestState(generation, loadedModel);
 		state.withoutTemperature = apiTemperatureUnsupported;
+		if (config.aiBackend() == AiBackend.FREE_MT)
+		{
+			// Free MT cannot take a prompt: terms are substituted into the text instead, in
+			// FreeMtText.prepare, which also protects colour spans with token pairs (strict Chinese
+			// anchors, non-strict closer-style sentences and English proper nouns). Keep the LLM-only
+			// hint and echo bookkeeping empty.
+			state.glossaryText = "";
+			state.glossaryEchoRef = "";
+		}
+		else
+		{
+			// Computed once per admitted request, never per lookup/tick. The index is built off-thread at
+			// store load, so this is a token lookup plus a short word-boundary scan (~50us). The hint is
+			// optional: a broken index must degrade to the plain message, not fail the request and leave
+			// the line stuck in inFlight, so its exceptions stay local and are never counted as failures.
+			// A store implementation may also answer null; that means "no hint", exactly like "".
+			try
+			{
+				String hint = store == null || glossaryMutedModels.contains(state.model)
+						? "" : store.glossaryPrompt(english);
+				state.glossaryText = hint == null ? "" : hint;
+			}
+			catch (RuntimeException e)
+			{
+				state.glossaryText = "";
+				log.debug("OSRSCN AI: terminology hint unavailable, continuing without it", e);
+			}
+			state.glossaryEchoRef = state.glossaryText;
+		}
 		try
 		{
 			request(english, persist, state);
@@ -348,6 +450,9 @@ public class AiTranslator
 		cacheFile = null;
 		cache.clear();
 		persisted.clear();
+		// Terminology bookkeeping is model identity too: a new model gets a clean echo record.
+		glossaryMutedModels.clear();
+		glossaryEchoStreak.clear();
 		apiTemperatureUnsupported = false; // a new model/backend/URL/key may accept temperature again
 	}
 
@@ -355,9 +460,17 @@ public class AiTranslator
 	{
 		generation++;
 		inFlight.clear();
+		untranslatable.clear(); // a new model/endpoint may translate the lines the old one choked on
 		failStreak.set(0);
 		backoffUntil = 0;
+		freeMtRateLimitUntil = 0; // a new endpoint identity may no longer be rate limiting
+		contentFailStreak.set(0);
+		contentBackoffUntil = 0;
+		contentFailAttempts.clear();
 		lastDispatch = 0;
+		freeMtUnavailableNotified = false; // a new config / cache clear re-arms the one-shot notice
+		freeMtDegraded = false;
+		freeMtUnusableLineStreak = 0;
 	}
 
 	/**
@@ -371,6 +484,8 @@ public class AiTranslator
 		parsedHeaders = Collections.emptyMap();
 		failStreak.set(0);
 		backoffUntil = 0;
+		contentFailStreak.set(0);
+		contentBackoffUntil = 0;
 	}
 
 	private static final class RequestState
@@ -380,6 +495,18 @@ public class AiTranslator
 		boolean completed;
 		boolean withoutTemperature; // this attempt omitted the optional temperature field
 		boolean retryWithoutTemperature; // the provider rejected temperature: retry once without it
+		boolean retryWithoutGlossary; // the model echoed the block: retry once without it
+		// An echo was already detected in this round. The retry itself carries no block, but its reply
+		// is still held to the translation acceptance rule, so a model that keeps repeating the source
+		// line cannot have that repeat cached as a translation on the second attempt.
+		boolean glossaryEchoed;
+		// Terminology block for the next attempt ("" = plain user message). Cleared when the model
+		// echoes it, so the retry sends the bare source line. Once cleared it stays empty: that is what
+		// makes the echo retry a single shot instead of a loop.
+		String glossaryText = "";
+		// The block as first sent in this round. Kept after glossaryText is cleared so the echo guard
+		// can still recognise and strip the reference lines the model copied; "" = no block this round.
+		String glossaryEchoRef = "";
 
 		RequestState(long generation, String model)
 		{
@@ -407,9 +534,10 @@ public class AiTranslator
 
 	/**
 	 * Gate for the on-disk reflow cache only - never the in-memory {@code cache}, which always serves live
-	 * on-screen text (cache.put is unconditional). Rejects the two categories that can never be a stable
-	 * cross-session hit and only bloat the cache / pollute reflow submissions: player-authored CJK content
-	 * (game English is never CJK), dynamic value labels, and number-templated messages that never recur.
+	 * on-screen text (every accepted translation is put regardless of this gate). Rejects the two
+	 * categories that can never be a stable cross-session hit and only bloat the cache / pollute reflow
+	 * submissions: player-authored CJK content (game English is never CJK), dynamic value labels, and
+	 * number-templated messages that never recur.
 	 * Deliberately does NOT apply MissingCollector's fragment / MAX_LEN / WORDY rules - those legitimately
 	 * get translated live (e.g. wrapped info-box lines), and dropping them from disk would make AI-off
 	 * users lose the translation next session.
@@ -453,6 +581,11 @@ public class AiTranslator
 		invalidateRequests();
 		cache.clear();
 		persisted.clear();
+		// An explicit clear is the user's "start over", so the terminology bookkeeping goes too:
+		// a model muted for echoing the block gets the hint again. configurationChanged() clears
+		// the same two because a new model identity also starts with a clean echo record.
+		glossaryMutedModels.clear();
+		glossaryEchoStreak.clear();
 		if (cacheFile != null)
 		{
 			//noinspection ResultOfMethodCallIgnored
@@ -476,7 +609,11 @@ public class AiTranslator
 		return inferenceDispatcher;
 	}
 
-	/** Called under this monitor; only local inference gets the cold-load budget. */
+	/**
+	 * Called under this monitor. Each backend gets the budget its own call shape needs: local inference
+	 * a cold-load-and-generate read/call budget, the online API a read budget sized for a provider that
+	 * stays silent until the whole answer is generated.
+	 */
 	private OkHttpClient inferenceClient(boolean api)
 	{
 		if (api)
@@ -485,6 +622,7 @@ public class AiTranslator
 			{
 				apiInferenceClient = httpClient.newBuilder()
 						.dispatcher(inferenceDispatcher())
+						.readTimeout(API_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
 						.build();
 			}
 			return apiInferenceClient;
@@ -502,9 +640,18 @@ public class AiTranslator
 
 	private void request(String english, boolean persist, RequestState state)
 	{
+		if (config.aiBackend() == AiBackend.FREE_MT)
+		{
+			requestFreeMt(english, persist, state);
+			return;
+		}
 		JsonArray messages = new JsonArray();
 		messages.add(message("system", SYSTEM_PROMPT));
-		messages.add(message("user", english));
+		// The terminology block is a prefix of the user message (not the system prompt) so the system
+		// prompt keeps its stable prefix for provider-side prompt caching. Empty means the user message
+		// is byte-identical to what this plugin sent before the glossary existed.
+		messages.add(message("user", state.glossaryText.isEmpty()
+				? english : state.glossaryText + "\n\n" + english));
 
 		boolean api = config.aiBackend() == AiBackend.OPENAI;
 		final String url = api ? apiEndpoint() : ollamaEndpoint();
@@ -571,6 +718,13 @@ public class AiTranslator
 					}
 					// Response IO/parse must not hold the model monitor: switching may happen mid-read.
 					String content = r.body() == null ? null : parseContent(r.body().string());
+					if (content == null)
+					{
+						// No usable content field: parser-level failure. Keep the safe wording (no body,
+						// no exception detail) that the privacy tests depend on.
+						if (persist) log.warn("OSRSCN AI parse failed: reply carried no usable content");
+						else log.warn("OSRSCN AI parse failed (non-persistent request): no usable content");
+					}
 					synchronized (AiTranslator.this)
 					{
 						if (!isCurrent(state)) return;
@@ -581,9 +735,47 @@ public class AiTranslator
 							// model rejects it so later lines skip the guaranteed 400/422 first attempt.
 							apiTemperatureUnsupported = true;
 						}
-						if (content != null && !content.isEmpty())
+						String zh = content == null ? "" : clean(content);
+						if (zh.isEmpty())
 						{
-							String zh = clean(content);
+							contentRejected(english);
+						}
+						else
+						{
+							List<GlossaryRef> references = glossaryRefs(state.glossaryEchoRef);
+							if (isGlossaryEcho(zh, english, state.glossaryEchoRef, references))
+							{
+								state.glossaryEchoed = true;
+								zh = stripGlossaryEcho(zh, references);
+							}
+							if (state.glossaryEchoed && !isUsableTranslation(zh, english))
+							{
+								// The reply was the reference block itself, the source line repeated
+								// back, or a stripped remainder made of nothing else: never a translation.
+								// Retry once without terminology; a second failure means this line cannot
+								// be translated, and repeating the round on every tick would never end.
+								if (!state.glossaryText.isEmpty())
+								{
+									state.retryWithoutGlossary = true;
+									state.glossaryText = "";
+								}
+								else
+								{
+									untranslatable.add(english);
+									markGlossaryEcho(state.model);
+									log.debug("OSRSCN AI: reply repeated the terminology block or the source"
+											+ " line for model '{}'; line marked untranslatable", state.model);
+								}
+								return; // never cache/persist/display a reference block or the source line
+							}
+							if (!isUsableTranslation(zh, english))
+							{
+								contentRejected(english);
+								return;
+							}
+							contentFailAttempts.remove(english);
+							contentFailStreak.set(0);
+							glossaryEchoStreak.remove(state.model);
 							cache.put(english, zh);
 							if (persist && isPersistable(english) && persisted.add(english))
 							{
@@ -610,12 +802,25 @@ public class AiTranslator
 				{
 					synchronized (AiTranslator.this)
 					{
-						if (state.retryWithoutTemperature && isCurrent(state))
+						if (isCurrent(state) && (state.retryWithoutTemperature || state.retryWithoutGlossary))
 						{
 							// Retry in place: the request keeps its in-flight ownership and is not finished,
 							// so callers still see it pending and no second slot is consumed.
+							// Only one retry can be pending at a time and neither can loop: a temperature
+							// retry is armed on a rejected HTTP response and cleared here before dispatch,
+							// while a glossary retry is armed on a successful response whose block was
+							// echoed, after glossaryText was cleared - so the bare retry cannot be re-armed.
+							boolean withoutTemperature = state.retryWithoutTemperature;
 							state.retryWithoutTemperature = false;
-							state.withoutTemperature = true;
+							if (withoutTemperature)
+							{
+								state.withoutTemperature = true;
+							}
+							else
+							{
+								// glossaryText was already cleared when the echo was detected.
+								state.retryWithoutGlossary = false;
+							}
 							try
 							{
 								request(english, persist, state);
@@ -641,6 +846,345 @@ public class AiTranslator
 		});
 	}
 
+	/**
+	 * Free MT request path: prepare the line (a closed colour run whose content is already Chinese
+	 * becomes a STRICT locally anchored {@code {{open}}…{{close}}} token pair that must keep its own
+	 * words; every closer-style run - closed by a literal {@code </col>} - becomes a NON-STRICT pair so
+	 * the wrapped sentence keeps its colour while Bing translates inside it; a switch-style run that
+	 * looks like a proper noun becomes a NON-STRICT pair too; only switch-style base text goes as plain
+	 * text without markers so Bing translates it in the base colour, other markup becomes
+	 * {@code {{n}}} tokens, NAME terms become Chinese), then POST the single-element array to
+	 * {@link FreeMtClient}. Failures are classified here: transport / non-2xx (P1/P2) count against the
+	 * endpoint, while P2'/P3/P4/C1-C5 only reject this line. The line is finished in a {@code finally}
+	 * block, so a throw can never leave it in flight.
+	 */
+	private void requestFreeMt(String english, boolean persist, RequestState state)
+	{
+		final FreeMtText.Prepared prepared;
+		try
+		{
+			List<TermMatch> terms = store == null
+					? Collections.<TermMatch>emptyList() : store.glossaryMatches(english);
+			prepared = FreeMtText.prepare(english, terms);
+		}
+		catch (RuntimeException e)
+		{
+			// A broken terminology index / prepare must degrade to "this line stays English", never to
+			// an endpoint failure: otherwise three odd lines would show the "Bing unavailable" dialog.
+			untranslatable.add(english);
+			finish(english, state);
+			log.debug("OSRSCN FREE-MT: terminology/prepare failed; line skipped");
+			return;
+		}
+		if (prepared.skip)
+		{
+			untranslatable.add(english);
+			finish(english, state);
+			return;
+		}
+		// Second S1 guard, independent of prepare: never send a line the endpoint cannot handle.
+		if (english.length() > FreeMtText.MAX_TEXT_CHARS || english.contains("{{")
+				|| english.contains("}}") || !Translator.hasTranslatableText(english))
+		{
+			untranslatable.add(english);
+			finish(english, state);
+			return;
+		}
+		Request req;
+		Call pending;
+		try
+		{
+			req = FreeMtClient.build(gson, prepared.text);
+			pending = inferenceClient(true).newCall(req);
+		}
+		catch (RuntimeException e)
+		{
+			// A local failure (request build, client call) is not a Bing failure: keep it line-scoped
+			// instead of letting the dispatch catch record an endpoint outage.
+			freeMtDispatchFailed(english, state);
+			return;
+		}
+		if (!isCurrent(state))
+		{
+			return;
+		}
+		Callback callback = new Callback()
+		{
+			@Override
+			public void onFailure(Call call, IOException e)
+			{
+				try
+				{
+					synchronized (AiTranslator.this)
+					{
+						if (!isCurrent(state))
+						{
+							return;
+						}
+						recordFailure();
+						if (failStreak.get() >= BACKOFF_AFTER_FAILURES)
+						{
+							maybeNotifyFreeMtUnavailable();
+						}
+					}
+					log.warn("OSRSCN FREE-MT request failed ({})", e.getClass().getSimpleName());
+				}
+				catch (Exception ignored)
+				{
+					// The failure path itself must not leak request/response content into the log.
+					log.warn("OSRSCN FREE-MT request failed");
+				}
+				finally
+				{
+					synchronized (AiTranslator.this)
+					{
+						finish(english, state);
+					}
+				}
+			}
+
+			@Override
+			public void onResponse(Call call, Response response)
+			{
+				try (Response r = response)
+				{
+					int status = r.code();
+					if (!r.isSuccessful())
+					{
+						synchronized (AiTranslator.this)
+						{
+							if (!isCurrent(state))
+							{
+								return;
+							}
+							if (status == 400 || status == 413 || status == 414 || status == 422)
+							{
+								// P2': the request itself was rejected (too long / bad shape). Line-level:
+								// one odd line must not count against the endpoint's health.
+								freeMtContentRejected(english);
+							}
+							else
+							{
+								// P1/P2: endpoint-level failure. recordFailure() first, because on the
+								// third failure it assigns its own 5 s backoff, which the 429 floor below
+								// must then raise instead of being overwritten by it.
+								recordFailure();
+								if (status == 429)
+								{
+									// A response from another request that was already in flight may
+									// complete after this one and call recordSuccess() (clears the
+									// shared backoff) or recordFailure() (assigns its own 5 s step):
+									// neither may cut the 60 s rate-limit window short, so it also
+									// lives in its own time-based floor.
+									long rateLimitedUntil = System.currentTimeMillis() + FREE_MT_429_BACKOFF_MS;
+									backoffUntil = Math.max(backoffUntil, rateLimitedUntil);
+									freeMtRateLimitUntil = Math.max(freeMtRateLimitUntil, rateLimitedUntil);
+								}
+								if (failStreak.get() >= BACKOFF_AFTER_FAILURES)
+								{
+									maybeNotifyFreeMtUnavailable();
+								}
+							}
+						}
+						log.warn("OSRSCN FREE-MT HTTP {}", status);
+						return;
+					}
+					// The 1 MB limit is a memory guard: it must be applied to the DECLARED length before
+					// the body is buffered. -1 means unknown, which falls through to the read-length
+					// fallback below.
+					long declaredLength = r.body() == null ? 0 : r.body().contentLength();
+					if (declaredLength > FREE_MT_MAX_BODY_CHARS)
+					{
+						synchronized (AiTranslator.this)
+						{
+							if (!isCurrent(state))
+							{
+								return;
+							}
+							recordSuccess(); // a 2xx proves the endpoint is alive
+							freeMtContentRejected(english); // P3: oversized reply
+						}
+						log.warn("OSRSCN FREE-MT: oversized response ignored");
+						return;
+					}
+					String body = r.body() == null ? "" : r.body().string();
+					if (body.length() > FREE_MT_MAX_BODY_CHARS)
+					{
+						synchronized (AiTranslator.this)
+						{
+							if (!isCurrent(state))
+							{
+								return;
+							}
+							recordSuccess(); // a 2xx proves the endpoint is alive
+							freeMtContentRejected(english); // P3: oversized reply
+						}
+						log.warn("OSRSCN FREE-MT: oversized response ignored");
+						return;
+					}
+					String raw;
+					try
+					{
+						raw = FreeMtClient.parse(gson, body);
+					}
+					catch (FreeMtParseException e)
+					{
+						// P3: a 2xx with an unusable structure is a line-level failure, but still an
+						// endpoint success (same rule as the LLM path's "no usable content" reply).
+						synchronized (AiTranslator.this)
+						{
+							if (!isCurrent(state))
+							{
+								return;
+							}
+							recordSuccess();
+							freeMtContentRejected(english);
+						}
+						log.debug("OSRSCN FREE-MT parse failed");
+						return;
+					}
+					synchronized (AiTranslator.this)
+					{
+						if (!isCurrent(state))
+						{
+							return;
+						}
+						recordSuccess();
+						String zh = clean(raw);
+						if (zh.isEmpty())
+						{
+							freeMtContentRejected(english); // P4: empty translation
+							return;
+						}
+						FreeMtText.Result result = FreeMtText.validate(zh, prepared);
+						if (result != FreeMtText.Result.OK)
+						{
+							freeMtContentRejected(english); // C1-C5
+							return;
+						}
+						String restored = FreeMtText.restore(zh, prepared);
+						cache.put(english, restored);
+						if (persist && isPersistable(english) && persisted.add(english))
+						{
+							persistToDisk(english, restored);
+						}
+						sessionCount.incrementAndGet();
+						// The debug monitor shows what the client will draw: restore the protected
+						// spans first ({{n}} placeholders would be meaningless in the panel).
+						recent.addFirst(english + "  →  " + restored);
+						while (recent.size() > 40)
+						{
+							recent.pollLast();
+						}
+						contentFailAttempts.remove(english);
+						contentFailStreak.set(0);
+						freeMtUnusableLineStreak = 0;
+						freeMtDegraded = false;
+						// Deliberately no success log: neither the source line nor the translation may
+						// reach the log file (the privacy tests scan it).
+					}
+				}
+				catch (Exception e)
+				{
+					// The body is the reply to a line of game/player text: never log it.
+					log.warn("OSRSCN FREE-MT request failed");
+				}
+				finally
+				{
+					synchronized (AiTranslator.this)
+					{
+						finish(english, state);
+					}
+				}
+			}
+		};
+		try
+		{
+			pending.enqueue(callback);
+		}
+		catch (RuntimeException e)
+		{
+			// Same rule as the build/newCall step above: enqueue is local, not a Bing failure.
+			freeMtDispatchFailed(english, state);
+		}
+	}
+
+	/**
+	 * A local free-MT dispatch failure (request build, client call, enqueue) is line-scoped, exactly
+	 * like a prepare failure: the line is skipped and never counted against the endpoint.
+	 */
+	private void freeMtDispatchFailed(String english, RequestState state)
+	{
+		untranslatable.add(english);
+		finish(english, state);
+		log.debug("OSRSCN FREE-MT: dispatch failed; line skipped");
+	}
+
+	/** Called under this monitor for a 2xx whose reply is not a usable translation. */
+	private void contentRejected(String english)
+	{
+		int attempts = contentFailAttempts.merge(english, 1, Integer::sum);
+		if (attempts >= 2)
+		{
+			untranslatable.add(english);
+			contentFailAttempts.remove(english);
+		}
+		int streak = contentFailStreak.incrementAndGet();
+		if (streak >= CONTENT_BACKOFF_AFTER_FAILURES)
+		{
+			contentBackoffUntil = System.currentTimeMillis() + CONTENT_BACKOFF_MS;
+			contentFailStreak.set(0);
+			log.warn("OSRSCN AI: {} consecutive content rejections, backing off {}s", streak, CONTENT_BACKOFF_MS / 1000);
+		}
+	}
+
+	/**
+	 * Free MT content failure (P2'/P3/P4/C1-C5): same per-line budget as the LLM path, plus the
+	 * "ten unusable lines" signal. {@link #contentRejected} stays void; the newly negative-cached
+	 * line is detected by asking whether this call is the one that made it untranslatable.
+	 */
+	private void freeMtContentRejected(String english)
+	{
+		contentRejected(english);
+		if (untranslatable.contains(english))
+		{
+			freeMtUnusableLineStreak++;
+			if (freeMtUnusableLineStreak >= FREE_MT_UNUSABLE_LINE_LIMIT)
+			{
+				maybeNotifyFreeMtUnavailable();
+			}
+		}
+	}
+
+	/**
+	 * Free MT looks unavailable (three consecutive endpoint failures or ten unusable lines): show the
+	 * warning dialog once per RuneLite run, on the EDT and without blocking the caller.
+	 */
+	private void maybeNotifyFreeMtUnavailable()
+	{
+		if (!config.useLocalAi() || config.aiBackend() != AiBackend.FREE_MT)
+		{
+			return; // the notice belongs to the free backend only, and only while AI is enabled
+		}
+		freeMtDegraded = true; // before the early return: later failures must still update the debug state
+		if (freeMtUnavailableNotified)
+		{
+			return;
+		}
+		freeMtUnavailableNotified = true;
+		log.warn("OSRSCN FREE-MT: unavailable (Bing unreachable or repeated failures)");
+		Runnable notifier = freeMtUnavailableNotifier;
+		if (notifier != null)
+		{
+			notifier.run(); // test hook
+			return;
+		}
+		SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(null,
+				"免费机器翻译当前不可用：Bing 无法连接，或连续多次翻译失败。\n"
+				+ "建议改用本地 Ollama 或在线 API，或关闭 AI 翻译继续使用本地译表。",
+				"OSRSCN 免费翻译", JOptionPane.WARNING_MESSAGE));
+	}
+
 	private void recordFailure()
 	{
 		int n = failStreak.incrementAndGet();
@@ -655,13 +1199,36 @@ public class AiTranslator
 	private void recordSuccess()
 	{
 		failStreak.set(0);
+		// freeMtRateLimitUntil is deliberately left alone: this success may belong to a request that
+		// was dispatched before a 429, and it must not reopen the rate-limited endpoint early.
 		backoffUntil = 0;
 	}
 
 	/** The model name for the active backend; also names the per-model on-disk cache file. */
 	private String activeModel()
 	{
-		return config.aiBackend() == AiBackend.OPENAI ? config.apiModel() : config.ollamaModel();
+		switch (config.aiBackend())
+		{
+			case OPENAI:
+				return config.apiModel();
+			case FREE_MT:
+				return "free-mt"; // single cache file: ai_free-mt.tsv
+			default:
+				return config.ollamaModel();
+		}
+	}
+
+	/**
+	 * Free MT status for the debug tab, or null when the free backend is not the active one.
+	 * EDT-safe: reads two volatile flags and config only, never this monitor, never IO.
+	 */
+	public String freeMtDebugLine()
+	{
+		if (!config.useLocalAi() || config.aiBackend() != AiBackend.FREE_MT)
+		{
+			return null;
+		}
+		return freeMtDegraded ? "不可用（已提示）" : "Bing";
 	}
 
 	private String ollamaEndpoint()
@@ -756,13 +1323,17 @@ public class AiTranslator
 	 */
 	public void testConnection(java.util.function.BiConsumer<Boolean, String> onResult)
 	{
-		if (config.aiBackend() == AiBackend.OPENAI)
+		switch (config.aiBackend())
 		{
-			testApiConnection(onResult);
-		}
-		else
-		{
-			testOllamaConnection(onResult);
+			case OPENAI:
+				testApiConnection(onResult);
+				break;
+			case FREE_MT:
+				testFreeMtConnection(onResult);
+				break;
+			default:
+				testOllamaConnection(onResult);
+				break;
 		}
 	}
 
@@ -803,6 +1374,76 @@ public class AiTranslator
 					{
 						onResult.accept(false, "连接失败 (HTTP " + r.code() + ")");
 					}
+				}
+			}
+		});
+	}
+
+	/**
+	 * Free backend probe: translate {@link FreeMtClient#probeText()} once. Runs on the EDT-safe test
+	 * client ({@link #testClient()}), never {@link #inferenceClient(boolean)} - that one's contract is
+	 * "called under this monitor". A usable reply re-arms the unavailable notice.
+	 */
+	private void testFreeMtConnection(java.util.function.BiConsumer<Boolean, String> onResult)
+	{
+		Request req = FreeMtClient.build(gson, FreeMtClient.probeText());
+		testClient().newCall(req).enqueue(new Callback()
+		{
+			@Override
+			public void onFailure(Call call, IOException e)
+			{
+				onResult.accept(false, "免费机器翻译不可用：Bing 连接失败");
+			}
+
+			@Override
+			public void onResponse(Call call, Response response)
+			{
+				try (Response r = response)
+				{
+					boolean ok = false;
+					String message;
+					if (r.isSuccessful())
+					{
+						try
+						{
+							String raw = FreeMtClient.parse(gson,
+									r.body() == null ? "" : r.body().string());
+							String zh = clean(raw);
+							ok = !zh.isEmpty() && FreeMtText.hasCjk(zh);
+							message = ok ? "免费机器翻译可用（Bing）" : "Bing 回傳內容無法使用";
+						}
+						catch (FreeMtParseException | IOException e)
+						{
+							message = "Bing 回傳格式錯誤";
+						}
+					}
+					else
+					{
+						message = "免费机器翻译不可用：Bing HTTP " + r.code();
+					}
+					if (ok)
+					{
+						// Reset in the callback, not in the caller's onResult lambda: the caller may be
+						// any thread (the panel marshals to the EDT).
+						synchronized (AiTranslator.this)
+						{
+							// Only the free backend owns this state. If the user switched backend while
+							// the probe was in flight, its late success must not clear the new backend's
+							// failStreak/backoff (the Ollama/API probes never touch them either).
+							if (config.aiBackend() == AiBackend.FREE_MT)
+							{
+								freeMtUnavailableNotified = false;
+								freeMtDegraded = false;
+								freeMtUnusableLineStreak = 0;
+								recordSuccess();
+							}
+						}
+					}
+					onResult.accept(ok, message);
+				}
+				catch (Exception e)
+				{
+					onResult.accept(false, "免费机器翻译不可用：Bing 回傳無法解析");
 				}
 			}
 		});
@@ -1069,7 +1710,7 @@ public class AiTranslator
 			JsonObject msg = root.getAsJsonObject("message");
 			if (msg.has("content"))
 			{
-				return msg.get("content").getAsString();
+				return msg.get("content").isJsonPrimitive() ? msg.get("content").getAsString() : null;
 			}
 		}
 		// OpenAI-compatible /chat/completions: { "choices": [ { "message": { "content": ... } } ] }
@@ -1084,7 +1725,7 @@ public class AiTranslator
 					JsonObject msg = first.getAsJsonObject("message");
 					if (msg.has("content"))
 					{
-						return msg.get("content").getAsString();
+						return msg.get("content").isJsonPrimitive() ? msg.get("content").getAsString() : null;
 					}
 				}
 			}
@@ -1095,6 +1736,246 @@ public class AiTranslator
 	private static String clean(String s)
 	{
 		return THINK.matcher(s).replaceAll("").trim();
+	}
+
+	/** Whitespace-normalized form, so an echoed reference line is recognised regardless of spacing. */
+	private static String flatten(String s)
+	{
+		return s.trim().replaceAll("\\s+", " ").replaceAll("\\s*=>\\s*", " => ");
+	}
+
+	/**
+	 * One {@code en => zh} pair of a terminology block, with the matcher that recognises the model
+	 * copying it back. Detection and stripping share this matcher, so a reply can never be classified
+	 * as an echo and then leave a reference line behind (or be accepted whole while one is inside).
+	 */
+	private static final class GlossaryRef
+	{
+		// The block's own "=>" plus the separators a model commonly retypes it with (Chinese output
+		// often rewrites the arrow; a fullwidth colon needs no spaces at all).
+		private static final String SEPARATOR = "=>|->|→|：|:";
+		final String en;
+		final String zh;
+		final String flattened;
+		private final Pattern line;
+
+		GlossaryRef(String en, String zh)
+		{
+			this.en = en;
+			this.zh = zh;
+			flattened = flatten(en + " => " + zh);
+			// Case-insensitive, with the word boundary in front of the English term made explicit:
+			// a name may end in "'s", so \b is not reliable. The separator itself bounds the end.
+			line = Pattern.compile("(?i)(?<![A-Za-z0-9_])" + Pattern.quote(en)
+					+ "\\s*(?:" + SEPARATOR + ")");
+		}
+
+		/** @return the end index of the first {@code en + separator} occurrence in {@code text}, or -1. */
+		int separatorEnd(String text)
+		{
+			Matcher matcher = line.matcher(text);
+			return matcher.find() ? matcher.end() : -1;
+		}
+	}
+
+	/**
+	 * The reference pairs of one terminology block. The block is generated as one pair per line after
+	 * {@link TermGlossary#HEADER}, so a line with an arrow is always a pair.
+	 */
+	private static List<GlossaryRef> glossaryRefs(String glossaryText)
+	{
+		List<GlossaryRef> references = new ArrayList<>();
+		if (glossaryText == null || glossaryText.isEmpty())
+		{
+			return references;
+		}
+		for (String line : glossaryText.split("\n"))
+		{
+			String flat = flatten(line);
+			int arrow = flat.indexOf("=>");
+			if (arrow <= 0)
+			{
+				continue;
+			}
+			String en = flat.substring(0, arrow).trim();
+			String zh = flat.substring(arrow + 2).trim();
+			if (!en.isEmpty() && !zh.isEmpty())
+			{
+				references.add(new GlossaryRef(en, zh));
+			}
+		}
+		return references;
+	}
+
+	/**
+	 * True when a reply is the reference block instead of a translation: the header constant, a
+	 * complete pair copied from the block, a retyped {@code en + separator} reference line (the model
+	 * may rewrite "=>" as "->", "→" or "："), or - weaker - an arrow in a reply to a source line that
+	 * has none (the block is the only reason the model sees "=>").
+	 */
+	private static boolean isGlossaryEcho(String zh, String english, String glossaryRef,
+			List<GlossaryRef> references)
+	{
+		if (zh.contains(TermGlossary.HEADER))
+		{
+			return true;
+		}
+		if (!references.isEmpty())
+		{
+			String flat = flatten(zh);
+			for (GlossaryRef reference : references)
+			{
+				if (flat.contains(reference.flattened))
+				{
+					return true;
+				}
+			}
+			for (String line : zh.split("\n", -1))
+			{
+				if (findReference(line, references) != null)
+				{
+					return true;
+				}
+			}
+		}
+		return glossaryRef.indexOf("=>") >= 0 && zh.indexOf("=>") >= 0 && english.indexOf("=>") < 0;
+	}
+
+	/**
+	 * Removes copied header and reference lines from a mixed reply, block-aware rather than line-exact:
+	 * the English header, any line that retypes one of the block's pairs (any accepted separator, and
+	 * a pair split as "en =>" + next line "zh" counts as one reference), and - once a reference line
+	 * was seen - the translated block header. Every other line is kept in order.
+	 *
+	 * @return the translation left behind, or "" when the reply was nothing but the block
+	 */
+	private static String stripGlossaryEcho(String zh, List<GlossaryRef> references)
+	{
+		String[] lines = zh.split("\n", -1);
+		boolean referenceSeen = false;
+		for (String line : lines)
+		{
+			if (findReference(line, references) != null)
+			{
+				referenceSeen = true;
+				break;
+			}
+		}
+		StringBuilder kept = new StringBuilder();
+		for (int i = 0; i < lines.length; i++)
+		{
+			String trimmed = lines[i].trim();
+			if (trimmed.isEmpty() || trimmed.contains(TermGlossary.HEADER))
+			{
+				continue;
+			}
+			GlossaryRef reference = findReference(trimmed, references);
+			if (reference != null)
+			{
+				// "crystal gate =>" with the Chinese on the following line: that split pair is one
+				// reference, so consume the continuation line with it.
+				if (i + 1 < lines.length && endsAtSeparator(trimmed, reference)
+						&& lines[i + 1].trim().startsWith(reference.zh))
+				{
+					i++;
+				}
+				continue;
+			}
+			if (referenceSeen && isTranslatedHeader(trimmed))
+			{
+				continue;
+			}
+			if (kept.length() > 0)
+			{
+				kept.append('\n');
+			}
+			kept.append(trimmed);
+		}
+		return kept.toString();
+	}
+
+	/**
+	 * @return the first pair that occurs in {@code line} - either retyped ({@code en + separator}) or
+	 *         copied verbatim with different spacing (the flattened pair is contained in the flattened
+	 *         line) - or null.
+	 */
+	private static GlossaryRef findReference(String line, List<GlossaryRef> references)
+	{
+		String flat = null;
+		for (GlossaryRef reference : references)
+		{
+			if (reference.separatorEnd(line) >= 0)
+			{
+				return reference;
+			}
+			if (flat == null)
+			{
+				flat = flatten(line);
+			}
+			if (flat.contains(reference.flattened))
+			{
+				return reference;
+			}
+		}
+		return null;
+	}
+
+	/** True when a reference line is only {@code en + separator}, with the Chinese on the next line. */
+	private static boolean endsAtSeparator(String line, GlossaryRef reference)
+	{
+		int end = reference.separatorEnd(line);
+		return end >= 0 && line.substring(end).trim().isEmpty();
+	}
+
+	/**
+	 * True for a translated block header: a label-only line that names the terminology and ends at its
+	 * colon ("术语参考翻译："). A line with content after the colon is a translation and is kept.
+	 */
+	private static boolean isTranslatedHeader(String line)
+	{
+		if (line.indexOf("术语") < 0 && line.indexOf("術語") < 0)
+		{
+			return false;
+		}
+		char last = line.charAt(line.length() - 1);
+		return last == '：' || last == ':';
+	}
+
+	/**
+	 * The acceptance rule for a reply that carried (or repeated) the reference block: only real
+	 * Chinese content counts as a translation, never an empty remainder, the source line itself, or a
+	 * remainder with no Chinese at all.
+	 */
+	private static boolean isUsableTranslation(String zh, String english)
+	{
+		if (zh.isEmpty() || !hasCjk(zh))
+		{
+			return false;
+		}
+		return !flatten(zh).equals(flatten(english));
+	}
+
+	private static boolean hasCjk(String text)
+	{
+		for (int i = 0; i < text.length(); i++)
+		{
+			char c = text.charAt(i);
+			if (c >= 0x3400 && c <= 0x9FFF)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** One exhausted echo round for {@code model}; two in a row stop terminology for it this session. */
+	private void markGlossaryEcho(String model)
+	{
+		int streak = glossaryEchoStreak.merge(model, 1, Integer::sum);
+		if (streak >= 2 && glossaryMutedModels.add(model))
+		{
+			log.warn("OSRSCN AI: model '{}' keeps echoing the terminology block; terminology disabled for it", model);
+		}
 	}
 
 	private JsonObject message(String role, String content)

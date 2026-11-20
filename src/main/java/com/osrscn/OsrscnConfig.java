@@ -23,9 +23,11 @@ public interface OsrscnConfig extends Config
 
 	@ConfigSection(
 			name = "AI 翻译（共用）",
-			description = "两种后端（本地 Ollama / 在线 API）共用的设置。开启后，"
-					+ "<br>本地查表缺失的游戏英文文本会发送到你设置的翻译服务器翻译，玩家名永不发送。"
-					+ "<br>默认用本地 Ollama；后端专属的地址与模型见下方两个分节。",
+			description = "三种后端（本地 Ollama / 在线 API / 免费机器翻译）共用的设置。开启后，"
+					+ "<br>本地查表缺失的游戏英文文本会发送到所选后端翻译；插件不会主动发送玩家名"
+					+ "<br>（保护范围见 README 隐私说明）。"
+					+ "<br>免费机器翻译也会套用「翻译并发数 / 间隔」。默认用本地 Ollama；"
+					+ "<br>Ollama / 在线 API 的专属设置见下方两节。",
 			position = 2)
 	String aiCommon = "aiCommon";
 
@@ -111,7 +113,10 @@ public interface OsrscnConfig extends Config
 	@ConfigItem(
 			keyName = "clearCacheHotkey",
 			name = "清翻译缓存",
-			description = "清掉 AI 翻译缓存，重新翻译",
+			description = "清掉 AI 翻译缓存，重新翻译。按下后画面顶部会短暂显示「已清缓存」。"
+					+ "<br>如果按了没反应、缓存也没清掉，可能是这个组合键已被其他程序注册为"
+					+ "<br>系统全局快捷键而先被拦截（常见于显卡驱动、录屏/直播、输入法、聊天软件）。"
+					+ "<br>可在此改用其他组合键（例如 Ctrl+Shift+V、Ctrl+Alt+C），或关闭占用该键的程序。",
 			section = general,
 			position = 1
 	)
@@ -178,7 +183,8 @@ public interface OsrscnConfig extends Config
 			description = "其他玩家公共聊天的处理方式（含管理员和自动喊话）。玩家名字任何情况都不翻译。"
 					+ "<br>「不翻译」按原频道颜色显示英文；「翻译」直接把英文行替换成中文；"
 					+ "<br>「另起一行」保留英文行，下面另插一条中文翻译（如 OSRS_CN: 玩家名: 你好）。"
-					+ "<br>玩家黑话翻译质量不稳，且会占用 AI 翻译队列。",
+					+ "<br>玩家黑话翻译质量不稳，且会占用 AI 翻译队列。"
+					+ "<br>选免费机器翻译时，玩家聊天内容（可识别的玩家名已替换为占位符）也会送到 Microsoft。",
 			section = general,
 			position = 6
 	)
@@ -193,7 +199,9 @@ public interface OsrscnConfig extends Config
 			description = "独立设置 Friends Chat、Clan、Guest、GIM 的玩家发言；不受「公屏玩家发言」影响。"
 					+ "<br>默认不翻译；可直接翻译或保留英文另起一行。缺少译文时需开启「启用 AI 翻译」。"
 					+ "<br>正文发送至所选 AI 后端：本机 Ollama 在本机处理，"
-					+ "<br>在线 API 或远程地址会发送至远端。玩家名保持原样，不发送给 AI。"
+					+ "<br>在线 API 或远程地址会发送至远端。玩家名不翻译；正文中可识别的玩家名"
+					+ "<br>会先替换为占位符再发送。"
+					+ "<br>选免费机器翻译时，该聊天正文也会送到 Microsoft。"
 					+ "<br>切换后仅翻译新来信。",
 			section = general,
 			position = 7
@@ -250,8 +258,10 @@ public interface OsrscnConfig extends Config
 	@ConfigItem(
 			keyName = "aiBackend",
 			name = "AI 后端",
-			description = "AI 翻译用哪个后端。「本地 Ollama」免费私密但要 GPU；「在线 API」"
-					+ "<br>用 DeepSeek/OpenAI 等云端服务，按量付费，会把游戏文本发到该服务商。",
+			description = "AI 翻译用哪个后端，共三种。「本地 Ollama」免费私密但要 GPU；「在线 API」"
+					+ "<br>用 DeepSeek/OpenAI 等云端服务，按量付费，会把游戏文本发到该服务商；"
+					+ "<br>「免费机器翻译（实验）」用 Bing 的免费匿名端点，选择后不用额外设置，"
+					+ "<br>但游戏文本会送到 Microsoft，品质低于 AI，也可能会突然不能用，但速度极快和免费。",
 			section = aiCommon,
 			position = 1
 	)
@@ -302,7 +312,7 @@ public interface OsrscnConfig extends Config
 	@ConfigItem(
 			keyName = "aiConcurrency",
 			name = "翻译并发数",
-			description = "同时进行的 AI 翻译请求数。对本地 Ollama 和在线 API 都生效；上限 64；"
+			description = "同时进行的 AI 翻译请求数。对本地 Ollama、在线 API 和免费机器翻译都生效；上限 64；"
 					+ "<br>实际吞吐仍受 AI 服务商限流与本机性能影响。越大填充越快，但更吃 GPU、"
 					+ "<br>可能掉帧（Ollama 需开并行）",
 			section = aiCommon,
@@ -334,6 +344,7 @@ public interface OsrscnConfig extends Config
 			description = "勾一下立即测试当前「AI 后端」是否连通（在线 API 还会验密钥），结果用弹窗提示。"
 					+ "<br>先只查模型清单，不消耗 token；若供应商不提供 /models，"
 					+ "<br>会补发一个最小请求验证（约 1 token；个别供应商不接受长度上限时会再试一次）。"
+					+ "<br>免费机器翻译会测试 Bing 是否可用（不消耗 token）。"
 					+ "<br>测试后该项会自动重置为未勾选；RuneLite 设置面板不会即时刷新这个勾选框，"
 					+ "<br>重新打开本页即可看到。侧边栏「翻译 → 测试 AI 连接」有同功能按钮，"
 					+ "<br>结果直接显示在侧边栏。",

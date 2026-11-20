@@ -2571,6 +2571,10 @@ public class InterfaceTranslator
 	 * cost at client-tick rate tanks the frame rate. A full-tree walk (not translateGroupId) because
 	 * side panels live nested inside the top-level root, not as their own widget root; non-slowScan
 	 * widgets are skipped in translateWidget, so the fast lanes' work is not duplicated.
+	 *
+	 * <p>The same game-tick cadence is the backstop for the combat-achievement boss title (see
+	 * {@link #translateCaBossTitle()}), so a page already open when Chinese was switched on - and any
+	 * script-hook fire we missed - still gets translated within one tick.
 	 */
 	public void translateSlowGroups()
 	{
@@ -2584,6 +2588,30 @@ public class InterfaceTranslator
 		{
 			slowLane = false;
 		}
+		translateCaBossTitle();
+	}
+
+	/**
+	 * The combat-achievement boss-detail page title ("Combat Achievements - &lt;boss&gt;") is written by
+	 * the page's own onLoad script (4835) directly onto {@link InterfaceID.CaBoss#FRAME}'s text. The
+	 * generic client-tick/per-frame scans already reach group 713 when the page is open, so this backstop
+	 * is insurance for ordering and toggling: a page that was already open when Chinese was enabled
+	 * (onLoad does not re-run), and any script fire we miss or whose text the client rewrites before our
+	 * hook ran.
+	 *
+	 * <p>Called at most once per game tick. Closed page: one {@code getWidget} and the hidden check below.
+	 * Open page: translateComponent walks just this frame's short subtree, and translateWidget's own memo
+	 * (a widget already holding our char-images is skipped without a lookup) makes this a no-op once the
+	 * title is Chinese, so it can never re-translate a stable title or re-fire the AI.
+	 */
+	private void translateCaBossTitle()
+	{
+		Widget frame = client.getWidget(InterfaceID.CaBoss.FRAME);
+		if (frame == null || frame.isHidden())
+		{
+			return;
+		}
+		translateComponent(InterfaceID.CaBoss.FRAME);
 	}
 
 	public void translateGroupId(int groupId)

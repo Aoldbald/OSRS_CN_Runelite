@@ -9,6 +9,7 @@ import ch.qos.logback.classic.encoder.PatternLayoutEncoder;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.FileAppender;
 import com.google.gson.Gson;
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.osrscn.AiBackend;
 import com.osrscn.OsrscnConfig;
@@ -31,6 +32,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 import net.runelite.api.Client;
+import net.runelite.api.Player;
 import net.runelite.client.RuneLite;
 import net.runelite.client.events.ConfigChanged;
 import okhttp3.Call;
@@ -239,6 +241,7 @@ public class AiTranslatorPrivacyTest
 					.code(code).message("fictional").body(body).build());
 		}
 		void success(String zh) throws IOException { respond(200, json(reply(zh))); }
+		void bing(String zh) throws IOException { respond(200, AiTranslatorPrivacyTest.bing(zh)); }
 	}
 
 	private static String reply(String zh)
@@ -249,6 +252,66 @@ public class AiTranslatorPrivacyTest
 	private static ResponseBody json(String text) { return ResponseBody.create(MediaType.parse("application/json"), text); }
 	private static RuntimeException bodyException() { return new IllegalStateException(EN, new IOException(ZH)); }
 	private static String malformed() { return "{\"" + EN + ZH + "\":[}"; }
+
+	/** Well-formed Bing success body: {@code [{"translations":[{"text":...}]}]}. */
+	private static ResponseBody bing(String text)
+	{
+		JsonObject translation = new JsonObject();
+		translation.addProperty("text", text);
+		JsonArray translations = new JsonArray();
+		translations.add(translation);
+		JsonObject result = new JsonObject();
+		result.add("translations", translations);
+		JsonArray root = new JsonArray();
+		root.add(result);
+		return ResponseBody.create(MediaType.parse("text/plain"), root.toString());
+	}
+
+	private static String requestBody(Pending pending) throws IOException
+	{
+		Buffer buffer = new Buffer();
+		pending.request.body().writeTo(buffer);
+		return buffer.readUtf8();
+	}
+
+	/** Socket-free client whose nearby players are exactly the given names. */
+	private static void nearbyPlayers(Translator translator, String... names) throws Exception
+	{
+		List<Player> players = new ArrayList<>();
+		for (String name : names)
+		{
+			final String playerName = name;
+			players.add((Player) Proxy.newProxyInstance(AiTranslatorPrivacyTest.class.getClassLoader(),
+					new Class<?>[] {Player.class}, (proxy, method, args) ->
+							method.getName().equals("getName") ? playerName : zero(method.getReturnType())));
+		}
+		List<Player> nearby = Collections.unmodifiableList(players);
+		inject(translator, "client", Proxy.newProxyInstance(AiTranslatorPrivacyTest.class.getClassLoader(),
+				new Class<?>[] {Client.class}, (proxy, method, args) ->
+				{
+					switch (method.getName())
+					{
+						case "getTickCount": return 7;
+						case "getPlayers": return nearby;
+						case "getLocalPlayer": return null;
+						default: return zero(method.getReturnType());
+					}
+				}));
+	}
+
+	/** Default value for the interface methods the tests do not care about (primitives need a value). */
+	private static Object zero(Class<?> type)
+	{
+		if (type == boolean.class) return false;
+		if (type == int.class) return 0;
+		if (type == long.class) return 0L;
+		if (type == short.class) return (short) 0;
+		if (type == byte.class) return (byte) 0;
+		if (type == char.class) return (char) 0;
+		if (type == float.class) return 0f;
+		if (type == double.class) return 0d;
+		return null;
+	}
 
 	@Test public void playerSuccessAndCacheHitStayInMemory() throws Exception
 	{
@@ -431,5 +494,66 @@ public class AiTranslatorPrivacyTest
 		assertFalse("header value must not be logged", logText().contains(value));
 		assertTrue(Files.readString(f.file().toPath()).contains(GAME_ZH));
 		assertFalse("header value must not be persisted", Files.readString(f.file().toPath()).contains(value));
+	}
+
+	// ---- free machine translation (Bing) -----------------------------------------------------
+
+	@Test public void freeMtPlayerSuccessStaysInMemoryWithoutBytes() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.FREE_MT;
+		f.request(EN, false).bing(ZH); f.flush();
+		assertEquals(ZH, f.ai.cached(TranslationStore.normalize(EN)));
+		assertEquals(1, f.ai.sessionCount());
+		assertEquals(0, f.ai.inFlightCount());
+		assertTrue(f.ai.recent().get(0).contains(ZH));
+		assertFalse("player chat must never create the free-MT cache file",
+				new File(f.dir, "ai_free-mt.tsv").exists());
+		f.enabled = false;
+		assertNotNull(f.translator.renderChat(EN, 0xffffff, 200, 14, true, false));
+		assertEquals(1, f.calls.size());
+		assertFalse("the free-MT success path must not log the source", logText().contains(EN));
+		assertFalse("the free-MT success path must not log the translation", logText().contains(ZH));
+		noPlayerBytes();
+	}
+
+	@Test public void freeMtPersistentGameSuccessWritesCacheButNeverLogsContent() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.FREE_MT;
+		f.request(GAME, true).bing(GAME_ZH); f.flush();
+		File cache = new File(f.dir, "ai_free-mt.tsv");
+		assertTrue("a game-text success is persisted", cache.exists());
+		assertTrue(Files.readString(cache.toPath(), StandardCharsets.UTF_8).contains(GAME_ZH));
+		String log = logText();
+		assertFalse("the persistent success path must not log the source", log.contains(GAME));
+		assertFalse("the persistent success path must not log the translation", log.contains(GAME_ZH));
+		assertFalse("neither may the normalized source reach the log",
+				log.contains(TranslationStore.normalize(GAME)));
+	}
+
+	@Test public void freeMtPlayerNameIsPlaceheldBeforeTheBingRequest() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.FREE_MT;
+		nearbyPlayers(f.translator, "FictionalName");
+		String text = "FictionalName waves at the moon gate.";
+		Pending pending = f.request(text, false);
+		assertEquals("edge.microsoft.com", pending.request.url().host());
+		String body = requestBody(pending);
+		assertTrue("the request is the Bing single-line array", body.startsWith("[\""));
+		assertFalse("the nearby player name must never reach Bing", body.contains("FictionalName"));
+		assertTrue("the protected name travels as a {{n}} token", body.contains("{{0}}"));
+	}
+
+	@Test public void freeMtManualBoxUsesTheSharedFunnelAndIdentityGuard() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.FREE_MT;
+		String manual = "The fictional crystal guardian opens the northern gate.";
+		assertNull(f.translator.plainNoPlayer(manual));
+		assertEquals(1, f.calls.size());
+		Pending pending = f.calls.get(0);
+		assertEquals("edge.microsoft.com", pending.request.url().host());
+		assertEquals("[\"" + manual + "\"]", requestBody(pending));
+		// The identity guard shared with every AI dispatch refuses identity-bearing text first.
+		assertNull(f.translator.plainNoPlayer("Trading with: fictional name"));
+		assertEquals("identity-bearing text must not reach Bing", 1, f.calls.size());
 	}
 }

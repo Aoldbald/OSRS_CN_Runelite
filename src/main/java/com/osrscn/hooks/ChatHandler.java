@@ -623,9 +623,26 @@ public class ChatHandler
 
 	private long pendingTimeoutMs()
 	{
-		// Capture once when work is admitted. Ticks and colour refreshes never renew this budget.
-		return config.useLocalAi() && config.aiBackend() == AiBackend.OLLAMA
-				? AiTranslator.OLLAMA_REQUEST_TIMEOUT_MS + PENDING_TIMEOUT_MS : PENDING_TIMEOUT_MS;
+		// Captured once when work is admitted; ticks and colour refreshes never renew it.
+		if (!config.useLocalAi())
+		{
+			return PENDING_TIMEOUT_MS;
+		}
+		// The fixed grace covers the tick that picks the reply up and the hand-off between requests;
+		// with aiConcurrency at its default of 1 a queued slot turn, and the single terminology-echo
+		// retry, can push the reply later still: this window is a bounded heuristic, not a guarantee.
+		// A reply that lands after it is still cached; only this line's display is given up.
+		return requestBudgetMs() + PENDING_TIMEOUT_MS;
+	}
+
+	/** Read budget the AI client actually enforces for the active backend. */
+	private long requestBudgetMs()
+	{
+		// Mirror AiTranslator's own classification (OPENAI and FREE_MT -> API client) so a backend
+		// can never pair its display window with another backend's transport budget.
+		AiBackend backend = config.aiBackend();
+		return backend == AiBackend.OPENAI || backend == AiBackend.FREE_MT
+				? AiTranslator.API_REQUEST_TIMEOUT_MS : AiTranslator.OLLAMA_REQUEST_TIMEOUT_MS;
 	}
 
 	/** INSERT mode: remember this player-chat line so {@link #tick()} can add a Chinese line for it. */

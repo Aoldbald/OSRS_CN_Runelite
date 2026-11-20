@@ -10,8 +10,10 @@ displays it inline via `<img=N>`, so translated text shows up in the original ga
 
 - Simplified Chinese only, with one-key English/Chinese toggle.
 - Local lookup first: most text is translated from local TSV tables — fast and stable.
-- AI translation fills gaps: text missing from the tables can be sent to a local
-  Ollama server. Works fine for the lookup part even without a local model.
+- AI / free machine translation fills gaps: text missing from the tables can be sent
+  to a local Ollama server, a cloud LLM API you configure, or Microsoft's Bing
+  translator (free, experimental). The lookup part works fine with none of them
+  enabled.
 - Translates dialogue, right-click menus, interfaces, chat, NPC overhead text, and examines.
 - Player names are never translated.
 - Lightweight: the JAR ships no translation tables or logs — translation data is
@@ -27,12 +29,20 @@ them locally.
 You can point the **translation data URL** config option at a mirror (for example a
 faster regional mirror) if the default source is slow for you.
 
-## AI translation (third-party server notice)
+## AI / free machine translation (third-party server notice)
 
 AI translation is **off by default**. When enabled, the in-game English text that is
-missing from the local tables is sent to the LLM server you configure (by default a
-local Ollama instance at `http://localhost:11434`). No data is sent anywhere unless
-you turn this on and configure a server. Player names are never sent.
+missing from the local tables is sent to the backend you select: the LLM server you
+configure (by default a local Ollama instance at `http://localhost:11434`), or the
+optional **free machine translation (experimental)** backend, which uses Microsoft's
+Bing translator. Free machine translation needs no API key and no GPU, but it only
+uses Bing: the text is sent to Microsoft, quality is lower than an LLM, proper nouns
+that are not in the local term table may be transliterated, and lines it cannot
+translate stay in English. If Bing cannot be reached or keeps failing, the plugin
+shows a warning popup (once per failure wave; it can appear again after you change
+the settings, clear the cache, or a connection test succeeds) and suggests switching
+to Ollama or an online API. No data is sent anywhere unless you turn AI translation on;
+the plugin does not actively send player names (see the privacy FAQ).
 
 A few providers require every request to carry specific headers: OpenCode Go, for
 example, requires `x-opencode-session` (a fixed, unchanging session id) and
@@ -70,13 +80,30 @@ lookup against bundled-on-first-run TSV tables — no network LLM, no cost. AI
 translation is an **optional** fallback for text not yet in the tables, and it
 defaults to a **local** Ollama instance on your own machine (free, offline).
 Text is only ever sent to a cloud provider if you deliberately switch the AI
-option to a cloud LLM yourself.
+option to a cloud LLM or to the free machine translation backend yourself.
+There is also an optional **free machine translation (experimental)** backend: no
+API key and no GPU are needed, but it uses Microsoft's Bing translator, sends the
+text to Microsoft, and its quality is lower than an LLM's.
 
 **What data leaves my computer?**
 On first run, the translation tables are downloaded once. With AI translation
-**off** (the default), nothing else is sent anywhere. With AI **on**, only the
-in-game English text missing from the tables is sent to the LLM server you
-configured (local Ollama by default). Player names are never sent.
+**off** (the default), nothing else is sent anywhere. With AI **on**, the in-game
+English text missing from the tables is sent to the backend you selected: your LLM
+server (local Ollama by default) or your configured cloud API. If you pick **free
+machine translation**, that text, anything you type into the side panel's manual
+translation box, and — when a player-chat mode is enabled — the player chat content
+(detected player names replaced by placeholders) are sent to **Microsoft** (Bing). The
+plugin does not actively send player names; it keeps the existing limited protection
+(nearby players, top-three/top-crab patterns, and `<osrscn-name-N>` placeholders) and
+never translates names.
+
+**Does free machine translation replace the local lookup tables?**
+No. Local TSV lookup always runs first and handles most text; free machine
+translation is only an optional fallback for text that is still missing. Turning it
+off (or turning AI translation off) returns the plugin to pure local lookup
+immediately. It keeps its own cache file, `ai_free-mt.tsv` under
+`~/.runelite/osrscn/`; switching back to Ollama or an online API does not delete that
+file automatically — delete it yourself if you want it gone.
 
 ## Contact & feedback
 
@@ -114,7 +141,8 @@ OSRS 原生界面无法直接显示中文。OSRSCN 把每个汉字渲染成小�
 
 - 只做简体中文，支持一键中英切换。
 - 本地查表优先：大部分文本直接从本地 TSV 译文表命中，快且稳定。
-- AI 翻译补缺：查表没有的文本可发给本地 Ollama 翻译；没有本地模型也能正常使用查表部分。
+- AI／免费机器翻译补缺：查表没有的文本可发给本地 Ollama、在线 API，或免费的 Bing
+  机器翻译（实验）；三者都不开也能正常使用查表部分。
 - 翻译对话、右键菜单、界面、聊天、NPC 头顶气泡、examine。
 - 玩家名永不翻译。
 - 轻量：JAR 不打包译文表或日志，译文数据首次运行时单独下载（见下）。中文字图用内置
@@ -127,11 +155,15 @@ OSRS 原生界面无法直接显示中文。OSRSCN 把每个汉字渲染成小�
 
 如果默认数据源对你太慢，可以在配置里把 **翻译数据地址** 改成镜像地址。
 
-## AI 翻译（第三方服务器提示）
+## AI／免费机器翻译（第三方服务器提示）
 
-AI 翻译**默认关闭**。开启后，本地查表缺失的游戏英文文本会发送到你配置的 LLM 服务器
-（默认是本地 Ollama，地址 `http://localhost:11434`）。不开启、不配置服务器就不会发送
-任何数据。玩家名永不发送。
+AI 翻译**默认关闭**。开启后，本地查表缺失的游戏英文文本会发送到你选的后端：你配置的
+LLM 服务器（默认是本地 Ollama，地址 `http://localhost:11434`），或可选的**免费机器翻译
+（实验）**后端（使用 Microsoft 的 Bing 翻译）。免费机器翻译不需要 API key、不需要 GPU，
+但只用 Bing：文字会送到 Microsoft，品质低于 AI，不在本地术语表里的专有名词可能被音译，
+翻不出来的行会保留英文。Bing 连不上或连续失败时，插件会弹窗提醒（同一波失败只弹一次；
+改设定、清快取或测试连接成功后可以再弹），建议改用 Ollama 或在线 API。不开启 AI 翻译就
+不会发送任何数据；插件不会主动发送玩家名（详见隐私 FAQ）。
 
 少数供应商要求每个请求都带特定 header：例如 OpenCode Go 要求 `x-opencode-session`
 （固定不变的 session id），并建议自定义 `User-Agent`。在插件设置的
@@ -159,11 +191,23 @@ OSRSCN 是纯显示插件：**不自动化任何操作、不模拟点击、不�
 不需要任何付费或 API key。核心翻译是**免费、离线**的本地查表（TSV 译文表，首次运行下载
 后本地缓存），不联网、不调用任何云端大模型、零成本。AI 翻译只是**可选的补充**，用来翻
 译文表里还没有的零碎文本，而且**默认走你本机的本地 Ollama（免费、离线）**。只有你自己
-主动把 AI 选项切到云端大模型，文本才会发给该服务商。
+主动把 AI 选项切到云端大模型或免费机器翻译，文本才会发给对应服务商。此外还有可选的
+**免费机器翻译（实验）**后端：不用 API key、不用 GPU，但只用 Bing、文字会送到 Microsoft，
+品质低于 AI。
 
 **到底有什么数据离开我的电脑？**
 首次运行会下载一次译文表。AI 翻译**关闭**时（默认），不再向任何地方发送数据。AI **开启**
-时，只有查表缺失的游戏英文文本会发给你配置的 LLM 服务器（默认本地 Ollama）。玩家名永不发送。
+时，查表缺失的游戏英文文本会发给你选的后端：你配置的 LLM 服务器（默认本地 Ollama）或
+在线 API。如果选择**免费机器翻译**，这些文字、侧边栏「手动翻译」框里输入的文字，以及
+（开启玩家聊天处理时）玩家聊天内容（可识别的玩家名已替换为占位符）都会送到 **Microsoft**（Bing）。
+插件不会主动发送玩家名：沿用既有的有限保护（附近玩家、top-three/top-crab 句式、
+`<osrscn-name-N>` 占位符），并且任何情况下都不翻译玩家名。
+
+**免费机器翻译会取代本地查表吗？**
+不会。本地 TSV 查表永远优先执行，处理大部分文本；免费机器翻译只是查表仍然缺失时的可选
+补充。关掉免费机器翻译（或关掉 AI 翻译）立即回到纯本地查表。它有自己的缓存文件
+`~/.runelite/osrscn/ai_free-mt.tsv`；切回 Ollama 或在线 API 不会自动删除该文件，需要的
+话可以自己删。
 
 ## 联系与反馈
 

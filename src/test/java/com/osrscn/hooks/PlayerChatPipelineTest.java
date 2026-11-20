@@ -371,25 +371,40 @@ public class PlayerChatPipelineTest
         }
     }
 
-    @Test public void onlineAndDisabledAiKeepOriginalChatWindow() throws Exception
+    @Test public void onlineApiGetsTransportPlusOneGraceWindow() throws Exception
     {
         for (PlayerChatMode mode : new PlayerChatMode[] {PlayerChatMode.INLINE, PlayerChatMode.INSERT})
+        try (Fixture f = new Fixture(mode, CHANNELS[0], false, false))
         {
-            try (Fixture f = new Fixture(mode, CHANNELS[0], false, false))
-            {
-                f.backend = AiBackend.OPENAI; f.release = new CountDownLatch(1);
-                f.fire(); await(() -> f.requests.get() == 1);
-                f.clock.set(15_001); f.chat.tick(); f.release.countDown(); f.awaitResponse(); f.chat.tick();
-                assertFalse(f.value.contains("<img=")); assertTrue(f.inserted.isEmpty());
-                assertEquals(10_000, f.observedReadTimeoutMs); assertEquals(0, f.observedCallTimeoutMs);
-                f.assertRequests(1); f.assertPrivate();
-            }
-            try (Fixture f = new Fixture(mode, CHANNELS[0], false, false))
-            {
-                f.enabled = false; f.fire(); f.clock.set(15_001); f.chat.tick();
-                f.enabled = true; f.chat.tick(); f.chat.refreshNativeColors();
-                f.assertRequests(0); f.assertPrivate();
-            }
+            f.backend = AiBackend.OPENAI; f.release = new CountDownLatch(1);
+            f.fire(); await(() -> f.requests.get() == 1);
+            assertEquals(AiTranslator.API_REQUEST_TIMEOUT_MS, f.observedReadTimeoutMs);
+            assertEquals(0, f.observedCallTimeoutMs);
+            // INSERT keeps its deadline on the Insert; INLINE keeps it on the Pending.
+            java.util.Map<?, ?> queue = (java.util.Map<?, ?>) field(f.chat,
+                    mode == PlayerChatMode.INLINE ? "pending" : "inserts");
+            assertEquals(AiTranslator.API_REQUEST_TIMEOUT_MS + 15_000L, field(queue.get(f.node), "deadline"));
+            f.clock.set(15_001); f.chat.tick();
+            assertEquals(1, queue.size()); // inside the widened window: no early drop
+            f.release.countDown(); f.awaitResponse(); f.chat.tick();
+            f.assertDelivered(); f.assertRequests(1); f.assertPrivate();
+            f.clock.set(30_001); f.chat.tick();
+            assertTrue(queue.isEmpty());
+        }
+    }
+
+    @Test public void disabledAiKeepsTheFifteenSecondChatWindow() throws Exception
+    {
+        for (PlayerChatMode mode : new PlayerChatMode[] {PlayerChatMode.INLINE, PlayerChatMode.INSERT})
+        try (Fixture f = new Fixture(mode, CHANNELS[0], false, false))
+        {
+            f.enabled = false; f.fire(); f.clock.set(15_001); f.chat.tick();
+            f.enabled = true; f.chat.tick(); f.chat.refreshNativeColors();
+            f.assertRequests(0); f.assertPrivate();
+            // INSERT keeps its entry on the Insert; only INLINE uses the Pending map.
+            java.util.Map<?, ?> queue = (java.util.Map<?, ?>) field(f.chat,
+                    mode == PlayerChatMode.INLINE ? "pending" : "inserts");
+            assertTrue(queue.isEmpty());
         }
     }
 
