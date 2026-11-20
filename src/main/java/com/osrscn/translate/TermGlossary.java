@@ -1,6 +1,7 @@
 package com.osrscn.translate;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -11,6 +12,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
@@ -42,6 +44,8 @@ final class TermGlossary
 	private static final Pattern TAGS = Pattern.compile("<[^>]*>");
 	private static final Pattern BRACKET_PLACEHOLDERS = Pattern.compile("\\[[^\\]]*\\]");
 	private static final Pattern TOKEN_SPLIT = Pattern.compile("[^a-z0-9']+");
+	// Same token alphabet as TOKEN_SPLIT, used by matches() to walk tokens together with offsets.
+	private static final Pattern TOKEN = Pattern.compile("[a-z0-9']+");
 
 	private static final class Term
 	{
@@ -235,6 +239,137 @@ final class TermGlossary
 			prompt.append("  ").append(hit.term.en).append(" => ").append(hit.term.zh).append('\n');
 		}
 		return prompt.toString().trim();
+	}
+
+	/**
+	 * NAME terms that occur in {@code raw}, with offsets into that raw string (half-open), for the
+	 * free-MT substitution path. {@link #promptFor} cannot serve it: it normalises the line and
+	 * collapses its layout, so its spans do not address the original text.
+	 *
+	 * <p>Tags and {@code [...]} placeholders are blanked in place with spaces of the same length, so
+	 * a term inside a tag or placeholder never matches while every offset still points at the raw
+	 * line. Matching rules are the same as {@link #promptFor}: whole words only, a possessive base
+	 * form reaches the plain name, and the {@code ignored} filtering already happened in
+	 * {@link #build}.
+	 *
+	 * @return matches sorted by raw start, longest first at the same start; never null. Overlaps
+	 *         are kept, because resolving them (longest wins) belongs to the single-scan caller.
+	 */
+	List<TermMatch> matches(String raw)
+	{
+		if (raw == null || raw.isEmpty() || byToken.isEmpty())
+		{
+			return Collections.emptyList();
+		}
+		String lower = lowerKeepingOffsets(mask(raw));
+		Set<Term> candidates = matchCandidates(lower);
+		if (candidates.isEmpty())
+		{
+			return Collections.emptyList();
+		}
+		List<TermMatch> out = new ArrayList<>();
+		for (Term term : candidates)
+		{
+			String termLower = term.en.toLowerCase(Locale.ROOT);
+			int from = 0;
+			while ((from = lower.indexOf(termLower, from)) >= 0)
+			{
+				int end = from + termLower.length();
+				String seen = raw.substring(from, end);
+				// Only claim a span whose raw spelling really lower-cases to the term. That drops a
+				// rare hit whose toLowerCase mapping changed the length, instead of cutting a word.
+				if (isWordBoundary(lower, from, end)
+						&& seen.toLowerCase(Locale.ROOT).equals(termLower))
+				{
+					out.add(new TermMatch(seen, term.zh, from, end));
+				}
+				from++;
+			}
+		}
+		// Same start: the longer term first, so a caller that keeps the first hit gets longest-wins.
+		out.sort(Comparator
+				.comparingInt((TermMatch match) -> match.start)
+				.thenComparing(Comparator.comparingInt((TermMatch match) -> match.end).reversed())
+				.thenComparing(match -> match.en, String.CASE_INSENSITIVE_ORDER));
+		return out.isEmpty() ? Collections.emptyList() : out;
+	}
+
+	/** Blank tags and {@code [...]} placeholders with spaces, keeping every index in place. */
+	private static String mask(String raw)
+	{
+		if (raw.indexOf('<') < 0 && raw.indexOf('[') < 0)
+		{
+			return raw;
+		}
+		char[] out = raw.toCharArray();
+		Matcher tags = TAGS.matcher(raw);
+		while (tags.find())
+		{
+			Arrays.fill(out, tags.start(), tags.end(), ' ');
+		}
+		Matcher placeholders = BRACKET_PLACEHOLDERS.matcher(raw);
+		while (placeholders.find())
+		{
+			Arrays.fill(out, placeholders.start(), placeholders.end(), ' ');
+		}
+		return new String(out);
+	}
+
+	/**
+	 * Lower-case {@code masked} so index {@code i} of the result is always index {@code i} of the
+	 * raw line. {@link String#toLowerCase} can change the length for a few code points, which would
+	 * shift every later offset; in that case map one character at a time (which never changes the
+	 * length) and let the caller drop a hit that no longer lines up.
+	 */
+	private static String lowerKeepingOffsets(String masked)
+	{
+		String lower = masked.toLowerCase(Locale.ROOT);
+		if (lower.length() == masked.length())
+		{
+			return lower;
+		}
+		char[] out = new char[masked.length()];
+		for (int i = 0; i < out.length; i++)
+		{
+			out[i] = Character.toLowerCase(masked.charAt(i));
+		}
+		return new String(out);
+	}
+
+	/** The token-index lookup of {@link #promptFor}, over an already-lower-cased line. */
+	private Set<Term> matchCandidates(String lower)
+	{
+		Set<Term> candidates = new HashSet<>();
+		Matcher token = TOKEN.matcher(lower);
+		while (token.find())
+		{
+			String word = token.group();
+			List<Term> list = byToken.get(word);
+			if (list != null)
+			{
+				candidates.addAll(list);
+			}
+			// Same possessive fallback as promptFor: "Lumbridge's" only reaches the plain name
+			// through its base form, and a multi-word term can index the possessive token itself.
+			if (word.endsWith("'s") && word.length() > 3)
+			{
+				List<Term> base = byToken.get(word.substring(0, word.length() - 2));
+				if (base != null)
+				{
+					candidates.addAll(base);
+				}
+			}
+		}
+		return candidates;
+	}
+
+	/** True when {@code [from, end)} stands on word boundaries in {@code lower}. */
+	private static boolean isWordBoundary(String lower, int from, int end)
+	{
+		char before = from == 0 ? ' ' : lower.charAt(from - 1);
+		char after = end == lower.length() ? ' ' : lower.charAt(end);
+		return !Character.isLetterOrDigit(before) && before != '_'
+				&& !Character.isLetterOrDigit(after) && after != '_';
 	}
 
 	/** Strip tags and {@code [...]} placeholders, then canonicalize the same way lookups do. */

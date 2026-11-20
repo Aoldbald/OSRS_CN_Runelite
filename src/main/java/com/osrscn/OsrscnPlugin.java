@@ -496,8 +496,10 @@ public class OsrscnPlugin extends Plugin
 		// does not flash English until the next per-tick scan. Which scripts map to which surface/targets
 		// lives in SurfaceRegistry; this is just the dispatch. One-shot per fire, so hover hit-test cells
 		// are untouched (a per-frame redraw of the account summary previously broke its mouseover).
-		// NOTE: combat achievements (CaTasks) is intentionally not handled here - it resists draw-time
-		// widget rewrites, so it is handled via overlay rendering instead.
+		// NOTE: there is no combat-achievement overlay. The CA task list (CaTasks, group 715) is skipped by
+		// the per-frame pass only (SurfaceRegistry: perFrameExcluded, a big scrollable list) and is kept
+		// fresh by the client-tick scan; the CA boss-detail page title (CaBoss.FRAME) also has a script
+		// hook (script 4835) and a per-game-tick backstop in InterfaceTranslator.
 		if (!toggle.isChineseEnabled())
 		{
 			return;

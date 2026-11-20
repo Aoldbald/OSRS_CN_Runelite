@@ -16,6 +16,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
 import java.util.concurrent.atomic.AtomicReference;
+import com.osrscn.AiBackend;
 import com.osrscn.OsrscnConfig;
 import com.osrscn.OsrscnPlugin;
 import com.osrscn.PlayerChatMode;
@@ -1134,6 +1135,46 @@ public class ChatHandlerTest
 		assertEquals("Skillcape", f.chat.values[0].get());
 		assertEquals(calls, f.translator.calls);
 		assertTrue(state(f.chat.handler, "tracked").isEmpty());
+	}
+
+	@Test
+	public void freeMtBackendUsesApiRequestBudget() throws Exception
+	{
+		assertEquals(AiTranslator.API_REQUEST_TIMEOUT_MS, budgetMs(AiBackend.FREE_MT, "requestBudgetMs"));
+	}
+
+	@Test
+	public void freeMtBackendPendingTimeoutAddsTheApiBudget() throws Exception
+	{
+		assertEquals(AiTranslator.API_REQUEST_TIMEOUT_MS + handlerConstant("PENDING_TIMEOUT_MS"),
+				budgetMs(AiBackend.FREE_MT, "pendingTimeoutMs"));
+	}
+
+	/** Invoke a private instance budget method with a config proxy pinned to one backend. */
+	private static long budgetMs(AiBackend backend, String methodName) throws Exception
+	{
+		ChatHandler handler = new ChatHandler();
+		OsrscnConfig config = (OsrscnConfig) Proxy.newProxyInstance(ChatHandlerTest.class.getClassLoader(),
+				new Class<?>[] { OsrscnConfig.class }, (proxy, method, args) ->
+				{
+					switch (method.getName())
+					{
+						case "useLocalAi": return true;
+						case "aiBackend": return backend;
+						default: return defaultValue(method.getReturnType());
+					}
+				});
+		inject(handler, "config", config);
+		Method method = ChatHandler.class.getDeclaredMethod(methodName);
+		method.setAccessible(true);
+		return ((Number) method.invoke(handler)).longValue();
+	}
+
+	private static long handlerConstant(String name) throws Exception
+	{
+		Field field = ChatHandler.class.getDeclaredField(name);
+		field.setAccessible(true);
+		return field.getLong(null);
 	}
 
 	private static Map<?, ?> state(ChatHandler handler, String name) throws Exception

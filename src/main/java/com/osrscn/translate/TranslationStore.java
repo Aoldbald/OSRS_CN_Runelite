@@ -167,6 +167,18 @@ public class TranslationStore
 		return g == null ? "" : g.promptFor(english);
 	}
 
+	/**
+	 * Terminology matches for the free MT path: the NAME terms that occur in {@code english}, with
+	 * offsets into that raw string. Mirrors {@link #glossaryPrompt}: reads the volatile glossary and
+	 * returns an empty list when it is not built yet or nothing matches. Called once per admitted
+	 * request, before the single scan that turns tags into placeholders and terms into Chinese.
+	 */
+	public List<TermMatch> glossaryMatches(String english)
+	{
+		TermGlossary g = glossary;
+		return g == null ? java.util.Collections.emptyList() : g.matches(english);
+	}
+
 	/** Loads the store on the client's background executor. Safe to call once at start-up. */
 	public void loadAsync()
 	{

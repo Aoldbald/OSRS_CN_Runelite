@@ -23,6 +23,8 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.inject.Inject;
 import javax.inject.Singleton;
+import javax.swing.JOptionPane;
+import javax.swing.SwingUtilities;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.RuneLite;
 import okhttp3.Call;
@@ -35,8 +37,10 @@ import okhttp3.RequestBody;
 import okhttp3.Response;
 
 /**
- * Asynchronous AI fallback for text not found in the lookup table. Two backends (see {@code aiBackend}):
- * local Ollama ({@code /api/chat}) and any OpenAI-compatible online API ({@code /chat/completions}).
+ * Asynchronous AI fallback for text not found in the lookup table. Three backends (see
+ * {@code aiBackend}): local Ollama ({@code /api/chat}), any OpenAI-compatible online API
+ * ({@code /chat/completions}), and the keyless free machine translation endpoint
+ * ({@link FreeMtClient}, Bing/Edge).
  *
  * <p>{@link #translate} never blocks: on a miss it returns {@code null} and fires a background
  * request; the result lands in the cache and is picked up by a later call.
@@ -141,8 +145,24 @@ public class AiTranslator
 	private static final int BACKOFF_AFTER_FAILURES = 3;
 	private static final long BACKOFF_BASE_MS = 5_000;
 	private static final long BACKOFF_MAX_MS = 300_000;
+	// Free MT answers 429 for its own rate limiting, far above the 5 s step that recordFailure()
+	// assigns on the third consecutive failure. The window is raised on the shared backoffUntil (so
+	// the usual check sees it) AND stored in freeMtRateLimitUntil, which no other response can lower;
+	// see that field for why the two copies are needed.
+	private static final long FREE_MT_429_BACKOFF_MS = 60_000L;
+	// Ten unusable LINES (not attempts) mean the free endpoint is probably unusable, not one odd line.
+	private static final int FREE_MT_UNUSABLE_LINE_LIMIT = 10;
+	// A normal free-MT answer is a few hundred bytes; anything above 1 MB is treated as a P3 content
+	// failure instead of being parsed.
+	private static final int FREE_MT_MAX_BODY_CHARS = 1_048_576;
 	private final java.util.concurrent.atomic.AtomicInteger failStreak = new java.util.concurrent.atomic.AtomicInteger();
 	private volatile long backoffUntil;
+	// The FREE_MT 429 rate-limit window. recordSuccess() clears backoffUntil (a 2xx proves the
+	// endpoint answers) and recordFailure() assigns its own 5 s step, but with aiConcurrency > 1 those
+	// responses may belong to requests dispatched BEFORE the 429: neither may shorten the rate-limit
+	// pause, so the 60 s window is kept here as well. This copy only expires with time (and with the
+	// other backoff state on configurationChanged()/clearCache()); it gates the FREE_MT backend only.
+	private volatile long freeMtRateLimitUntil;
 
 	// Content-level failures: a 2xx with an unusable reply is not a transport failure, so it must not
 	// touch failStreak/backoffUntil. A short global pause stops hammering a model that keeps returning junk.
@@ -151,6 +171,14 @@ public class AiTranslator
 	private final java.util.concurrent.atomic.AtomicInteger contentFailStreak = new java.util.concurrent.atomic.AtomicInteger();
 	private volatile long contentBackoffUntil;
 	private final java.util.Map<String, Integer> contentFailAttempts = new java.util.HashMap<>();
+
+	// Free MT (Bing) state. The two flags below are read from the EDT by freeMtDebugLine(), which must
+	// not take this monitor (the panel refresh runs every second); the line streak is only touched
+	// under the monitor. freeMtUnavailableNotifier is a test hook: null means show the Swing dialog.
+	private volatile boolean freeMtUnavailableNotified; // dialog already shown in this RuneLite run
+	private volatile boolean freeMtDegraded; // currently degraded (debug; cleared by a success)
+	private volatile Runnable freeMtUnavailableNotifier;
+	private int freeMtUnusableLineStreak; // consecutive untranslatable lines (under monitor)
 
 	// Some models (o1/o3/gpt-5, strict proxies) reject the optional temperature parameter with
 	// 400/422. Once a retry without it succeeds, this configuration omits temperature from every
@@ -268,9 +296,16 @@ public class AiTranslator
 		{
 			return; // model/config changed, the miss is negative-cached, or another callback filled it
 		}
-		if (System.currentTimeMillis() < backoffUntil)
+		final long now = System.currentTimeMillis();
+		if (now < backoffUntil)
 		{
 			return; // backend keeps failing: wait out the backoff window
+		}
+		if (now < freeMtRateLimitUntil && config.aiBackend() == AiBackend.FREE_MT)
+		{
+			// Bing rate-limited us. A success/failure that arrives later may belong to a request
+			// dispatched before the 429, so it must not reopen the endpoint early (see the field).
+			return;
 		}
 		if (System.currentTimeMillis() < contentBackoffUntil)
 		{
@@ -289,23 +324,35 @@ public class AiTranslator
 		lastDispatch = System.currentTimeMillis();
 		RequestState state = new RequestState(generation, loadedModel);
 		state.withoutTemperature = apiTemperatureUnsupported;
-		// Computed once per admitted request, never per lookup/tick. The index is built off-thread at
-		// store load, so this is a token lookup plus a short word-boundary scan (~50us). The hint is
-		// optional: a broken index must degrade to the plain message, not fail the request and leave
-		// the line stuck in inFlight, so its exceptions stay local and are never counted as failures.
-		// A store implementation may also answer null; that means "no hint", exactly like "".
-		try
+		if (config.aiBackend() == AiBackend.FREE_MT)
 		{
-			String hint = store == null || glossaryMutedModels.contains(state.model)
-					? "" : store.glossaryPrompt(english);
-			state.glossaryText = hint == null ? "" : hint;
-		}
-		catch (RuntimeException e)
-		{
+			// Free MT cannot take a prompt: terms are substituted into the text instead, in
+			// FreeMtText.prepare, which also protects colour spans with token pairs (strict Chinese
+			// anchors, non-strict closer-style sentences and English proper nouns). Keep the LLM-only
+			// hint and echo bookkeeping empty.
 			state.glossaryText = "";
-			log.debug("OSRSCN AI: terminology hint unavailable, continuing without it", e);
+			state.glossaryEchoRef = "";
 		}
-		state.glossaryEchoRef = state.glossaryText;
+		else
+		{
+			// Computed once per admitted request, never per lookup/tick. The index is built off-thread at
+			// store load, so this is a token lookup plus a short word-boundary scan (~50us). The hint is
+			// optional: a broken index must degrade to the plain message, not fail the request and leave
+			// the line stuck in inFlight, so its exceptions stay local and are never counted as failures.
+			// A store implementation may also answer null; that means "no hint", exactly like "".
+			try
+			{
+				String hint = store == null || glossaryMutedModels.contains(state.model)
+						? "" : store.glossaryPrompt(english);
+				state.glossaryText = hint == null ? "" : hint;
+			}
+			catch (RuntimeException e)
+			{
+				state.glossaryText = "";
+				log.debug("OSRSCN AI: terminology hint unavailable, continuing without it", e);
+			}
+			state.glossaryEchoRef = state.glossaryText;
+		}
 		try
 		{
 			request(english, persist, state);
@@ -416,10 +463,14 @@ public class AiTranslator
 		untranslatable.clear(); // a new model/endpoint may translate the lines the old one choked on
 		failStreak.set(0);
 		backoffUntil = 0;
+		freeMtRateLimitUntil = 0; // a new endpoint identity may no longer be rate limiting
 		contentFailStreak.set(0);
 		contentBackoffUntil = 0;
 		contentFailAttempts.clear();
 		lastDispatch = 0;
+		freeMtUnavailableNotified = false; // a new config / cache clear re-arms the one-shot notice
+		freeMtDegraded = false;
+		freeMtUnusableLineStreak = 0;
 	}
 
 	/**
@@ -589,6 +640,11 @@ public class AiTranslator
 
 	private void request(String english, boolean persist, RequestState state)
 	{
+		if (config.aiBackend() == AiBackend.FREE_MT)
+		{
+			requestFreeMt(english, persist, state);
+			return;
+		}
 		JsonArray messages = new JsonArray();
 		messages.add(message("system", SYSTEM_PROMPT));
 		// The terminology block is a prefix of the user message (not the system prompt) so the system
@@ -790,6 +846,280 @@ public class AiTranslator
 		});
 	}
 
+	/**
+	 * Free MT request path: prepare the line (a closed colour run whose content is already Chinese
+	 * becomes a STRICT locally anchored {@code {{open}}…{{close}}} token pair that must keep its own
+	 * words; every closer-style run - closed by a literal {@code </col>} - becomes a NON-STRICT pair so
+	 * the wrapped sentence keeps its colour while Bing translates inside it; a switch-style run that
+	 * looks like a proper noun becomes a NON-STRICT pair too; only switch-style base text goes as plain
+	 * text without markers so Bing translates it in the base colour, other markup becomes
+	 * {@code {{n}}} tokens, NAME terms become Chinese), then POST the single-element array to
+	 * {@link FreeMtClient}. Failures are classified here: transport / non-2xx (P1/P2) count against the
+	 * endpoint, while P2'/P3/P4/C1-C5 only reject this line. The line is finished in a {@code finally}
+	 * block, so a throw can never leave it in flight.
+	 */
+	private void requestFreeMt(String english, boolean persist, RequestState state)
+	{
+		final FreeMtText.Prepared prepared;
+		try
+		{
+			List<TermMatch> terms = store == null
+					? Collections.<TermMatch>emptyList() : store.glossaryMatches(english);
+			prepared = FreeMtText.prepare(english, terms);
+		}
+		catch (RuntimeException e)
+		{
+			// A broken terminology index / prepare must degrade to "this line stays English", never to
+			// an endpoint failure: otherwise three odd lines would show the "Bing unavailable" dialog.
+			untranslatable.add(english);
+			finish(english, state);
+			log.debug("OSRSCN FREE-MT: terminology/prepare failed; line skipped");
+			return;
+		}
+		if (prepared.skip)
+		{
+			untranslatable.add(english);
+			finish(english, state);
+			return;
+		}
+		// Second S1 guard, independent of prepare: never send a line the endpoint cannot handle.
+		if (english.length() > FreeMtText.MAX_TEXT_CHARS || english.contains("{{")
+				|| english.contains("}}") || !Translator.hasTranslatableText(english))
+		{
+			untranslatable.add(english);
+			finish(english, state);
+			return;
+		}
+		Request req;
+		Call pending;
+		try
+		{
+			req = FreeMtClient.build(gson, prepared.text);
+			pending = inferenceClient(true).newCall(req);
+		}
+		catch (RuntimeException e)
+		{
+			// A local failure (request build, client call) is not a Bing failure: keep it line-scoped
+			// instead of letting the dispatch catch record an endpoint outage.
+			freeMtDispatchFailed(english, state);
+			return;
+		}
+		if (!isCurrent(state))
+		{
+			return;
+		}
+		Callback callback = new Callback()
+		{
+			@Override
+			public void onFailure(Call call, IOException e)
+			{
+				try
+				{
+					synchronized (AiTranslator.this)
+					{
+						if (!isCurrent(state))
+						{
+							return;
+						}
+						recordFailure();
+						if (failStreak.get() >= BACKOFF_AFTER_FAILURES)
+						{
+							maybeNotifyFreeMtUnavailable();
+						}
+					}
+					log.warn("OSRSCN FREE-MT request failed ({})", e.getClass().getSimpleName());
+				}
+				catch (Exception ignored)
+				{
+					// The failure path itself must not leak request/response content into the log.
+					log.warn("OSRSCN FREE-MT request failed");
+				}
+				finally
+				{
+					synchronized (AiTranslator.this)
+					{
+						finish(english, state);
+					}
+				}
+			}
+
+			@Override
+			public void onResponse(Call call, Response response)
+			{
+				try (Response r = response)
+				{
+					int status = r.code();
+					if (!r.isSuccessful())
+					{
+						synchronized (AiTranslator.this)
+						{
+							if (!isCurrent(state))
+							{
+								return;
+							}
+							if (status == 400 || status == 413 || status == 414 || status == 422)
+							{
+								// P2': the request itself was rejected (too long / bad shape). Line-level:
+								// one odd line must not count against the endpoint's health.
+								freeMtContentRejected(english);
+							}
+							else
+							{
+								// P1/P2: endpoint-level failure. recordFailure() first, because on the
+								// third failure it assigns its own 5 s backoff, which the 429 floor below
+								// must then raise instead of being overwritten by it.
+								recordFailure();
+								if (status == 429)
+								{
+									// A response from another request that was already in flight may
+									// complete after this one and call recordSuccess() (clears the
+									// shared backoff) or recordFailure() (assigns its own 5 s step):
+									// neither may cut the 60 s rate-limit window short, so it also
+									// lives in its own time-based floor.
+									long rateLimitedUntil = System.currentTimeMillis() + FREE_MT_429_BACKOFF_MS;
+									backoffUntil = Math.max(backoffUntil, rateLimitedUntil);
+									freeMtRateLimitUntil = Math.max(freeMtRateLimitUntil, rateLimitedUntil);
+								}
+								if (failStreak.get() >= BACKOFF_AFTER_FAILURES)
+								{
+									maybeNotifyFreeMtUnavailable();
+								}
+							}
+						}
+						log.warn("OSRSCN FREE-MT HTTP {}", status);
+						return;
+					}
+					// The 1 MB limit is a memory guard: it must be applied to the DECLARED length before
+					// the body is buffered. -1 means unknown, which falls through to the read-length
+					// fallback below.
+					long declaredLength = r.body() == null ? 0 : r.body().contentLength();
+					if (declaredLength > FREE_MT_MAX_BODY_CHARS)
+					{
+						synchronized (AiTranslator.this)
+						{
+							if (!isCurrent(state))
+							{
+								return;
+							}
+							recordSuccess(); // a 2xx proves the endpoint is alive
+							freeMtContentRejected(english); // P3: oversized reply
+						}
+						log.warn("OSRSCN FREE-MT: oversized response ignored");
+						return;
+					}
+					String body = r.body() == null ? "" : r.body().string();
+					if (body.length() > FREE_MT_MAX_BODY_CHARS)
+					{
+						synchronized (AiTranslator.this)
+						{
+							if (!isCurrent(state))
+							{
+								return;
+							}
+							recordSuccess(); // a 2xx proves the endpoint is alive
+							freeMtContentRejected(english); // P3: oversized reply
+						}
+						log.warn("OSRSCN FREE-MT: oversized response ignored");
+						return;
+					}
+					String raw;
+					try
+					{
+						raw = FreeMtClient.parse(gson, body);
+					}
+					catch (FreeMtParseException e)
+					{
+						// P3: a 2xx with an unusable structure is a line-level failure, but still an
+						// endpoint success (same rule as the LLM path's "no usable content" reply).
+						synchronized (AiTranslator.this)
+						{
+							if (!isCurrent(state))
+							{
+								return;
+							}
+							recordSuccess();
+							freeMtContentRejected(english);
+						}
+						log.debug("OSRSCN FREE-MT parse failed");
+						return;
+					}
+					synchronized (AiTranslator.this)
+					{
+						if (!isCurrent(state))
+						{
+							return;
+						}
+						recordSuccess();
+						String zh = clean(raw);
+						if (zh.isEmpty())
+						{
+							freeMtContentRejected(english); // P4: empty translation
+							return;
+						}
+						FreeMtText.Result result = FreeMtText.validate(zh, prepared);
+						if (result != FreeMtText.Result.OK)
+						{
+							freeMtContentRejected(english); // C1-C5
+							return;
+						}
+						String restored = FreeMtText.restore(zh, prepared);
+						cache.put(english, restored);
+						if (persist && isPersistable(english) && persisted.add(english))
+						{
+							persistToDisk(english, restored);
+						}
+						sessionCount.incrementAndGet();
+						// The debug monitor shows what the client will draw: restore the protected
+						// spans first ({{n}} placeholders would be meaningless in the panel).
+						recent.addFirst(english + "  →  " + restored);
+						while (recent.size() > 40)
+						{
+							recent.pollLast();
+						}
+						contentFailAttempts.remove(english);
+						contentFailStreak.set(0);
+						freeMtUnusableLineStreak = 0;
+						freeMtDegraded = false;
+						// Deliberately no success log: neither the source line nor the translation may
+						// reach the log file (the privacy tests scan it).
+					}
+				}
+				catch (Exception e)
+				{
+					// The body is the reply to a line of game/player text: never log it.
+					log.warn("OSRSCN FREE-MT request failed");
+				}
+				finally
+				{
+					synchronized (AiTranslator.this)
+					{
+						finish(english, state);
+					}
+				}
+			}
+		};
+		try
+		{
+			pending.enqueue(callback);
+		}
+		catch (RuntimeException e)
+		{
+			// Same rule as the build/newCall step above: enqueue is local, not a Bing failure.
+			freeMtDispatchFailed(english, state);
+		}
+	}
+
+	/**
+	 * A local free-MT dispatch failure (request build, client call, enqueue) is line-scoped, exactly
+	 * like a prepare failure: the line is skipped and never counted against the endpoint.
+	 */
+	private void freeMtDispatchFailed(String english, RequestState state)
+	{
+		untranslatable.add(english);
+		finish(english, state);
+		log.debug("OSRSCN FREE-MT: dispatch failed; line skipped");
+	}
+
 	/** Called under this monitor for a 2xx whose reply is not a usable translation. */
 	private void contentRejected(String english)
 	{
@@ -808,6 +1138,53 @@ public class AiTranslator
 		}
 	}
 
+	/**
+	 * Free MT content failure (P2'/P3/P4/C1-C5): same per-line budget as the LLM path, plus the
+	 * "ten unusable lines" signal. {@link #contentRejected} stays void; the newly negative-cached
+	 * line is detected by asking whether this call is the one that made it untranslatable.
+	 */
+	private void freeMtContentRejected(String english)
+	{
+		contentRejected(english);
+		if (untranslatable.contains(english))
+		{
+			freeMtUnusableLineStreak++;
+			if (freeMtUnusableLineStreak >= FREE_MT_UNUSABLE_LINE_LIMIT)
+			{
+				maybeNotifyFreeMtUnavailable();
+			}
+		}
+	}
+
+	/**
+	 * Free MT looks unavailable (three consecutive endpoint failures or ten unusable lines): show the
+	 * warning dialog once per RuneLite run, on the EDT and without blocking the caller.
+	 */
+	private void maybeNotifyFreeMtUnavailable()
+	{
+		if (!config.useLocalAi() || config.aiBackend() != AiBackend.FREE_MT)
+		{
+			return; // the notice belongs to the free backend only, and only while AI is enabled
+		}
+		freeMtDegraded = true; // before the early return: later failures must still update the debug state
+		if (freeMtUnavailableNotified)
+		{
+			return;
+		}
+		freeMtUnavailableNotified = true;
+		log.warn("OSRSCN FREE-MT: unavailable (Bing unreachable or repeated failures)");
+		Runnable notifier = freeMtUnavailableNotifier;
+		if (notifier != null)
+		{
+			notifier.run(); // test hook
+			return;
+		}
+		SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(null,
+				"免费机器翻译当前不可用：Bing 无法连接，或连续多次翻译失败。\n"
+				+ "建议改用本地 Ollama 或在线 API，或关闭 AI 翻译继续使用本地译表。",
+				"OSRSCN 免费翻译", JOptionPane.WARNING_MESSAGE));
+	}
+
 	private void recordFailure()
 	{
 		int n = failStreak.incrementAndGet();
@@ -822,13 +1199,36 @@ public class AiTranslator
 	private void recordSuccess()
 	{
 		failStreak.set(0);
+		// freeMtRateLimitUntil is deliberately left alone: this success may belong to a request that
+		// was dispatched before a 429, and it must not reopen the rate-limited endpoint early.
 		backoffUntil = 0;
 	}
 
 	/** The model name for the active backend; also names the per-model on-disk cache file. */
 	private String activeModel()
 	{
-		return config.aiBackend() == AiBackend.OPENAI ? config.apiModel() : config.ollamaModel();
+		switch (config.aiBackend())
+		{
+			case OPENAI:
+				return config.apiModel();
+			case FREE_MT:
+				return "free-mt"; // single cache file: ai_free-mt.tsv
+			default:
+				return config.ollamaModel();
+		}
+	}
+
+	/**
+	 * Free MT status for the debug tab, or null when the free backend is not the active one.
+	 * EDT-safe: reads two volatile flags and config only, never this monitor, never IO.
+	 */
+	public String freeMtDebugLine()
+	{
+		if (!config.useLocalAi() || config.aiBackend() != AiBackend.FREE_MT)
+		{
+			return null;
+		}
+		return freeMtDegraded ? "不可用（已提示）" : "Bing";
 	}
 
 	private String ollamaEndpoint()
@@ -923,13 +1323,17 @@ public class AiTranslator
 	 */
 	public void testConnection(java.util.function.BiConsumer<Boolean, String> onResult)
 	{
-		if (config.aiBackend() == AiBackend.OPENAI)
+		switch (config.aiBackend())
 		{
-			testApiConnection(onResult);
-		}
-		else
-		{
-			testOllamaConnection(onResult);
+			case OPENAI:
+				testApiConnection(onResult);
+				break;
+			case FREE_MT:
+				testFreeMtConnection(onResult);
+				break;
+			default:
+				testOllamaConnection(onResult);
+				break;
 		}
 	}
 
@@ -970,6 +1374,76 @@ public class AiTranslator
 					{
 						onResult.accept(false, "连接失败 (HTTP " + r.code() + ")");
 					}
+				}
+			}
+		});
+	}
+
+	/**
+	 * Free backend probe: translate {@link FreeMtClient#probeText()} once. Runs on the EDT-safe test
+	 * client ({@link #testClient()}), never {@link #inferenceClient(boolean)} - that one's contract is
+	 * "called under this monitor". A usable reply re-arms the unavailable notice.
+	 */
+	private void testFreeMtConnection(java.util.function.BiConsumer<Boolean, String> onResult)
+	{
+		Request req = FreeMtClient.build(gson, FreeMtClient.probeText());
+		testClient().newCall(req).enqueue(new Callback()
+		{
+			@Override
+			public void onFailure(Call call, IOException e)
+			{
+				onResult.accept(false, "免费机器翻译不可用：Bing 连接失败");
+			}
+
+			@Override
+			public void onResponse(Call call, Response response)
+			{
+				try (Response r = response)
+				{
+					boolean ok = false;
+					String message;
+					if (r.isSuccessful())
+					{
+						try
+						{
+							String raw = FreeMtClient.parse(gson,
+									r.body() == null ? "" : r.body().string());
+							String zh = clean(raw);
+							ok = !zh.isEmpty() && FreeMtText.hasCjk(zh);
+							message = ok ? "免费机器翻译可用（Bing）" : "Bing 回傳內容無法使用";
+						}
+						catch (FreeMtParseException | IOException e)
+						{
+							message = "Bing 回傳格式錯誤";
+						}
+					}
+					else
+					{
+						message = "免费机器翻译不可用：Bing HTTP " + r.code();
+					}
+					if (ok)
+					{
+						// Reset in the callback, not in the caller's onResult lambda: the caller may be
+						// any thread (the panel marshals to the EDT).
+						synchronized (AiTranslator.this)
+						{
+							// Only the free backend owns this state. If the user switched backend while
+							// the probe was in flight, its late success must not clear the new backend's
+							// failStreak/backoff (the Ollama/API probes never touch them either).
+							if (config.aiBackend() == AiBackend.FREE_MT)
+							{
+								freeMtUnavailableNotified = false;
+								freeMtDegraded = false;
+								freeMtUnusableLineStreak = 0;
+								recordSuccess();
+							}
+						}
+					}
+					onResult.accept(ok, message);
+				}
+				catch (Exception e)
+				{
+					onResult.accept(false, "免费机器翻译不可用：Bing 回傳無法解析");
 				}
 			}
 		});

@@ -184,6 +184,12 @@ final class SurfaceRegistry
 				new Target(Reach.GROUP_ID, InterfaceID.SKILL_GUIDE),
 				new Target(Reach.COMPONENT, InterfaceID.SkillGuide.TITLE),
 				new Target(Reach.COMPONENT, InterfaceID.SkillGuide.CATEGORIES));
+		// Combat-achievement boss detail page (group 713). Its onLoad script 4835 writes the page title
+		// ("Combat Achievements - <boss>") directly onto CaBoss.FRAME's text before creating the page's
+		// children, so a walk that ran before the script saw English. Firing right after the script
+		// translates the freshly written title before the frame draws. No ScriptID constant exists for
+		// 4835 (gameval only names a few scripts), hence the literal, as for 9350 above.
+		r.script(4835, new Target(Reach.COMPONENT, InterfaceID.CaBoss.FRAME));
 		// Prayer hover tooltip draw-time rewrite (9444).
 		r.script(9444, new Target(Reach.COMPONENT, InterfaceID.Prayerbook.TOOLTIP));
 

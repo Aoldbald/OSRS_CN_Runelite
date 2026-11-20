@@ -5,6 +5,7 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -362,5 +363,177 @@ public class TermGlossaryTest
 				+ " Mark of Grace, my life, a goblin, grew to the size of a cart.");
 		assertTrue(prompt.contains("Lumbridge => 仑桥镇"));
 		assertEquals("exactly one reference line", 1, listedTerms(prompt));
+	}
+
+	// ---- free MT: raw-offset term matches (TermGlossary.matches) ----------------------
+
+	@Test
+	public void matchesReportsRawOffsetsInStartOrder()
+	{
+		TermGlossary glossary = build(table("Dragon scimitar", "龙金弯刀", "Lumbridge", "仑桥镇"));
+		String raw = "Buy a DRAGON SCIMITAR, then visit lumbridge.";
+		List<TermMatch> matches = glossary.matches(raw);
+		assertEquals(2, matches.size());
+
+		TermMatch scimitar = matches.get(0);
+		// en is the spelling in the raw line, not the table spelling (TermMatch documents this).
+		assertEquals("DRAGON SCIMITAR", scimitar.en);
+		assertEquals("龙金弯刀", scimitar.zh);
+		assertEquals(raw.indexOf("DRAGON SCIMITAR"), scimitar.start);
+		assertEquals(scimitar.start + "DRAGON SCIMITAR".length(), scimitar.end);
+		assertEquals("DRAGON SCIMITAR", raw.substring(scimitar.start, scimitar.end));
+
+		TermMatch lumbridge = matches.get(1);
+		assertEquals("lumbridge", lumbridge.en);
+		assertEquals("仑桥镇", lumbridge.zh);
+		assertEquals(raw.indexOf("lumbridge"), lumbridge.start);
+		assertEquals(lumbridge.start + "lumbridge".length(), lumbridge.end);
+		assertTrue("matches must be sorted by raw start", scimitar.start < lumbridge.start);
+	}
+
+	@Test
+	public void masksTagsAndBracketPlaceholdersWhileKeepingRawOffsets()
+	{
+		TermGlossary glossary = build(table("Dragon scimitar", "龙金弯刀", "Fremennik", "费明尼克"));
+		String tagged = "You have not unlocked <colNum0>Dragon scimitar</col> yet.";
+		List<TermMatch> matches = glossary.matches(tagged);
+		assertEquals(1, matches.size());
+		assertEquals("Dragon scimitar", matches.get(0).en);
+		assertEquals(tagged.indexOf("Dragon scimitar"), matches.get(0).start);
+		assertEquals(tagged.indexOf("Dragon scimitar") + "Dragon scimitar".length(),
+				matches.get(0).end);
+
+		// A term that is itself inside a tag is masked away, exactly like promptFor's tag strip.
+		assertEquals(0, glossary.matches("A <Dragon scimitar> is not a real tag.").size());
+		// [...] placeholders are player names: no term may match inside one, but the same word
+		// outside brackets still matches.
+		assertEquals(0, glossary.matches("Greetings, [Fremennik name].").size());
+		assertEquals(1, glossary.matches("Greetings, Fremennik.").size());
+	}
+
+	@Test
+	public void keepsRawOffsetsWhenLowerCaseWouldChangeTheLineLength()
+	{
+		// P2-10: U+0130 expands to "i" + U+0307 under String.toLowerCase, which would shift every
+		// later offset by one; matches must fall back to a per-character mapping so the term after
+		// it still reports raw indexes.
+		TermGlossary glossary = build(table("Dragon scimitar", "龙金弯刀"));
+		String raw = "\u0130stanbul then a Dragon scimitar.";
+		assertTrue("the premise: whole-string lower-casing must change the length",
+				raw.toLowerCase(Locale.ROOT).length() != raw.length());
+		List<TermMatch> matches = glossary.matches(raw);
+		assertEquals(1, matches.size());
+		assertEquals(raw.indexOf("Dragon scimitar"), matches.get(0).start);
+		assertEquals(raw.indexOf("Dragon scimitar") + "Dragon scimitar".length(),
+				matches.get(0).end);
+		assertEquals("Dragon scimitar", raw.substring(matches.get(0).start, matches.get(0).end));
+	}
+
+	@Test
+	public void keepsOverlapsAndPutsTheLongestTermFirstAtTheSameStart()
+	{
+		TermGlossary glossary = build(table(
+				"Dragon", "龙", "Dragon scimitar", "龙金弯刀", "Scimitar", "弯刀"));
+		List<TermMatch> matches = glossary.matches("A Dragon scimitar.");
+		assertEquals(3, matches.size());
+		assertEquals("Dragon scimitar", matches.get(0).en);
+		assertEquals(2, matches.get(0).start);
+		assertEquals(17, matches.get(0).end);
+		// Same start: the longer term is listed first; overlaps are left for the caller to resolve.
+		assertEquals("Dragon", matches.get(1).en);
+		assertEquals(2, matches.get(1).start);
+		assertEquals(8, matches.get(1).end);
+		assertEquals("scimitar", matches.get(2).en); // the raw spelling, lower-case in this line
+		assertEquals(9, matches.get(2).start);
+		assertEquals(17, matches.get(2).end);
+	}
+
+	@Test
+	public void matchesHonoursTheIgnoreListAndPossessiveForms()
+	{
+		TermGlossary glossary = TermGlossary.build(
+				table("Lumbridge", "仑桥镇", "Parrots", "鹦鹉"), Set.of("parrot"));
+		List<TermMatch> matches = glossary.matches("Lumbridge's parrots are loud.");
+		assertEquals(1, matches.size());
+		assertEquals("Lumbridge", matches.get(0).en);
+		assertEquals("仑桥镇", matches.get(0).zh);
+		assertEquals(0, matches.get(0).start);
+		assertEquals("Lumbridge".length(), matches.get(0).end);
+		assertEquals(0, glossary.matches("The parrots are loud.").size());
+	}
+
+	@Test
+	public void matchesReturnsEmptyListForMissingInputOrEmptyIndex()
+	{
+		TermGlossary glossary = build(table("Rune", "符文"));
+		assertTrue(glossary.matches(null).isEmpty());
+		assertTrue(glossary.matches("").isEmpty());
+		assertTrue(glossary.matches("Nothing here.").isEmpty());
+		assertTrue(TermGlossary.build(table(), Set.of()).matches("A rune stone.").isEmpty());
+	}
+
+	@Test
+	public void promptForKeepsTheNormalisationThatMatchesMustNotAdopt()
+	{
+		// P2-9: promptFor is not a wrapper around matches. plain() folds curly quotes and en/em
+		// dashes and turns <br> into a space, so these lines still yield terminology hints; matches
+		// reads the raw line and must not claim a span it would have to cut.
+		TermGlossary glossary = build(table(
+				"King's message", "国王的信件",
+				"Zamorak-Brew", "扎莫拉克酒",
+				"Dragon scimitar", "龙金弯刀"));
+		assertTrue(glossary.promptFor("Read the King\u2019s message.")
+				.contains("King's message => 国王的信件"));
+		assertTrue(glossary.promptFor("A Zamorak\u2014Brew, please.")
+				.contains("Zamorak-Brew => 扎莫拉克酒"));
+		assertTrue(glossary.promptFor("A Dragon<br>scimitar.")
+				.contains("Dragon scimitar => 龙金弯刀"));
+
+		assertTrue(glossary.matches("Read the King\u2019s message.").isEmpty());
+		assertTrue(glossary.matches("A Zamorak\u2014Brew, please.").isEmpty());
+		assertTrue(glossary.matches("A Dragon<br>scimitar.").isEmpty());
+	}
+
+	@Test
+	public void doesNotMatchATermHiddenInsideALongerWord()
+	{
+		TermGlossary glossary = build(table("Rune", "符文", "Dragon scimitar", "龙金弯刀"));
+		// The review's literal cases: a term that is only part of a longer spelling is not a term.
+		assertEquals(0, glossary.matches("RuneScape is a game.").size());
+		assertEquals(0, glossary.matches("Dragonscimitar is sharp.").size());
+		// These lines still carry a real token for the term, so the token index does hand it to the
+		// span scan and only the whole-word boundary can reject the embedded occurrence. If
+		// isWordBoundary always returned true, the two assertions below would see 2 and 1 matches.
+		List<TermMatch> rune = glossary.matches("A rune stone and RuneScape.");
+		assertEquals(1, rune.size());
+		assertEquals("rune", rune.get(0).en);
+		assertEquals(2, rune.get(0).start);
+		assertEquals(0, glossary.matches("Dragon scimitars are sharp.").size());
+	}
+
+	@Test
+	public void matchesEveryOccurrenceOfTheSameTerm()
+	{
+		TermGlossary glossary = build(table("Rune", "符文"));
+		List<TermMatch> matches = glossary.matches("Rune and Rune.");
+		assertEquals(2, matches.size());
+		assertEquals(0, matches.get(0).start);
+		assertEquals("Rune", matches.get(0).en);
+		assertEquals(9, matches.get(1).start);
+		assertEquals("Rune", matches.get(1).en);
+		assertEquals("符文", matches.get(1).zh);
+	}
+
+	@Test
+	public void matchesATermAtTheEndOfTheString()
+	{
+		TermGlossary glossary = build(table("Lumbridge", "仑桥镇"));
+		List<TermMatch> matches = glossary.matches("Visit Lumbridge");
+		assertEquals(1, matches.size());
+		assertEquals("Lumbridge", matches.get(0).en);
+		assertEquals("Visit ".length(), matches.get(0).start);
+		assertEquals("Visit Lumbridge".length(), matches.get(0).end);
+		// The other outer edge: the term is the whole string, so start == 0 and end == length.
+		assertEquals(1, glossary.matches("Lumbridge").size());
 	}
 }

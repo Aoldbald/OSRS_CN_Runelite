@@ -638,9 +638,10 @@ public class ChatHandler
 	/** Read budget the AI client actually enforces for the active backend. */
 	private long requestBudgetMs()
 	{
-		// Mirror AiTranslator's own classification (OPENAI -> API client) so a third backend can
-		// never pair one backend's display window with the other backend's transport budget.
-		return config.aiBackend() == AiBackend.OPENAI
+		// Mirror AiTranslator's own classification (OPENAI and FREE_MT -> API client) so a backend
+		// can never pair its display window with another backend's transport budget.
+		AiBackend backend = config.aiBackend();
+		return backend == AiBackend.OPENAI || backend == AiBackend.FREE_MT
 				? AiTranslator.API_REQUEST_TIMEOUT_MS : AiTranslator.OLLAMA_REQUEST_TIMEOUT_MS;
 	}
 

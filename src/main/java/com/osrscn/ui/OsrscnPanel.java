@@ -1,5 +1,6 @@
 package com.osrscn.ui;
 
+import com.osrscn.AiBackend;
 import com.osrscn.OsrscnConfig;
 import com.osrscn.OsrscnPlugin;
 import com.osrscn.translate.AiTranslator;
@@ -114,9 +115,11 @@ public class OsrscnPanel extends PluginPanel
 
 	// 调试
 	private boolean lastDebug;
+	private JPanel debugGrid;
 	private final JLabel cacheLabel = statLabel();
 	private final JLabel inflightLabel = statLabel();
 	private final JLabel sessionLabel = statLabel();
+	private final JLabel freeMtLabel = statLabel();
 	private final JTextArea recentArea = new JTextArea();
 
 	private final Timer refreshTimer;
@@ -720,7 +723,7 @@ public class OsrscnPanel extends PluginPanel
 		}
 		else if (System.currentTimeMillis() > translateDeadline)
 		{
-			translateOutput.setText("（翻译超时，确认 Ollama 和 AI 翻译已开启）");
+			translateOutput.setText("（翻译超时，确认 AI 后端已开启且连接正常）");
 			translatePending = null;
 			translatePoll.stop();
 		}
@@ -733,12 +736,13 @@ public class OsrscnPanel extends PluginPanel
 		JPanel panel = new JPanel(new BorderLayout(0, 6));
 		panel.setBackground(ColorScheme.DARK_GRAY_COLOR);
 
-		JPanel grid = new JPanel(new GridLayout(0, 1, 0, 4));
-		grid.setBackground(ColorScheme.DARK_GRAY_COLOR);
-		grid.add(cacheLabel);
-		grid.add(inflightLabel);
-		grid.add(sessionLabel);
-		panel.add(grid, BorderLayout.NORTH);
+		debugGrid = new JPanel(new GridLayout(0, 1, 0, 4));
+		debugGrid.setBackground(ColorScheme.DARK_GRAY_COLOR);
+		debugGrid.add(cacheLabel);
+		debugGrid.add(inflightLabel);
+		debugGrid.add(sessionLabel);
+		debugGrid.add(freeMtLabel);
+		panel.add(debugGrid, BorderLayout.NORTH);
 
 		recentArea.setEditable(false);
 		recentArea.setLineWrap(true);
@@ -799,6 +803,38 @@ public class OsrscnPanel extends PluginPanel
 			cacheLabel.setText(stat("已缓存", ai.cacheSize() + " 条"));
 			inflightLabel.setText(stat("翻译中", String.valueOf(ai.inFlightCount())));
 			sessionLabel.setText(stat("本次会话", ai.sessionCount() + " 条"));
+			// 免费翻译状态行只在 FREE_MT 时出现。GridLayout 不会跳过隐藏元件（仍占一格空白），
+			// 所以不能只 setVisible，必须从 grid 里 add/remove。
+			// 注意：Unsafe 分配的 test panel 不执行字段初始化，freeMtLabel/debugGrid/ai 都可能为 null；
+			// 这段必须留在 debugMonitor 守卫内，并对每个引用判空。
+			if (freeMtLabel != null && debugGrid != null)
+			{
+				boolean freeMt = config.useLocalAi() && config.aiBackend() == AiBackend.FREE_MT;
+				if (freeMt)
+				{
+					if (freeMtLabel.getParent() == null)
+					{
+						debugGrid.add(freeMtLabel);
+						debugGrid.revalidate();
+						debugGrid.repaint();
+					}
+					String line = ai == null ? null : ai.freeMtDebugLine();
+					if (line != null)
+					{
+						String text = stat("免费翻译", line);
+						if (!text.equals(freeMtLabel.getText()))
+						{
+							freeMtLabel.setText(text);
+						}
+					}
+				}
+				else if (freeMtLabel.getParent() != null)
+				{
+					debugGrid.remove(freeMtLabel);
+					debugGrid.revalidate();
+					debugGrid.repaint();
+				}
+			}
 			StringBuilder sb = new StringBuilder();
 			for (String line : ai.recent())
 			{
