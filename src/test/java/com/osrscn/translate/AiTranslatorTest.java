@@ -17,7 +17,10 @@ import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -262,7 +265,7 @@ public class AiTranslatorTest
 		assertNull(f.ai.cached(TEXT)); assertEquals(1, f.ai.inFlightCount());
 		assertEquals(0, f.ai.sessionCount()); assertTrue(f.ai.recent().isEmpty());
 		assertFalse(f.file("fixture-A").exists()); assertFalse(f.file("fixture-B").exists());
-		b.success("new player"); assertEquals("new player", f.ai.cached(TEXT));
+		b.success("新的玩家"); assertEquals("新的玩家", f.ai.cached(TEXT));
 		assertFalse(f.file("fixture-B").exists());
 	}
 
@@ -272,8 +275,8 @@ public class AiTranslatorTest
 		Pending b = f.request(true); a.success("old game");
 		assertNull(f.ai.cached(TEXT)); assertEquals(1, f.ai.inFlightCount());
 		assertFalse(f.file("fixture-A").exists()); assertFalse(f.file("fixture-B").exists());
-		b.success("new game");
-		assertEquals(TEXT + "\tnew game\n", Files.readString(f.file("fixture-B").toPath()));
+		b.success("新的游戏");
+		assertEquals(TEXT + "\t新的游戏\n", Files.readString(f.file("fixture-B").toPath()));
 	}
 
 	@Test public void lateOldSuccessCannotOverwriteCompletedNewSuccess() throws Exception
@@ -281,10 +284,10 @@ public class AiTranslatorTest
 		for (boolean persist : new boolean[] { false, true })
 		{
 			Fixture f = new Fixture(); Pending a = f.request(persist); f.switchTo("fixture-B");
-			f.request(persist).success("new"); a.success("old");
-			assertEquals("new", f.ai.cached(TEXT)); assertEquals(1, f.ai.sessionCount());
+			f.request(persist).success("新的"); a.success("old");
+			assertEquals("新的", f.ai.cached(TEXT)); assertEquals(1, f.ai.sessionCount());
 			assertEquals(1, f.ai.recent().size());
-			if (persist) assertEquals(TEXT + "\tnew\n", Files.readString(f.file("fixture-B").toPath()));
+			if (persist) assertEquals(TEXT + "\t新的\n", Files.readString(f.file("fixture-B").toPath()));
 		}
 	}
 
@@ -333,8 +336,8 @@ public class AiTranslatorTest
 	{
 		Fixture f = new Fixture(); Pending a = f.request(true); f.model = "fixture-B"; f.ai.cached(TEXT);
 		f.model = "fixture-A"; Pending newer = f.request(true); a.success("obsolete A");
-		assertNull(f.ai.cached(TEXT)); assertEquals(1, f.ai.inFlightCount()); newer.success("current A");
-		assertEquals("current A", f.ai.cached(TEXT));
+		assertNull(f.ai.cached(TEXT)); assertEquals(1, f.ai.inFlightCount()); newer.success("目前的 A");
+		assertEquals("目前的 A", f.ai.cached(TEXT));
 	}
 
 	@Test public void configurationAtoBtoAWithoutLookupStillInvalidatesOldA() throws Exception
@@ -365,13 +368,13 @@ public class AiTranslatorTest
 	{
 		Fixture f = new Fixture(); Pending current = f.request(false); f.event("aiPaceMs");
 		ConfigChanged ignored = new ConfigChanged(); ignored.setGroup("fictional-other"); ignored.setKey("apiModel");
-		f.plugin.onConfigChanged(ignored); current.success("current"); assertEquals("current", f.ai.cached(TEXT));
+		f.plugin.onConfigChanged(ignored); current.success("目前"); assertEquals("目前", f.ai.cached(TEXT));
 	}
 
 	@Test public void aiOffRetainsCompletedCacheButCannotDispatchMiss() throws Exception
 	{
-		Fixture f = new Fixture(); f.request(false).success("cached"); f.enabled = false; f.event("useLocalAi");
-		assertEquals("cached", f.ai.translate(TEXT, false));
+		Fixture f = new Fixture(); f.request(false).success("已缓存"); f.enabled = false; f.event("useLocalAi");
+		assertEquals("已缓存", f.ai.translate(TEXT, false));
 		assertNull(f.ai.translate("Another fictional gate.", false)); assertEquals(1, f.calls.size());
 	}
 
@@ -379,7 +382,7 @@ public class AiTranslatorTest
 	{
 		Fixture f = new Fixture(); Pending old = f.request(true); f.ai.clearCache(); Pending current = f.request(true);
 		old.success("obsolete clear"); assertNull(f.ai.cached(TEXT)); assertEquals(1, f.ai.inFlightCount());
-		current.success("current"); assertEquals("current", f.ai.cached(TEXT));
+		current.success("目前"); assertEquals("目前", f.ai.cached(TEXT));
 	}
 
 	@Test public void modelSwitchDuringBodyReadCannotCommitSuccess() throws Exception
@@ -409,7 +412,7 @@ public class AiTranslatorTest
 	@Test public void responseCloseAfterSuccessCannotClearNewSameKeyFinally() throws Exception
 	{
 		Fixture f = new Fixture(); Pending a = f.request(false);
-		BufferedSource source = new Buffer().writeUtf8("{\"message\":{\"content\":\"old\"}}");
+		BufferedSource source = new Buffer().writeUtf8("{\"message\":{\"content\":\"旧的\"}}");
 		a.respond(200, new ResponseBody()
 		{
 			@Override public MediaType contentType() { return MediaType.parse("application/json"); }
@@ -419,7 +422,7 @@ public class AiTranslatorTest
 			{
 				// ResponseBody.string closes its source before commit; Response.close occurs after it.
 				assertFalse("response close must release the model monitor", Thread.holdsLock(f.ai));
-				assertEquals("old", f.ai.cached(TEXT)); assertEquals(1, f.ai.sessionCount());
+				assertEquals("旧的", f.ai.cached(TEXT)); assertEquals(1, f.ai.sessionCount());
 				f.switchTo("fixture-B"); f.request(false); super.close();
 			}
 		});
@@ -430,10 +433,10 @@ public class AiTranslatorTest
 	{
 		Fixture f = new Fixture(); f.enqueueHook = pending ->
 		{
-			try { pending.success("inline callback"); } catch (Exception e) { throw new AssertionError(e); }
+			try { pending.success("行内回调"); } catch (Exception e) { throw new AssertionError(e); }
 		};
 		f.ai.translate(TEXT, false, new AiTranslator.RequestPermit(() -> true));
-		assertEquals("inline callback", f.ai.cached(TEXT)); assertEquals(0, f.ai.inFlightCount());
+		assertEquals("行内回调", f.ai.cached(TEXT)); assertEquals(0, f.ai.inFlightCount());
 	}
 
 	@Test public void newCallReentryCannotEnqueueAnObsoleteGeneration() throws Exception
@@ -507,10 +510,10 @@ public class AiTranslatorTest
 
 	@Test public void memoryEntryCanStillBePromotedOnlyByPersistTrue() throws Exception
 	{
-		Fixture f = new Fixture(); f.request(false).success("memory"); assertFalse(f.file("fixture-A").exists());
-		assertEquals("memory", f.ai.cached(TEXT)); assertFalse(f.file("fixture-A").exists());
-		assertEquals("memory", f.ai.translate(TEXT, true));
-		assertEquals(TEXT + "\tmemory\n", Files.readString(f.file("fixture-A").toPath()));
+		Fixture f = new Fixture(); f.request(false).success("内存"); assertFalse(f.file("fixture-A").exists());
+		assertEquals("内存", f.ai.cached(TEXT)); assertFalse(f.file("fixture-A").exists());
+		assertEquals("内存", f.ai.translate(TEXT, true));
+		assertEquals(TEXT + "\t内存\n", Files.readString(f.file("fixture-A").toPath()));
 		f.ai.translate(TEXT, true); assertEquals(1, Files.readAllLines(f.file("fixture-A").toPath()).size());
 	}
 
@@ -527,7 +530,7 @@ public class AiTranslatorTest
 
 	@Test public void clearAfterConnectionEventDeletesCurrentDiskCacheBeforeAnotherLookup() throws Exception
 	{
-		Fixture f = new Fixture(); f.request(true).success("stored A"); f.event("apiKey");
+		Fixture f = new Fixture(); f.request(true).success("已存 A"); f.event("apiKey");
 		Translator translator = new Translator(); inject(translator, "ai", f.ai);
 		translator.clearAiCache();
 		assertFalse(f.file("fixture-A").exists()); assertNull(f.ai.cached(TEXT));
@@ -535,13 +538,13 @@ public class AiTranslatorTest
 
 	@Test public void clearAfterModelEventTargetsCurrentModelWithoutDeletingPreviousModel() throws Exception
 	{
-		Fixture f = new Fixture(); f.request(true).success("stored A");
+		Fixture f = new Fixture(); f.request(true).success("已存 A");
 		Files.writeString(f.file("fixture-B").toPath(), TEXT + "\tstored B\n", StandardCharsets.UTF_8);
 		f.switchTo("fixture-B");
 		Translator translator = new Translator(); inject(translator, "ai", f.ai);
 		translator.clearAiCache();
 		assertTrue(f.file("fixture-A").exists()); assertFalse(f.file("fixture-B").exists());
-		assertEquals(TEXT + "\tstored A\n", Files.readString(f.file("fixture-A").toPath()));
+		assertEquals(TEXT + "\t已存 A\n", Files.readString(f.file("fixture-A").toPath()));
 		assertNull(f.ai.cached(TEXT));
 	}
 
@@ -922,21 +925,21 @@ public class AiTranslatorTest
 		assertNull(pending.request.header("Bad Header"));
 		assertNull(pending.request.header("Authorization"));
 		assertEquals("OSRSCN", pending.request.header("x-opencode-session"));
-		pending.success("header-safe");
-		assertEquals("header-safe", f.ai.cached(TEXT));
+		pending.success("标头安全");
+		assertEquals("标头安全", f.ai.cached(TEXT));
 		assertEquals(0, f.failures()); assertEquals(0, f.value("backoffUntil"));
 	}
 
 	@Test public void headerConfigChangeKeepsCacheAndResetsFailures() throws Exception
 	{
 		Fixture f = new Fixture(); f.extraHeaders = "x-opencode-session: OLD";
-		f.request(false).success("cached translation");
+		f.request(false).success("缓存翻译");
 		f.backoff();
 		f.extraHeaders = "x-opencode-session: NEW";
 		f.event("apiExtraHeaders");
 		assertEquals(0, f.failures()); assertEquals(0, f.value("backoffUntil"));
 		// Headers are not cache identity: the existing translation still hits without a new request.
-		assertEquals("cached translation", f.ai.translate(TEXT, false));
+		assertEquals("缓存翻译", f.ai.translate(TEXT, false));
 		assertEquals(1, f.calls.size());
 		String other = TEXT + " Another fictional gate.";
 		assertNull(f.ai.translate(other, true));
@@ -967,7 +970,8 @@ public class AiTranslatorTest
 		// The injected client belongs to RuneLite: its dispatcher must come out untouched.
 		assertEquals(5, injected.dispatcher().getMaxRequestsPerHost());
 		assertEquals(64, injected.dispatcher().getMaxRequests());
-		// Only the dispatcher differs: pool, executor and interceptor chain are still the injected ones.
+		// Only the dispatcher and the AI timeout budgets differ: pool, executor and interceptor chain
+		// are still the injected ones.
 		assertSame(injected.connectionPool(), api.connectionPool());
 		assertSame(injected.connectionPool(), ollama.connectionPool());
 		assertSame(injected.dispatcher().executorService(), api.dispatcher().executorService());
@@ -978,5 +982,716 @@ public class AiTranslatorTest
 		// Local inference keeps its cold-load budget while using the same private dispatcher.
 		assertEquals(AiTranslator.OLLAMA_REQUEST_TIMEOUT_MS, ollama.readTimeoutMillis());
 		assertEquals(AiTranslator.OLLAMA_REQUEST_TIMEOUT_MS, ollama.callTimeoutMillis());
+		// The online API bounds one silent read, not the whole call; the injected client keeps
+		// RuneLite's inherited 10s read default and has no whole-call cap either.
+		assertEquals(AiTranslator.API_REQUEST_TIMEOUT_MS, api.readTimeoutMillis());
+		assertEquals(0, api.callTimeoutMillis());
+		assertEquals(10_000, injected.readTimeoutMillis());
+		assertEquals(0, injected.callTimeoutMillis());
+	}
+
+	// ---- terminology hint (NAME-table glossary prefix on the user message) ----
+
+	private static Map<String, String> termTable(String... pairs)
+	{
+		Map<String, String> map = new LinkedHashMap<>();
+		for (int i = 0; i + 1 < pairs.length; i += 2)
+		{
+			map.put(pairs[i], pairs[i + 1]);
+		}
+		return map;
+	}
+
+	private static String userContent(Pending pending) throws Exception
+	{
+		return pending.json().getAsJsonArray("messages").get(1).getAsJsonObject()
+				.get("content").getAsString();
+	}
+
+	private static String systemContent(Pending pending) throws Exception
+	{
+		return pending.json().getAsJsonArray("messages").get(0).getAsJsonObject()
+				.get("content").getAsString();
+	}
+
+	private static TranslationStore storeWith(String... pairs)
+	{
+		TranslationStore store = new TranslationStore();
+		try
+		{
+			inject(store, "glossary", TermGlossary.build(termTable(pairs), Set.of()));
+		}
+		catch (Exception e)
+		{
+			throw new AssertionError(e);
+		}
+		return store;
+	}
+
+	@Test public void admittedRequestCarriesMatchingNameTerminology() throws Exception
+	{
+		Fixture f = new Fixture();
+		inject(f.ai, "store", storeWith("crystal gate", "水晶门"));
+		Pending pending = f.request(false);
+		String user = userContent(pending);
+		assertTrue(user.startsWith("Terminology (reference translations"));
+		assertTrue(user.contains("crystal gate => 水晶门"));
+		assertTrue("the source text must still follow the block", user.endsWith(TEXT));
+	}
+
+	@Test public void systemPromptTreatsTerminologyAsReferenceOnly() throws Exception
+	{
+		Fixture f = new Fixture();
+		inject(f.ai, "store", storeWith("crystal gate", "水晶门"));
+		String system = systemContent(f.request(false));
+		assertTrue("must frame the list as reference", system.contains("treat it as reference only"));
+		assertTrue("ordinary words must stay translatable", system.contains("ordinary words and function words"));
+		assertFalse("must not order the model to force the list",
+				system.contains("those entries are established translations"));
+	}
+
+	@Test public void requestWithoutNameMatchKeepsThePlainUserMessage() throws Exception
+	{
+		Fixture f = new Fixture();
+		Pending pending = f.request(false);
+		assertEquals("no store means no terminology block", TEXT, userContent(pending));
+	}
+
+	@Test public void temperatureRetryReusesTheSameTerminologyBlock() throws Exception
+	{
+		Fixture f = new Fixture();
+		f.backend = AiBackend.OPENAI;
+		inject(f.ai, "store", storeWith("crystal gate", "水晶门"));
+		Pending first = f.request(false);
+		assertTrue(userContent(first).contains("crystal gate => 水晶门"));
+		first.respond(400, temperatureRejected());
+		assertEquals(2, f.calls.size());
+		Pending retry = f.calls.get(1);
+		assertTrue("the retry must carry the same block", userContent(retry).contains("crystal gate => 水晶门"));
+		assertFalse(retry.json().has("temperature"));
+	}
+
+	@Test public void terminologyDoesNotChangeTheCacheKey() throws Exception
+	{
+		Fixture f = new Fixture();
+		inject(f.ai, "store", storeWith("crystal gate", "水晶门"));
+		f.request(true).success("水晶门");
+		assertEquals(TEXT + "\t水晶门\n", Files.readString(f.file("fixture-A").toPath()));
+	}
+
+	// ---- glossary echo guard (the model copying the reference block back instead of translating) ----
+
+	/** The reference block the fixture store produces for {@link #TEXT}. */
+	private static String echoedBlock()
+	{
+		return TermGlossary.HEADER + "\n  crystal gate => 水晶门";
+	}
+
+	/**
+	 * Drives one line through a full echo round: the reply is the block, the single retry without
+	 * terminology also replies with the block, and the line ends up negative-cached.
+	 */
+	private static void echoRound(Fixture f, String english) throws Exception
+	{
+		int before = f.calls.size();
+		assertNull(f.ai.translate(english, false));
+		assertEquals(before + 1, f.calls.size());
+		assertTrue("a normal round starts with the block",
+				userContent(f.calls.get(before)).contains("crystal gate => 水晶门"));
+		f.calls.get(before).success(echoedBlock());
+		assertEquals("exactly one retry without terminology", before + 2, f.calls.size());
+		assertEquals(english, userContent(f.calls.get(before + 1)));
+		f.calls.get(before + 1).success(echoedBlock());
+		assertEquals("a persistent echo must not retry again", before + 2, f.calls.size());
+		assertNull(f.ai.cached(english));
+	}
+
+	private static TranslationStore throwingStore()
+	{
+		return new TranslationStore()
+		{
+			@Override
+			public String glossaryPrompt(String english)
+			{
+				throw new IllegalStateException("fictional broken terminology index");
+			}
+		};
+	}
+
+	@Test public void echoedTerminologyIsRetriedWithoutTheBlockAndThenCached() throws Exception
+	{
+		Fixture f = new Fixture();
+		inject(f.ai, "store", storeWith("crystal gate", "水晶门"));
+		Pending first = f.request(true);
+		assertTrue(userContent(first).contains("crystal gate => 水晶门"));
+		first.success(echoedBlock());
+		assertEquals("the echo must get exactly one retry", 2, f.calls.size());
+		Pending retry = f.calls.get(1);
+		assertEquals("the retry must send the bare source line", TEXT, userContent(retry));
+		retry.success("水晶门在前方等待。");
+		assertEquals("水晶门在前方等待。", f.ai.cached(TEXT));
+		assertEquals(1, f.ai.sessionCount());
+		assertEquals(0, f.ai.inFlightCount());
+		assertEquals("only the accepted translation may reach the disk",
+				TEXT + "\t水晶门在前方等待。\n", Files.readString(f.file("fixture-A").toPath()));
+	}
+
+	@Test public void persistentEchoIsNegativeCachedAndNeverRequestsAgain() throws Exception
+	{
+		Fixture f = new Fixture();
+		inject(f.ai, "store", storeWith("crystal gate", "水晶门"));
+		echoRound(f, TEXT);
+		assertEquals("no second round may run", 2, f.calls.size());
+		assertEquals(0, f.ai.inFlightCount());
+		assertNull("an echoed block must never be cached as a translation", f.ai.cached(TEXT));
+		assertEquals(0, f.ai.sessionCount());
+		assertTrue(f.ai.recent().isEmpty());
+		assertFalse(f.file("fixture-A").exists());
+		// Negative cache: the same line keeps missing every tick, so it must not re-request.
+		assertNull(f.ai.translate(TEXT, true));
+		assertNull(f.ai.translate(TEXT, false));
+		assertEquals("a negative-cached line must not reach the model again", 2, f.calls.size());
+		assertEquals(0, f.ai.inFlightCount());
+	}
+
+	@Test public void echoedBlockWithUsableTranslationAfterItIsStrippedAndAccepted() throws Exception
+	{
+		Fixture f = new Fixture();
+		inject(f.ai, "store", storeWith("crystal gate", "水晶门"));
+		f.request(true).success(echoedBlock() + "\n\n水晶门在前方等待。");
+		assertEquals("a usable translation after the block needs no retry", 1, f.calls.size());
+		assertEquals("水晶门在前方等待。", f.ai.cached(TEXT));
+		assertEquals(1, f.ai.sessionCount());
+		assertEquals(0, f.ai.inFlightCount());
+		assertEquals(TEXT + "\t水晶门在前方等待。\n", Files.readString(f.file("fixture-A").toPath()));
+	}
+
+	@Test public void literalArrowInAPlainReplyIsNotAnEcho() throws Exception
+	{
+		Fixture f = new Fixture();
+		f.request(false).success("A => B 的例子");
+		assertEquals("a literal arrow in a translation must never be stripped", 1, f.calls.size());
+		assertEquals("A => B 的例子", f.ai.cached(TEXT));
+		assertEquals(0, f.ai.inFlightCount());
+	}
+
+	@Test public void throwingGlossaryPromptDegradesToPlainMessageWithoutStickingInFlight() throws Exception
+	{
+		Fixture f = new Fixture();
+		inject(f.ai, "store", throwingStore());
+		assertNull("a broken hint must never escape as an exception", f.ai.translate(TEXT, false));
+		assertEquals("the request must still be dispatched", 1, f.calls.size());
+		assertEquals("the failed hint must not be half-applied", TEXT, userContent(f.calls.get(0)));
+		assertEquals(1, f.ai.inFlightCount());
+		f.calls.get(0).success("水晶门在前方等待。");
+		assertEquals("the request must complete normally", 0, f.ai.inFlightCount());
+		assertEquals("水晶门在前方等待。", f.ai.cached(TEXT));
+		// A broken hint is not a backend failure: it must not start the failure/backoff countdown.
+		assertEquals("a broken hint must not count as a failure", 0, f.failures());
+		assertEquals("a broken hint must not open a backoff window", 0, f.value("backoffUntil"));
+		// The containment must not poison the next admitted request with a healthy store.
+		inject(f.ai, "store", storeWith("crystal gate", "水晶门"));
+		String next = TEXT + " Another.";
+		assertNull(f.ai.translate(next, false));
+		assertEquals("the next request must still dispatch immediately", 2, f.calls.size());
+		assertEquals("a broken hint must not delay the next request", 0, f.failures());
+		assertEquals("a broken hint must not delay the next request", 0, f.value("backoffUntil"));
+		assertTrue("a later request gets terminology again",
+				userContent(f.calls.get(1)).contains("crystal gate => 水晶门"));
+	}
+
+	@Test public void storeWithoutMatchingTermKeepsThePlainUserMessage() throws Exception
+	{
+		Fixture f = new Fixture();
+		inject(f.ai, "store", storeWith("dragon scimitar", "龙之弯刀"));
+		Pending pending = f.request(false);
+		assertEquals("a store whose terms do not occur in the line adds no block", TEXT, userContent(pending));
+	}
+
+	@Test public void repeatedEchoRoundsStopSendingTerminologyForThatModel() throws Exception
+	{
+		Fixture f = new Fixture();
+		inject(f.ai, "store", storeWith("crystal gate", "水晶门"));
+		echoRound(f, TEXT);
+		echoRound(f, TEXT + " Another.");
+		String third = TEXT + " Third.";
+		int before = f.calls.size();
+		assertNull(f.ai.translate(third, false));
+		assertEquals(before + 1, f.calls.size());
+		assertEquals("a model that keeps echoing must lose the block",
+				third, userContent(f.calls.get(before)));
+	}
+
+	@Test public void clearCacheRestoresTerminologyForAMutedModel() throws Exception
+	{
+		Fixture f = new Fixture();
+		inject(f.ai, "store", storeWith("crystal gate", "水晶门"));
+		echoRound(f, TEXT);
+		echoRound(f, TEXT + " Another.");
+		String third = TEXT + " Third.";
+		int before = f.calls.size();
+		assertNull(f.ai.translate(third, false));
+		assertEquals("the muted model must not get the block", third, userContent(f.calls.get(before)));
+
+		f.ai.clearCache();
+		String fourth = TEXT + " Fourth.";
+		int cleared = f.calls.size();
+		assertNull(f.ai.translate(fourth, false));
+		assertEquals("the cleared line must be dispatched", cleared + 1, f.calls.size());
+		assertTrue("an explicit cache clear must restore terminology for the muted model",
+				userContent(f.calls.get(cleared)).contains("crystal gate => 水晶门"));
+	}
+
+	// ---- echo guard round 2: block-aware stripping and the translation acceptance rule ----
+
+	@Test public void echoedBlockFollowedByTheSourceLineIsNeverCached() throws Exception
+	{
+		Fixture f = new Fixture();
+		inject(f.ai, "store", storeWith("crystal gate", "水晶门"));
+		Pending first = f.request(true);
+		first.success(echoedBlock() + "\n\n" + TEXT); // strip leaves the source: not a translation
+		assertEquals("the source line left over must get exactly one retry", 2, f.calls.size());
+		Pending retry = f.calls.get(1);
+		assertEquals("the retry must send the bare source line", TEXT, userContent(retry));
+		retry.success(TEXT); // the model repeats the source sentence instead of translating it
+		assertEquals("a repeated source line must never be retried in place", 2, f.calls.size());
+		assertNull("the source line must never be cached as a translation", f.ai.cached(TEXT));
+		assertEquals(0, f.ai.sessionCount());
+		assertTrue(f.ai.recent().isEmpty());
+		assertFalse("nothing may reach the disk", f.file("fixture-A").exists());
+		assertEquals(0, f.ai.inFlightCount());
+		// An untranslated sentence is an ordinary content rejection: one more attempt, then the line is
+		// negative-cached and a repeated lookup must not send it again.
+		assertEquals(1, contentFailStreak(f));
+		f.request(true).success(TEXT);
+		assertEquals(3, f.calls.size());
+		assertNull(f.ai.translate(TEXT, true));
+		assertEquals(3, f.calls.size());
+		assertFalse(f.file("fixture-A").exists());
+	}
+
+	@Test public void sourceLineEchoIsRetriedAndTheRealTranslationIsAccepted() throws Exception
+	{
+		Fixture f = new Fixture();
+		inject(f.ai, "store", storeWith("crystal gate", "水晶门"));
+		f.request(true).success(echoedBlock() + "\n\n" + TEXT);
+		assertEquals("the unusable remainder must get the single retry", 2, f.calls.size());
+		assertEquals(TEXT, userContent(f.calls.get(1)));
+		f.calls.get(1).success("水晶门在前方等待。");
+		assertEquals("水晶门在前方等待。", f.ai.cached(TEXT));
+		assertEquals(1, f.ai.sessionCount());
+		assertEquals(0, f.ai.inFlightCount());
+		assertEquals("only the accepted translation may reach the disk",
+				TEXT + "\t水晶门在前方等待。\n", Files.readString(f.file("fixture-A").toPath()));
+	}
+
+	@Test public void referencePairSplitAcrossTwoLinesIsStripped() throws Exception
+	{
+		Fixture f = new Fixture();
+		inject(f.ai, "store", storeWith("crystal gate", "水晶门"));
+		String splitBlock = TermGlossary.HEADER + "\n  crystal gate =>\n  水晶门";
+		f.request(true).success(splitBlock + "\n\n水晶门");
+		assertEquals("a split pair plus a real translation needs no retry", 1, f.calls.size());
+		assertEquals("水晶门", f.ai.cached(TEXT));
+		assertEquals("only the translation may reach the disk", TEXT + "\t水晶门\n",
+				Files.readString(f.file("fixture-A").toPath()));
+		assertEquals(0, f.ai.inFlightCount());
+	}
+
+	@Test public void translatedHeaderWithRetypedPairsIsStripped() throws Exception
+	{
+		for (String separator : new String[] { "→", "->", "：", ":" })
+		{
+			Fixture f = new Fixture();
+			inject(f.ai, "store", storeWith("crystal gate", "水晶门"));
+			f.request(false).success("术语参考翻译：\n  crystal gate " + separator
+					+ " 水晶门\n\n水晶门在前方等待。");
+			assertEquals(separator + ": a real translation after the block needs no retry",
+					1, f.calls.size());
+			assertEquals(separator + ": the translation must be kept", "水晶门在前方等待。",
+					f.ai.cached(TEXT));
+			assertFalse(separator + ": the translated header must not become part of the translation",
+					f.ai.cached(TEXT).contains("术语"));
+			assertEquals(0, f.ai.inFlightCount());
+		}
+	}
+
+	@Test public void translatedHeaderWithVerbatimPairsIsStrippedAndNotCached() throws Exception
+	{
+		Fixture f = new Fixture();
+		inject(f.ai, "store", storeWith("crystal gate", "水晶门"));
+		f.request(false).success("术语对照：\n  crystal gate => 水晶门\n\n水晶门在前方等待。");
+		assertEquals("a real translation after the block needs no retry", 1, f.calls.size());
+		assertEquals("水晶门在前方等待。", f.ai.cached(TEXT));
+		assertFalse("the translated header line must not leak into the translation",
+				f.ai.cached(TEXT).contains("术语"));
+	}
+
+	@Test public void translatedHeaderAndRetypedPairsAloneAreTreatedAsAnEcho() throws Exception
+	{
+		Fixture f = new Fixture();
+		inject(f.ai, "store", storeWith("crystal gate", "水晶门"));
+		String block = "术语参考翻译：\n  crystal gate → 水晶门";
+		f.request(false).success(block);
+		assertEquals("a retyped block alone must get the single retry", 2, f.calls.size());
+		assertEquals("the retry must send the bare source line", TEXT, userContent(f.calls.get(1)));
+		f.calls.get(1).success(block);
+		assertNull("a retyped block must never be cached", f.ai.cached(TEXT));
+		assertEquals(0, f.ai.inFlightCount());
+	}
+
+	@Test public void headerOnlyReplyIsDetectedAsAnEcho() throws Exception
+	{
+		Fixture f = new Fixture();
+		inject(f.ai, "store", storeWith("crystal gate", "水晶门"));
+		f.request(false).success(TermGlossary.HEADER);
+		assertEquals("the header alone must get the single retry", 2, f.calls.size());
+		assertEquals("the retry must send the bare source line", TEXT, userContent(f.calls.get(1)));
+		f.calls.get(1).success(TermGlossary.HEADER);
+		assertNull("a header-only reply must never be cached", f.ai.cached(TEXT));
+		assertEquals(0, f.ai.inFlightCount());
+		assertEquals("a header-only reply must not enter the recent list", 0, f.ai.sessionCount());
+		assertNull(f.ai.translate(TEXT, false));
+		assertEquals("the negative cache must stop the doomed line", 2, f.calls.size());
+	}
+
+	@Test public void pairOnlyReplyIsDetectedAsAnEcho() throws Exception
+	{
+		// A retyped pair without the header and without "=>": only the en + separator matcher can
+		// recognise it, so removing that detection fails here and not in the header test.
+		Fixture f = new Fixture();
+		inject(f.ai, "store", storeWith("crystal gate", "水晶门"));
+		f.request(false).success("  crystal gate → 水晶门");
+		assertEquals("a copied pair alone must get the single retry", 2, f.calls.size());
+		f.calls.get(1).success("  crystal gate → 水晶门");
+		assertNull("a pair-only reply must never be cached", f.ai.cached(TEXT));
+		assertEquals(0, f.ai.inFlightCount());
+		assertEquals("a pair-only reply must not enter the recent list", 0, f.ai.sessionCount());
+
+		// The block's own "=>" form is recognised as well (the complete flattened pair).
+		Fixture verbatim = new Fixture();
+		inject(verbatim.ai, "store", storeWith("crystal gate", "水晶门"));
+		verbatim.request(false).success("  crystal gate => 水晶门");
+		assertEquals("a verbatim copied pair must get the single retry", 2, verbatim.calls.size());
+		assertNull("a verbatim pair-only reply must never be cached", verbatim.ai.cached(TEXT));
+	}
+
+	@Test public void persistentPureEchoWritesNoDiskLine() throws Exception
+	{
+		Fixture f = new Fixture();
+		inject(f.ai, "store", storeWith("crystal gate", "水晶门"));
+		f.request(true).success(echoedBlock());
+		f.calls.get(1).success(echoedBlock());
+		assertNull("a pure echo must never be cached", f.ai.cached(TEXT));
+		assertFalse("a pure echo must not create the cache file", f.file("fixture-A").exists());
+		assertNull(f.ai.translate(TEXT, true));
+		assertEquals(2, f.calls.size());
+		assertFalse(f.file("fixture-A").exists());
+	}
+
+	@Test public void negativeEchoCacheClearsWithModelIdentityAndExplicitClear() throws Exception
+	{
+		Fixture switched = new Fixture();
+		inject(switched.ai, "store", storeWith("crystal gate", "水晶门"));
+		echoRound(switched, TEXT);
+		int before = switched.calls.size();
+		switched.switchTo("fixture-B");
+		assertNull(switched.ai.translate(TEXT, false));
+		assertEquals("a new model must re-ask the line the old one echoed",
+				before + 1, switched.calls.size());
+
+		Fixture cleared = new Fixture();
+		inject(cleared.ai, "store", storeWith("crystal gate", "水晶门"));
+		echoRound(cleared, TEXT);
+		int previous = cleared.calls.size();
+		cleared.ai.clearCache();
+		assertNull(cleared.ai.translate(TEXT, false));
+		assertEquals("clearCache must re-ask a negative-cached line",
+				previous + 1, cleared.calls.size());
+	}
+
+	@Test public void literalArrowReplyIsAcceptedWithAndWithoutAGlossary() throws Exception
+	{
+		// No glossary at all: the arrow is ordinary displayed text, not a reference line.
+		Fixture plain = new Fixture();
+		plain.request(false).success("A => B 的例子");
+		assertEquals("A => B 的例子", plain.ai.cached(TEXT));
+
+		// With a glossary, the weak "an arrow appeared after a block" rule must not fire when the
+		// source itself legitimately contains "=>".
+		Fixture glossary = new Fixture();
+		inject(glossary.ai, "store", storeWith("crystal gate", "水晶门"));
+		String source = "The crystal gate => a fictional door.";
+		assertNull(glossary.ai.translate(source, false));
+		assertEquals(1, glossary.calls.size());
+		assertTrue("the source line gets a terminology block",
+				userContent(glossary.calls.get(0)).contains("crystal gate => 水晶门"));
+		glossary.calls.get(0).success("水晶门 => 一扇虚构的门");
+		assertEquals("水晶门 => 一扇虚构的门", glossary.ai.cached(source));
+	}
+
+	@Test public void nullGlossaryPromptDegradesToThePlainMessage() throws Exception
+	{
+		Fixture f = new Fixture();
+		inject(f.ai, "store", new TranslationStore()
+		{
+			@Override public String glossaryPrompt(String english) { return null; }
+		});
+		Pending pending = f.request(false);
+		assertEquals("a null hint means no terminology block", TEXT, userContent(pending));
+		pending.success("水晶门在前方等待。");
+		assertEquals("水晶门在前方等待。", f.ai.cached(TEXT));
+		assertEquals(0, f.ai.inFlightCount());
+	}
+
+	// ---- generic reply acceptance: empty, unparsable or untranslated replies are content failures ----
+
+	private static int contentFailStreak(Fixture f) throws Exception
+	{
+		return ((AtomicInteger) field(f.ai, "contentFailStreak")).get();
+	}
+
+	/** Ten distinct lines answered with an empty reply each: opens the global content backoff window. */
+	private static void exhaustContentBackoff(Fixture f) throws Exception
+	{
+		for (int i = 0; i < 10; i++)
+		{
+			assertNull(f.ai.translate(TEXT + " " + i, false));
+			f.calls.get(i).success("");
+		}
+	}
+
+	@Test public void emptyContentIsRejectedWithoutCachingOrTransportFailure() throws Exception
+	{
+		Fixture f = new Fixture();
+		f.request(false).success("");
+		assertNull(f.ai.cached(TEXT)); assertEquals(0, f.ai.sessionCount()); assertTrue(f.ai.recent().isEmpty());
+		assertEquals(0, f.failures()); assertEquals(0, f.value("backoffUntil"));
+		assertEquals(1, contentFailStreak(f));
+		// The same line failing a second time must become untranslatable instead of retrying forever.
+		f.request(false).success("");
+		assertEquals(2, contentFailStreak(f));
+		int calls = f.calls.size();
+		assertNull(f.ai.translate(TEXT, false)); assertEquals(calls, f.calls.size());
+	}
+
+	@Test public void missingContentIsRejectedLikeAnEmptyReply() throws Exception
+	{
+		for (String body : new String[] { "{}", "{\"message\":{}}" })
+		{
+			Fixture f = new Fixture();
+			f.request(false).respond(200, ResponseBody.create(MediaType.parse("application/json"), body));
+			assertNull(body, f.ai.cached(TEXT));
+			assertEquals(body, 0, f.ai.sessionCount()); assertTrue(body, f.ai.recent().isEmpty());
+			assertEquals(body, 0, f.failures()); assertEquals(body, 1, contentFailStreak(f));
+		}
+	}
+
+	@Test public void jsonNullContentIsRejectedForBothResponseShapes() throws Exception
+	{
+		Fixture ollama = new Fixture();
+		ollama.request(false).respond(200, ResponseBody.create(MediaType.parse("application/json"),
+				"{\"message\":{\"content\":null}}"));
+		assertNull(ollama.ai.cached(TEXT)); assertEquals(1, contentFailStreak(ollama));
+		assertEquals(0, ollama.failures());
+
+		Fixture openai = new Fixture(); openai.backend = AiBackend.OPENAI;
+		openai.request(false).respond(200, ResponseBody.create(MediaType.parse("application/json"),
+				"{\"choices\":[{\"message\":{\"content\":null}}]}"));
+		assertNull(openai.ai.cached(TEXT)); assertEquals(1, contentFailStreak(openai));
+		assertEquals(0, openai.failures());
+	}
+
+	@Test public void blankOrThinkOnlyContentIsRejectedAndNeverPersisted() throws Exception
+	{
+		for (String reply : new String[] { "   ", "\n\t", "<think>内部思考</think>" })
+		{
+			Fixture f = new Fixture();
+			f.request(true).success(reply);
+			assertNull(reply, f.ai.cached(TEXT));
+			assertEquals(reply, 0, f.ai.sessionCount());
+			assertFalse(reply, f.file("fixture-A").exists());
+			assertEquals(reply, 1, contentFailStreak(f));
+		}
+	}
+
+	@Test public void untranslatedEnglishReplyIsRejectedAndNegativeCached() throws Exception
+	{
+		Fixture f = new Fixture();
+		f.request(false).success(TEXT);
+		assertNull(f.ai.cached(TEXT)); assertEquals(1, contentFailStreak(f));
+		f.request(false).success(TEXT);
+		assertEquals(2, contentFailStreak(f)); assertEquals(2, f.calls.size());
+		assertNull(f.ai.translate(TEXT, false));
+		assertEquals("a repeated source line must not reach the model again", 2, f.calls.size());
+		assertFalse(f.file("fixture-A").exists());
+	}
+
+	@Test public void contentFailureFollowedByAcceptedReplyResetsTheStreak() throws Exception
+	{
+		Fixture f = new Fixture();
+		f.request(false).success("");
+		assertEquals(1, contentFailStreak(f));
+		f.request(false).success("新的翻译");
+		assertEquals("新的翻译", f.ai.cached(TEXT));
+		assertEquals(1, f.ai.sessionCount());
+		assertEquals(0, f.ai.inFlightCount());
+		assertEquals(0, contentFailStreak(f));
+	}
+
+	@Test public void tenConsecutiveContentFailuresOpenTheGlobalContentBackoff() throws Exception
+	{
+		Fixture f = new Fixture(); f.pace = 0;
+		long before = System.currentTimeMillis();
+		exhaustContentBackoff(f);
+		long until = f.value("contentBackoffUntil");
+		assertTrue("the content backoff window must be open", until > System.currentTimeMillis());
+		assertTrue("the window must be about 30s",
+				until >= before + 29_000 && until <= System.currentTimeMillis() + 31_000);
+		assertEquals(0, contentFailStreak(f));
+		assertEquals(0, f.failures());
+		int calls = f.calls.size();
+		assertNull(f.ai.translate(TEXT, false));
+		assertEquals("a content backoff must suppress dispatch", calls, f.calls.size());
+	}
+
+	@Test public void contentFailureStateIsClearedByCacheAndModelInvalidation() throws Exception
+	{
+		Fixture cleared = new Fixture(); exhaustContentBackoff(cleared);
+		assertTrue(cleared.value("contentBackoffUntil") > System.currentTimeMillis());
+		cleared.ai.clearCache();
+		assertEquals(0, contentFailStreak(cleared)); assertEquals(0, cleared.value("contentBackoffUntil"));
+
+		Fixture switched = new Fixture(); exhaustContentBackoff(switched);
+		switched.switchTo("fixture-B");
+		assertEquals(0, contentFailStreak(switched)); assertEquals(0, switched.value("contentBackoffUntil"));
+	}
+
+	@Test public void headerChangeClearsContentBackoffButKeepsNegativeCache() throws Exception
+	{
+		Fixture f = new Fixture();
+		f.request(false).success("");
+		f.request(false).success(""); // the same line again: negative-cached, not counted as an echo
+		assertEquals(2, contentFailStreak(f));
+		for (int i = 0; i < 8; i++)
+		{
+			assertNull(f.ai.translate(TEXT + " filler " + i, false));
+			f.calls.get(f.calls.size() - 1).success("");
+		}
+		assertTrue(f.value("contentBackoffUntil") > System.currentTimeMillis());
+		f.event("apiExtraHeaders");
+		assertEquals(0, contentFailStreak(f)); assertEquals(0, f.value("contentBackoffUntil"));
+		int calls = f.calls.size();
+		assertNull(f.ai.translate(TEXT, false));
+		assertEquals("a header change must not drop the negative cache", calls, f.calls.size());
+	}
+
+	@Test public void rejectedTemperatureRetryWithEmptyContentIsAContentFailureNotATransportFailure() throws Exception
+	{
+		Fixture f = new Fixture(); f.backend = AiBackend.OPENAI;
+		f.request(false).respond(400, temperatureRejected());
+		assertEquals("exactly one automatic retry", 2, f.calls.size());
+		f.calls.get(1).success("");
+		assertNull(f.ai.cached(TEXT)); assertEquals(0, f.ai.sessionCount());
+		assertEquals(0, f.failures()); assertEquals(0, f.value("backoffUntil"));
+		assertEquals(1, contentFailStreak(f));
+		assertEquals(0, f.ai.inFlightCount());
+	}
+
+	// ---- keep-English answers, negative-cache expiry, colon-separated kept names ----
+
+	private static Pending requestText(Fixture f, String text, boolean persist)
+	{
+		int size = f.calls.size();
+		assertNull(f.ai.translate(text, persist));
+		assertEquals(size + 1, f.calls.size());
+		return f.calls.get(size);
+	}
+
+	@Test public void nameLikeSourceEchoedBackIsCachedAsKeptEnglish() throws Exception
+	{
+		Fixture f = new Fixture();
+		String name = "Fictional Gryphon";
+		requestText(f, name, true).success(name);
+		assertEquals("a kept proper noun is a valid answer", name, f.ai.cached(name));
+		assertEquals("no retry for a kept name", 1, f.calls.size());
+		assertEquals(0, contentFailStreak(f));
+		assertEquals(name, f.ai.translate(name, true));
+		assertEquals("a cached kept name is never requested again", 1, f.calls.size());
+		assertEquals(name + "\t" + name + "\n", Files.readString(f.file("fixture-A").toPath()));
+	}
+
+	@Test public void quotedOrRecasedNameEchoIsStillKeptEnglish() throws Exception
+	{
+		Fixture f = new Fixture();
+		requestText(f, "Fictional Gryphon", false).success("\"fictional gryphon\"");
+		assertNotNull(f.ai.cached("Fictional Gryphon"));
+		assertEquals(0, contentFailStreak(f));
+	}
+
+	@Test public void manyKeptNamesNeverOpenTheContentBackoff() throws Exception
+	{
+		Fixture f = new Fixture();
+		for (int i = 0; i < 12; i++)
+		{
+			String name = "Fictional Place " + (char) ('A' + i);
+			requestText(f, name, false).success(name);
+		}
+		assertEquals(0, contentFailStreak(f));
+		assertEquals("kept names must not pause AI translation", 0, f.value("contentBackoffUntil"));
+		assertEquals(12, f.calls.size());
+	}
+
+	@Test public void nonNameEnglishReplyIsStillRejected() throws Exception
+	{
+		Fixture f = new Fixture();
+		requestText(f, "Fictional Gryphon", false).success("I cannot translate that.");
+		assertNull(f.ai.cached("Fictional Gryphon"));
+		assertEquals(1, contentFailStreak(f));
+	}
+
+	@Test public void untranslatableLineIsRetriedAfterTheTtl() throws Exception
+	{
+		Fixture f = new Fixture();
+		long[] now = {1_000_000L};
+		f.ai.clock = () -> now[0];
+		f.request(false).success("");
+		f.request(false).success("<think>only thinking</think>");
+		assertNull(f.ai.translate(TEXT, false));
+		assertEquals("negative-cached within the TTL", 2, f.calls.size());
+		now[0] += AiTranslator.UNTRANSLATABLE_TTL_MS - 1;
+		assertNull(f.ai.translate(TEXT, false));
+		assertEquals(2, f.calls.size());
+		now[0] += 2;
+		f.request(false).success("水晶门在前方等待。");
+		assertEquals("the line may be requested again once the entry expired", 3, f.calls.size());
+		assertEquals("水晶门在前方等待。", f.ai.cached(TEXT));
+	}
+
+	@Test public void keptNameBeforeAColonIsNotATerminologyEcho() throws Exception
+	{
+		Fixture f = new Fixture();
+		inject(f.ai, "store", storeWith("Kalphite Queen", "卡拉菲特女王"));
+		String source = "Kalphite Queen: You will not leave this fictional hive!";
+		Pending pending = requestText(f, source, false);
+		assertTrue(userContent(pending).contains("Kalphite Queen => 卡拉菲特女王"));
+		String reply = "Kalphite Queen：你别想离开这个虚构的巢穴！";
+		pending.success(reply);
+		assertEquals("a translation keeping the name before a colon is accepted", reply, f.ai.cached(source));
+		assertEquals("no echo retry", 1, f.calls.size());
+		@SuppressWarnings("unchecked")
+		Map<String, Integer> streak = (Map<String, Integer>) field(f.ai, "glossaryEchoStreak");
+		assertTrue(streak.isEmpty());
+	}
+
+	@Test public void pairRetypedWithAColonIsStillAnEcho() throws Exception
+	{
+		Fixture f = new Fixture();
+		inject(f.ai, "store", storeWith("Kalphite Queen", "卡拉菲特女王"));
+		String source = "Kalphite Queen: You will not leave this fictional hive!";
+		requestText(f, source, false).success("Kalphite Queen: 卡拉菲特女王");
+		assertEquals("a retyped pair gets the single retry without the block", 2, f.calls.size());
+		assertEquals(source, userContent(f.calls.get(1)));
+		assertNull(f.ai.cached(source));
 	}
 }

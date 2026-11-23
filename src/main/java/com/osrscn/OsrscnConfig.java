@@ -111,7 +111,10 @@ public interface OsrscnConfig extends Config
 	@ConfigItem(
 			keyName = "clearCacheHotkey",
 			name = "清翻译缓存",
-			description = "清掉 AI 翻译缓存，重新翻译",
+			description = "清掉 AI 翻译缓存，重新翻译。按下后画面顶部会短暂显示「已清缓存」。"
+					+ "<br>如果按了没反应、缓存也没清掉，可能是这个组合键已被其他程序注册为"
+					+ "<br>系统全局快捷键而先被拦截（常见于显卡驱动、录屏/直播、输入法、聊天软件）。"
+					+ "<br>可在此改用其他组合键（例如 Ctrl+Shift+V、Ctrl+Alt+C），或关闭占用该键的程序。",
 			section = general,
 			position = 1
 	)

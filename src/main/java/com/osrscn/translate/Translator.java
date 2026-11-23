@@ -61,6 +61,11 @@ public class Translator
 	// Combat-achievement "Monster: <name>" line: the prefix is fixed and the name lives in the name
 	// table (incl. bosses), so compose "怪物：" + looked-up name instead of needing a whole-line entry.
 	private static final Pattern MONSTER_LINE = Pattern.compile("(?i)^Monster:\\s*(.+)$");
+	// Combat-achievement boss page title ("Combat Achievements - <boss>"). The transcript data only ever
+	// carried the ~67 old bosses as whole rows; every newer boss page missed locally and fell through to
+	// the AI. Same scheme as Monster: above - the fixed prefix plus the boss name from the name table
+	// composes all of them, including bosses shipped after this build.
+	private static final Pattern CA_TITLE_LINE = Pattern.compile("^Combat Achievements - (.+)$");
 	private static final Pattern REQUIRES_LINE = Pattern.compile("(?i)^Requires:\\s*(.+)$");
 	// Examine "Price of <item>: GE average <Num0> HA value <Num1>" - the item lives in the name table, so
 	// compose a consistent line from the looked-up name instead of needing a whole-line entry per item.
@@ -1412,6 +1417,33 @@ public class Translator
 			return zhName == null ? null : "怪物：" + zhName;
 		}
 
+		Matcher caTitle = CA_TITLE_LINE.matcher(text);
+		if (caTitle.matches())
+		{
+			// Boss names live in the NAME table ("Shellbane gryphon", "Maggot King", ...), usually without
+			// the game's article; a few page titles carry it ("Combat Achievements - The Maggot King"), so
+			// a miss retries without the leading "The ". The NAME table is tried before the generic UI
+			// order because it is the curated entity spelling: the interface table also contains a few
+			// demo/skill-guide rows with a different translation of the same boss, and the CA page title
+			// must match the CA task rows rather than whichever table happens to come first. Still unknown
+			// -> null, which keeps the existing table-then-AI fallback (and its missing-row collection).
+			String boss = Tags.stripStyle(caTitle.group(1)).trim();
+			String zhBoss = nameTranslation(boss);
+			if (zhBoss == null && boss.regionMatches(true, 0, "The ", 0, 4))
+			{
+				zhBoss = nameTranslation(boss.substring(4).trim());
+			}
+			if (zhBoss == null)
+			{
+				zhBoss = lookupAnyOf(boss, order);
+				if (zhBoss == null && boss.regionMatches(true, 0, "The ", 0, 4))
+				{
+					zhBoss = lookupAnyOf(boss.substring(4).trim(), order);
+				}
+			}
+			return zhBoss == null ? null : "战斗成就 - " + zhBoss;
+		}
+
 		Matcher requires = REQUIRES_LINE.matcher(text);
 		if (!requires.matches())
 		{
@@ -1764,6 +1796,26 @@ public class Translator
 			}
 		}
 		return null;
+	}
+
+	/**
+	 * NAME-table translation for one entity name, exact then case-insensitive; null when unknown.
+	 * Kept separate from {@link #lookupAnyOf} so callers that need the curated entity spelling (CA boss
+	 * titles) do not get the interface/game-text row that happens to come first in their lookup order.
+	 */
+	private String nameTranslation(String name)
+	{
+		if (name == null || name.isEmpty() || store == null)
+		{
+			return null;
+		}
+		String zh = store.lookup(TranslationStore.Category.NAME, name);
+		if (zh != null)
+		{
+			return zh;
+		}
+		return store.lookupLower(TranslationStore.Category.NAME,
+				TranslationStore.normalize(name).toLowerCase(java.util.Locale.ROOT));
 	}
 
 	public void clearAiCache()

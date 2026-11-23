@@ -16,6 +16,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
 import java.util.concurrent.atomic.AtomicReference;
+import com.osrscn.AiBackend;
 import com.osrscn.OsrscnConfig;
 import com.osrscn.OsrscnPlugin;
 import com.osrscn.PlayerChatMode;
@@ -158,6 +159,43 @@ public class ChatHandlerTest
 		tip.transparent = true;
 		tip.fire(ChatMessageType.DIDYOUKNOW);
 		assertEquals(img(0xffff00), tip.value.get());
+	}
+
+	@Test
+	public void splitBroadcastCopyUsesTheSplitColourNotTheChatboxColour() throws Exception
+	{
+		ChatFixture f = new ChatFixture();
+		f.types[0].set(ChatMessageType.BROADCAST);
+		f.trackBoth();
+		AtomicReference<String> row = new AtomicReference<>("<col=ffff00>" + img(0x000000) + "</col>");
+		f.pmContainer = ChatFixture.container(row);
+
+		f.handler.refreshSplitBroadcast();
+		assertEquals("<col=ffff00>" + img(0xffff00) + "</col>", row.get());
+		assertEquals(img(0x000000), f.values[0].get());
+
+		int calls = f.translator.calls.get();
+		f.handler.refreshSplitBroadcast();
+		assertEquals(calls, f.translator.calls.get());
+
+		// The native rebuild writes the node's chatbox-coloured images back; a configured split colour wins.
+		f.varps.put(VarPlayerID.OPTION_CHAT_COLOUR_BROADCAST_SPLIT, 0x00ff01);
+		row.set("<col=00ff00>" + img(0x000000) + "</col>");
+		f.handler.refreshSplitBroadcast();
+		assertEquals("<col=00ff00>" + img(0x00ff00) + "</col>", row.get());
+	}
+
+	@Test
+	public void splitRowsLeaveNonBroadcastImagesAlone() throws Exception
+	{
+		ChatFixture f = new ChatFixture();
+		f.trackBoth();
+		String original = "<col=ffff00>" + img(0x000000) + "</col>";
+		AtomicReference<String> row = new AtomicReference<>(original);
+		f.pmContainer = ChatFixture.container(row);
+
+		f.handler.refreshSplitBroadcast();
+		assertEquals(original, row.get());
 	}
 
 	@Test
@@ -1134,6 +1172,47 @@ public class ChatHandlerTest
 		assertEquals("Skillcape", f.chat.values[0].get());
 		assertEquals(calls, f.translator.calls);
 		assertTrue(state(f.chat.handler, "tracked").isEmpty());
+	}
+
+	@Test
+	public void onlineApiBackendUsesApiRequestBudget() throws Exception
+	{
+		assertEquals(AiTranslator.API_REQUEST_TIMEOUT_MS, budgetMs(AiBackend.OPENAI, "requestBudgetMs"));
+		assertEquals(AiTranslator.OLLAMA_REQUEST_TIMEOUT_MS, budgetMs(AiBackend.OLLAMA, "requestBudgetMs"));
+	}
+
+	@Test
+	public void onlineApiBackendPendingTimeoutAddsTheApiBudget() throws Exception
+	{
+		assertEquals(AiTranslator.API_REQUEST_TIMEOUT_MS + handlerConstant("PENDING_TIMEOUT_MS"),
+				budgetMs(AiBackend.OPENAI, "pendingTimeoutMs"));
+	}
+
+	/** Invoke a private instance budget method with a config proxy pinned to one backend. */
+	private static long budgetMs(AiBackend backend, String methodName) throws Exception
+	{
+		ChatHandler handler = new ChatHandler();
+		OsrscnConfig config = (OsrscnConfig) Proxy.newProxyInstance(ChatHandlerTest.class.getClassLoader(),
+				new Class<?>[] { OsrscnConfig.class }, (proxy, method, args) ->
+				{
+					switch (method.getName())
+					{
+						case "useLocalAi": return true;
+						case "aiBackend": return backend;
+						default: return defaultValue(method.getReturnType());
+					}
+				});
+		inject(handler, "config", config);
+		Method method = ChatHandler.class.getDeclaredMethod(methodName);
+		method.setAccessible(true);
+		return ((Number) method.invoke(handler)).longValue();
+	}
+
+	private static long handlerConstant(String name) throws Exception
+	{
+		Field field = ChatHandler.class.getDeclaredField(name);
+		field.setAccessible(true);
+		return field.getLong(null);
 	}
 
 	private static Map<?, ?> state(ChatHandler handler, String name) throws Exception
@@ -2800,6 +2879,12 @@ public class ChatHandlerTest
 		{
 			return renderChat(text, color, maxChars, size, aiFallback, persist);
 		}
+
+		@Override
+		public Rendered renderChatCached(String text, int color, int maxChars, int size, ChatMessageType type)
+		{
+			return renderChat(text, color, maxChars, size, true, false);
+		}
 	}
 
 	private static final class PlayerChatFixture
@@ -2887,6 +2972,8 @@ public class ChatHandlerTest
 		final AtomicInteger inserted = new AtomicInteger();
 		final AtomicReference<String> insertText = new AtomicReference<>();
 		final Map<Long, MessageNode> messages = new HashMap<>();
+		final Map<Integer, Integer> varps = new HashMap<>();
+		Widget pmContainer;
 		boolean groupChannels = true;
 		PlayerChatMode mode = PlayerChatMode.INLINE;
 		boolean translateGame = true;
@@ -2947,9 +3034,11 @@ public class ChatHandlerTest
 							case "getMouseCanvasPosition": return mouse.get();
 							case "refreshChat": refreshes.incrementAndGet(); return null;
 							case "addChatMessage": inserted.incrementAndGet(); insertText.set((String) args[2]); return null;
+							case "getVarpValue": return varps.getOrDefault((int) args[0], 0);
 							case "getWidget":
 								int id = (int) args[0];
 								if (id == InterfaceID.Chatbox.SCROLLAREA) return scroll;
+								if (id == InterfaceID.PmChat.CONTAINER) return pmContainer;
 								int lineIndex = id - InterfaceID.Chatbox.LINE0;
 								if (lineIndex >= 0 && lineIndex < lines.length) return lines[lineIndex];
 								return null;
@@ -3007,6 +3096,22 @@ public class ChatHandlerTest
 		private static Widget textWidget(AtomicInteger color)
 		{
 			return widget(null, null, color);
+		}
+
+		/** pm_chat container whose first row (dynamic child 0) holds {@code text}. */
+		static Widget container(AtomicReference<String> text)
+		{
+			Widget row = (Widget) Proxy.newProxyInstance(ChatHandlerTest.class.getClassLoader(),
+					new Class<?>[] { Widget.class }, (proxy, method, args) ->
+					{
+						switch (method.getName())
+						{
+							case "getText": return text.get();
+							case "setText": text.set((String) args[0]); return null;
+							default: return defaultValue(method.getReturnType());
+						}
+					});
+			return widget(null, new Widget[] { row, null, null, null }, null);
 		}
 
 		private static Widget widget(Rectangle bounds, Widget[] dynamic, AtomicInteger color)

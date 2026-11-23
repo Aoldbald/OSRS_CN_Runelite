@@ -68,6 +68,7 @@ public class ChatHandler
 	private static final int DIDYOUKNOW_TRANSPARENT_RGB = 0xffff00;
 	private static final int GAME_OPAQUE_RGB = 0x000000;
 	private static final int GAME_TRANSPARENT_RGB = 0xffffff;
+	private static final int SPLIT_BROADCAST_RGB = 0xffff00;
 	private static final int CHAT_WIDTH_PX = 480; // approx chat line width, for wrapping
 	private static final int TIMESTAMP_PAD_PX = 60;
 	private static final long PENDING_TIMEOUT_MS = 15_000;
@@ -216,6 +217,8 @@ public class ChatHandler
 	private final List<Generation> buildingChatNodes = new ArrayList<>();
 	private boolean chatBuildActive;
 	private int chatBuildIndex;
+	// Last split-area broadcast row we wrote, so a stable frame does no work.
+	private String splitBroadcastShown;
 
 	/** True only for the script that owns the chatMessageBuilding callbacks. */
 	public static boolean isChatBuildScript(int scriptId)
@@ -493,6 +496,62 @@ public class ChatHandler
 		}
 	}
 
+	/**
+	 * The split-chat area above the chatbox repeats the newest broadcast in its own colour (yellow
+	 * unless the player set one). Char-images ignore that colour and keep the chatbox colour baked
+	 * into the node, so re-bake only that copy; the chatbox row keeps the node's images.
+	 */
+	public void refreshSplitBroadcast()
+	{
+		Widget container = client.getWidget(InterfaceID.PmChat.CONTAINER);
+		Widget[] rows = container == null || container.isHidden() ? null : container.getDynamicChildren();
+		if (rows == null)
+		{
+			return;
+		}
+		for (Widget row : rows)
+		{
+			String text = row == null || row.isHidden() ? null : row.getText();
+			if (text == null || !text.contains("<img=") || text.equals(splitBroadcastShown))
+			{
+				continue;
+			}
+			Tracked t = broadcastShownIn(text);
+			if (t == null)
+			{
+				continue;
+			}
+			Translator.Rendered r = translator.renderChatCached(t.english, splitBroadcastColor(),
+					chatMaxChars(), glyph.uiSize(), ChatMessageType.BROADCAST);
+			if (r == null)
+			{
+				continue; // glyphs still uploading: the next frame retries
+			}
+			String out = text.replace(t.renderedText, r.text);
+			row.setText(out);
+			splitBroadcastShown = out;
+		}
+	}
+
+	private Tracked broadcastShownIn(String text)
+	{
+		for (Tracked t : tracked.values())
+		{
+			if (t.generation.type == ChatMessageType.BROADCAST && t.rendered && t.renderedText != null
+					&& text.contains(t.renderedText) && current(t.generation))
+			{
+				return t;
+			}
+		}
+		return null;
+	}
+
+	private int splitBroadcastColor()
+	{
+		int setting = client.getVarpValue(net.runelite.api.gameval.VarPlayerID.OPTION_CHAT_COLOUR_BROADCAST_SPLIT);
+		return setting > 0 ? (setting - 1) & 0xffffff : SPLIT_BROADCAST_RGB;
+	}
+
 	private static int messageUid(int[] intStack, int intStackSize)
 	{
 		return intStack == null || intStackSize <= 0 || intStackSize > intStack.length
@@ -623,9 +682,25 @@ public class ChatHandler
 
 	private long pendingTimeoutMs()
 	{
-		// Capture once when work is admitted. Ticks and colour refreshes never renew this budget.
-		return config.useLocalAi() && config.aiBackend() == AiBackend.OLLAMA
-				? AiTranslator.OLLAMA_REQUEST_TIMEOUT_MS + PENDING_TIMEOUT_MS : PENDING_TIMEOUT_MS;
+		// Captured once when work is admitted; ticks and colour refreshes never renew it.
+		if (!config.useLocalAi())
+		{
+			return PENDING_TIMEOUT_MS;
+		}
+		// The fixed grace covers the tick that picks the reply up and the hand-off between requests;
+		// with aiConcurrency at its default of 1 a queued slot turn, and the single terminology-echo
+		// retry, can push the reply later still: this window is a bounded heuristic, not a guarantee.
+		// A reply that lands after it is still cached; only this line's display is given up.
+		return requestBudgetMs() + PENDING_TIMEOUT_MS;
+	}
+
+	/** Read budget the AI client actually enforces for the active backend. */
+	private long requestBudgetMs()
+	{
+		// Mirror AiTranslator's own classification so a backend can never pair its display window with
+		// another backend's transport budget.
+		return config.aiBackend() == AiBackend.OPENAI
+				? AiTranslator.API_REQUEST_TIMEOUT_MS : AiTranslator.OLLAMA_REQUEST_TIMEOUT_MS;
 	}
 
 	/** INSERT mode: remember this player-chat line so {@link #tick()} can add a Chinese line for it. */

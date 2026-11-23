@@ -81,6 +81,7 @@ public class TranslationStore
 	private final Map<Category, Map<String, String>> lowerMaps = new EnumMap<>(Category.class); // case-insensitive index
 	private volatile boolean loaded;
 	private volatile String baseUrl; // e.g. https://raw.githubusercontent.com/<user>/<repo>/<branch>/public/zh/
+	private volatile TermGlossary glossary; // built once in load(), read-only afterwards
 
 	@Inject
 	private OkHttpClient httpClient;
@@ -151,6 +152,18 @@ public class TranslationStore
 		return out;
 	}
 
+	/**
+	 * Terminology hint for one AI request: the reference Chinese names of NAME terms that occur in
+	 * {@code english}, or "" when the glossary is not built yet or nothing matches. Called once per
+	 * admitted request on the caller (client) thread, while the AiTranslator monitor is held; the work
+	 * is a token lookup plus a short word-boundary scan over one line, i.e. tens of microseconds.
+	 */
+	public String glossaryPrompt(String english)
+	{
+		TermGlossary g = glossary;
+		return g == null ? "" : g.promptFor(english);
+	}
+
 	/** Loads the store on the client's background executor. Safe to call once at start-up. */
 	public void loadAsync()
 	{
@@ -202,6 +215,10 @@ public class TranslationStore
 				}
 			}
 			buildPlaceholderIndex();
+			// Built here rather than lazily: the first request must never pay the ~70ms index build on
+			// the client thread. Requests that arrive before this point simply get no terminology hint.
+			// GlossaryIgnore holds reviewed common words that must never be forced as terminology.
+			glossary = TermGlossary.build(maps.get(Category.NAME), GlossaryIgnore.TERMS);
 			loaded = true;
 			log.info("OSRSCN translations loaded: {} entries", size());
 		}
